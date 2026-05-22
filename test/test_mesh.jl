@@ -1,8 +1,10 @@
 # Tests for `src/mesh.jl`: `HexMesh`, `make_cubical_mesh`.
 
 using WaveToySecondOrder
-using WaveToySecondOrder: HexMesh, make_cubical_mesh, nv
+using WaveToySecondOrder: HexMesh, make_cubical_mesh, make_inflated_cube_mesh, nv
 using Test
+
+count_zero_neighbours(m::HexMesh) = count(==(0), m.neighbour)
 
 @testset "mesh" begin
 
@@ -97,6 +99,50 @@ using Test
         e_far = 2 + 1*2 + 1*4     # = 8
         @test corner(e_far, 1) == [1.0, 1.0, 1.0]
         @test corner(e_far, 7) == [2.0, 2.0, 2.0]
+    end
+
+    @testset "make_inflated_cube_mesh: neighbour count by topology" begin
+        # Build the 7-patch inflated cube. The outer surface is the cube
+        # [-1, 1]³ tiled by 6·N² quads, one per outermost-shell element of
+        # the six outer patches. The four "side" faces of each outer patch
+        # are shared with the four adjacent outer patches along the cube
+        # edges, so each outer-shell element loses exactly one neighbour
+        # (the radially outward one). All other elements (the inner cube
+        # and the non-outermost outer-patch layers) are fully surrounded.
+        #
+        # Per-element neighbour counts therefore split into just two bins:
+        #   outer-shell (one outer face) → 5
+        #   everything else              → 6
+        N, R = 4, 0.1
+        m = make_inflated_cube_mesh(Float64, N, R)
+
+        # Each element bumps each of its neighbours' counters. By neighbour
+        # symmetry this equals the per-element count of non-zero neighbour
+        # slots, but we follow the prompt and accumulate explicitly.
+        count = zeros(Int, m.Ne)
+        for e in 1:m.Ne, f in 1:6
+            n = m.neighbour[f, e]
+            n == 0 && continue
+            count[n] += 1
+        end
+
+        # Histogram and sanity bounds.
+        @test all(3 .≤ count .≤ 6)
+        n3 = sum(count .== 3)
+        n4 = sum(count .== 4)
+        n5 = sum(count .== 5)
+        n6 = sum(count .== 6)
+        @test n3 + n4 + n5 + n6 == m.Ne
+
+        @test n3 == 0
+        @test n4 == 0
+        @test n5 == 6 * N^2
+        @test n6 == m.Ne - n5
+
+        # Cross-check: total outer-face slots equals tally of missing neighbours.
+        outer_slots = 3*n3 + 2*n4 + 1*n5
+        @test outer_slots == 6 * N^2
+        @test outer_slots == count_zero_neighbours(m)
     end
 
 end
