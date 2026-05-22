@@ -6,10 +6,11 @@ W = WaveToySecondOrder
 
 # Evolve
 
-x0 = 0
+x0 = 0                          # domain
 x1 = 1
-M = 8
-res = W.evolve(x0, x1, M)
+M = 8                           # number of elements
+N = 17                          # number of points per element
+res = W.evolve(x0, x1, M, N)
 t0, t1, x, sol = res.t0, res.t1, res.x, res.sol
 
 # Figure
