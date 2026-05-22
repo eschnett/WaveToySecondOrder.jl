@@ -1,101 +1,52 @@
 # 3D kernels: per-element Laplacian + SAT on a tensor-product GLL block,
-# and the corresponding global RHS over a cuboid mesh.
+# and the corresponding global RHS over a `HexMesh` of conforming hexes.
 #
 # Tensor-product GLL element: per-element data has shape (N, N, N). The 3D
 # Laplacian is the sum of three 1D Laplacians (one per axis); each 1D
 # contribution carries its own SAT at the two faces orthogonal to its axis.
 # The 1D operators (`G`, `L`, `Hinv`, `HinvG_L`, `HinvG_R`) and the SAT
 # increment (`_sat_increment`) are reused unchanged from `kernels1d.jl`.
+#
+# Global state arrays are `Array{T, 4}` of shape `(N, N, N, Ne)` — one
+# (N, N, N) block per element, ordered as a 1-D list of elements. Face
+# connectivity comes from the `HexMesh` rather than from the array layout,
+# which lets the same kernel handle structured cubical, unstructured, and
+# (eventually) multi-block / refined meshes with no further changes.
 
 ################################################################################
 # Initialisation
 
-# Initialise a 3D scalar field on a tensor-product GLL element to the
-# separable eigenmode
-#     u(x,y,z,t) = A · sin(kx·x) · sin(ky·y) · sin(kz·z) · cos(ω·t)
-# which satisfies u_tt = ∇²u for ω² = kx² + ky² + kz².
+# Per-element: evaluate the analytic separable eigenmode on a 3D node block,
+# given the physical (x, y, z) coordinate of each node.
 function initialize3d!(u::AbstractArray{T,3}, u̇::AbstractArray{T,3},
-                       x::AbstractVector, y::AbstractVector, z::AbstractVector,
+                       x::AbstractArray{T,3}, y::AbstractArray{T,3}, z::AbstractArray{T,3},
                        t; A, kx, ky, kz, ω) where {T}
-    sx = reshape(sin.(kx .* x), :, 1, 1)
-    sy = reshape(sin.(ky .* y), 1, :, 1)
-    sz = reshape(sin.(kz .* z), 1, 1, :)
-    @. u  =  A   * sx * sy * sz * cos(ω*t)
-    @. u̇ = -A*ω * sx * sy * sz * sin(ω*t)
+    @. u  =  A   * sin(kx*x) * sin(ky*y) * sin(kz*z) * cos(ω*t)
+    @. u̇ = -A*ω * sin(kx*x) * sin(ky*y) * sin(kz*z) * sin(ω*t)
     return u, u̇
 end
 
-# Per-element initialise on a 6D state array `u[i, j, k, mx, my, mz]`.
-function initialize3d!(u::AbstractArray{T,6}, u̇::AbstractArray{T,6},
-                       x::AbstractMatrix, y::AbstractMatrix, z::AbstractMatrix, t;
+# Global: walk the 1-D element list, dispatch to the per-element method
+# with the appropriate slice of the (3, N, N, N, Ne) coordinate array.
+function initialize3d!(u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
+                       coords::AbstractArray{T,5}, t;
                        A, kx, ky, kz, ω) where {T}
-    Mx, My, Mz = size(u, 4), size(u, 5), size(u, 6)
     @assert size(u̇) == size(u)
-    @assert size(x, 2) == Mx
-    @assert size(y, 2) == My
-    @assert size(z, 2) == Mz
-    for mz in 1:Mz, my in 1:My, mx in 1:Mx
-        initialize3d!(view(u,  :, :, :, mx, my, mz),
-                      view(u̇, :, :, :, mx, my, mz),
-                      view(x, :, mx), view(y, :, my), view(z, :, mz), t;
+    Ne = size(u, 4)
+    @assert size(coords, 5) == Ne
+    for e in 1:Ne
+        initialize3d!(view(u,  :, :, :, e),
+                      view(u̇, :, :, :, e),
+                      view(coords, 1, :, :, :, e),
+                      view(coords, 2, :, :, :, e),
+                      view(coords, 3, :, :, :, e), t;
                       A, kx, ky, kz, ω)
     end
     return u, u̇
 end
 
 ################################################################################
-# Axis abstractions
-
-# Fiber view: at face-position (p, q) along the two passive axes, return
-# the 1D slice running along the active axis D. Axis dispatch is at compile
-# time via `Val{D}`.
-@inline _fiber_view(::Val{1}, A, p, q) = view(A, :, p, q)
-@inline _fiber_view(::Val{2}, A, p, q) = view(A, p, :, q)
-@inline _fiber_view(::Val{3}, A, p, q) = view(A, p, q, :)
-
-# Scalar node access into the 6D state array: pick the active-axis position
-# `i` and the two face-position coordinates `(p, q)` for element `(mx,my,mz)`.
-# Axis dispatch via `Val{D}` collapses at compile time, so callers do direct
-# 6D indexing without any intermediate `SubArray` allocation.
-@inline _node(::Val{1}, u::AbstractArray{<:Any,6}, i, p, q, mx, my, mz) =
-    @inbounds u[i, p, q, mx, my, mz]
-@inline _node(::Val{2}, u::AbstractArray{<:Any,6}, i, p, q, mx, my, mz) =
-    @inbounds u[p, i, q, mx, my, mz]
-@inline _node(::Val{3}, u::AbstractArray{<:Any,6}, i, p, q, mx, my, mz) =
-    @inbounds u[p, q, i, mx, my, mz]
-
-# Read the N×N face slice of element `(mx, my, mz)` at the `row`-th node
-# along axis D and return as a stack-allocated `SMatrix{N,N,T}`.
-@inline function _face_smatrix(::Val{D}, ::Val{N},
-                               u::AbstractArray{T,6}, row::Integer,
-                               mx, my, mz) where {D, N, T}
-    out = MMatrix{N,N,T}(undef)
-    @inbounds for q in 1:N, p in 1:N
-        out[p, q] = _node(Val(D), u, row, p, q, mx, my, mz)
-    end
-    return SMatrix(out)
-end
-
-# Compute the N×N matrix of (∂u/∂ξ_D) at the `row`-th face of element
-# `(mx, my, mz)` and return as `SMatrix`. Two row-of-G dot products per
-# face point. No `SubArray`s, no heap.
-@inline function _face_gradient(::Val{D}, ::Val{N},
-                                u::AbstractArray{T,6}, row::Integer,
-                                mx, my, mz, ops::SBPOps{N,T}) where {D, N, T}
-    G = ops.G
-    out = MMatrix{N,N,T}(undef)
-    @inbounds for q in 1:N, p in 1:N
-        s = zero(T)
-        for i in 1:N
-            s += G[row, i] * _node(Val(D), u, i, p, q, mx, my, mz)
-        end
-        out[p, q] = s
-    end
-    return SMatrix(out)
-end
-
-################################################################################
-# Per-element face data
+# Per-element face data (one struct per axis, lives on the stack)
 
 # Per-axis face-pair data passed to `add_axis_laplacian3d!`: neighbour value
 # and boundary-gradient slices at the two faces orthogonal to a single axis,
@@ -112,16 +63,67 @@ struct FaceData{N, T, NN}
 end
 
 ################################################################################
+# Axis abstractions
+
+# Fiber view: at face-position (p, q) along the two passive axes, return
+# the 1D slice running along the active axis D. Axis dispatch is at compile
+# time via `Val{D}`.
+@inline _fiber_view(::Val{1}, A, p, q) = view(A, :, p, q)
+@inline _fiber_view(::Val{2}, A, p, q) = view(A, p, :, q)
+@inline _fiber_view(::Val{3}, A, p, q) = view(A, p, q, :)
+
+# Scalar node access into the 4D state array (N, N, N, Ne): pick the
+# active-axis position `i` and the two face-position coordinates `(p, q)`
+# for element `e`. Axis dispatch via `Val{D}` collapses at compile time,
+# so callers do direct 4D indexing without any `SubArray` allocation.
+@inline _node(::Val{1}, u::AbstractArray{<:Any,4}, i, p, q, e) =
+    @inbounds u[i, p, q, e]
+@inline _node(::Val{2}, u::AbstractArray{<:Any,4}, i, p, q, e) =
+    @inbounds u[p, i, q, e]
+@inline _node(::Val{3}, u::AbstractArray{<:Any,4}, i, p, q, e) =
+    @inbounds u[p, q, i, e]
+
+# Uniform-value N×N face matrix: every entry equals `b`. Built via
+# `ntuple(_, Val(N*N))` for full unrolling and stack allocation.
+@inline _uniform_face(::Val{N}, ::Type{T}, b) where {N, T} =
+    SMatrix{N, N, T}(ntuple(_ -> T(b), Val(N*N)))
+
+# Read the N×N face slice of element `e` at the `row`-th node along axis
+# D, returning an `SMatrix{N,N,T}`.
+@inline function _face_smatrix(::Val{D}, ::Val{N},
+                               u::AbstractArray{T,4}, row::Integer,
+                               e) where {D, N, T}
+    out = MMatrix{N,N,T}(undef)
+    @inbounds for q in 1:N, p in 1:N
+        out[p, q] = _node(Val(D), u, row, p, q, e)
+    end
+    return SMatrix(out)
+end
+
+# Compute the N×N matrix of (∂u/∂ξ_D) at the `row`-th face of element `e`
+# (two row-of-G dot products per face point). Returns `SMatrix{N,N,T}`.
+# No `SubArray`s, no heap.
+@inline function _face_gradient(::Val{D}, ::Val{N},
+                                u::AbstractArray{T,4}, row::Integer,
+                                e, ops::SBPOps{N,T}) where {D, N, T}
+    G = ops.G
+    out = MMatrix{N,N,T}(undef)
+    @inbounds for q in 1:N, p in 1:N
+        s = zero(T)
+        for i in 1:N
+            s += G[row, i] * _node(Val(D), u, i, p, q, e)
+        end
+        out[p, q] = s
+    end
+    return SMatrix(out)
+end
+
+################################################################################
 # Per-element 3D Laplacian + SAT
 
 # Apply the 1D Laplacian + SIPG-SAT along axis `D` of a 3D element block,
-# *accumulating* into `Lu`. The two faces orthogonal to D each carry an
-# N×N matrix of neighbour values and an N×N matrix of neighbour boundary
-# gradients; the per-face α weights are scalars (no spatial variation
-# along a single face).
-#
-# Per (p, q) on the face, this is exactly the 1D operation `apply_laplacian!`
-# applied to one fiber, plus accumulation instead of overwrite.
+# *accumulating* into `Lu`. Loads each fiber as an `SVector{N}`, computes
+# `ops.L * fiber + _sat_increment(...)` statically (no heap), writes back.
 function add_axis_laplacian3d!(::Val{D},
                                 Lu::AbstractArray{T,3}, u::AbstractArray{T,3},
                                 face::FaceData{N,T};
@@ -165,100 +167,111 @@ end
 ################################################################################
 # 3D global RHS
 
-# Uniform-value N×N face matrix: an `SMatrix{N,N,T}` with every entry equal
-# to the scalar `b`. Built via `ntuple(_, Val(N*N))` so it is fully unrolled
-# and stack-allocated.
-@inline _uniform_face(::Val{N}, ::Type{T}, b) where {N, T} =
-    SMatrix{N, N, T}(ntuple(_ -> T(b), Val(N*N)))
+# Map a mesh face index (1..6) to (active-axis Val, own-face row, neighbour
+# row). Face indices follow the `HexMesh` convention:
+#
+#     1 = −x   2 = +x   3 = −y   4 = +y   5 = −z   6 = +z
+#
+# Own row at the −face is 1, at the +face is N; the neighbour's matching
+# face is the opposite row.
+@inline _face_axis(::Val{1}) = Val(1)
+@inline _face_axis(::Val{2}) = Val(1)
+@inline _face_axis(::Val{3}) = Val(2)
+@inline _face_axis(::Val{4}) = Val(2)
+@inline _face_axis(::Val{5}) = Val(3)
+@inline _face_axis(::Val{6}) = Val(3)
+@inline _face_self_row(::Val{f},  ::Val{N}) where {f, N} = isodd(f) ? 1 : N
+@inline _face_neigh_row(::Val{f}, ::Val{N}) where {f, N} = isodd(f) ? N : 1
 
-# 3D RHS over a cuboid mesh of elements. The six scalar arguments `bxL`,
-# `bxR`, `byL`, `byR`, `bzL`, `bzR` set the (uniform) Dirichlet value on
-# each of the six outer cuboid faces (= 0 reproduces the previous
-# homogeneous behaviour). Element-local: each `(mx, my, mz)` iteration
-# touches only `u[:,:,:, mx, my, mz]` and its six immediate neighbours'
-# boundary slices.
-function rhs3d!(ü::AbstractArray{T,6}, u::AbstractArray{T,6}, u̇::AbstractArray{T,6},
-                bxL, bxR, byL, byR, bzL, bzR;
-                dom, ops::SBPOps{N,T}, τ) where {N, T}
-    Mx, My, Mz = size(u, 4), size(u, 5), size(u, 6)
-    @assert size(ü) == size(u̇) == size(u)
-    half = one(T) / 2
+# Build the `FaceData` for one axis (a pair of opposite mesh faces `fm`,
+# `fp` with `fp = fm + 1`) of one element.
+@inline function _axis_face_data(::Val{fm}, ::Val{fp}, ::Val{N},
+                                 u::AbstractArray{T,4}, e,
+                                 mesh::HexMesh{T},
+                                 bdry_values::NTuple{6, T},
+                                 ops::SBPOps{N,T}) where {fm, fp, N, T}
+    half = T(1) / 2
+    axisV = _face_axis(Val(fm))
 
-    @inbounds for mz in 1:Mz, my in 1:My, mx in 1:Mx
-        ue = view(u,  :, :, :, mx, my, mz)
-        üe = view(ü, :, :, :, mx, my, mz)
-
-        # Build each face's value and gradient as `SMatrix` locals — fully
-        # stack-allocated. Outer faces use a constant N×N matrix filled with
-        # the boundary scalar (mirror gradient for ΔGu = 0).
-
-        # --- −x face ---
-        if mx == 1
-            u_xm  = _uniform_face(Val(N), T, bxL)
-            Gu_xm = _face_gradient(Val(1), Val(N), u, 1, mx, my, mz, ops)
-            αx_m  = one(T)
-        else
-            u_xm  = _face_smatrix(Val(1), Val(N), u, N, mx-1, my, mz)
-            Gu_xm = _face_gradient(Val(1), Val(N), u, N, mx-1, my, mz, ops)
-            αx_m  = half
-        end
-        # --- +x face ---
-        if mx == Mx
-            u_xp  = _uniform_face(Val(N), T, bxR)
-            Gu_xp = _face_gradient(Val(1), Val(N), u, N, mx, my, mz, ops)
-            αx_p  = one(T)
-        else
-            u_xp  = _face_smatrix(Val(1), Val(N), u, 1, mx+1, my, mz)
-            Gu_xp = _face_gradient(Val(1), Val(N), u, 1, mx+1, my, mz, ops)
-            αx_p  = half
-        end
-        # --- −y face ---
-        if my == 1
-            u_ym  = _uniform_face(Val(N), T, byL)
-            Gu_ym = _face_gradient(Val(2), Val(N), u, 1, mx, my, mz, ops)
-            αy_m  = one(T)
-        else
-            u_ym  = _face_smatrix(Val(2), Val(N), u, N, mx, my-1, mz)
-            Gu_ym = _face_gradient(Val(2), Val(N), u, N, mx, my-1, mz, ops)
-            αy_m  = half
-        end
-        # --- +y face ---
-        if my == My
-            u_yp  = _uniform_face(Val(N), T, byR)
-            Gu_yp = _face_gradient(Val(2), Val(N), u, N, mx, my, mz, ops)
-            αy_p  = one(T)
-        else
-            u_yp  = _face_smatrix(Val(2), Val(N), u, 1, mx, my+1, mz)
-            Gu_yp = _face_gradient(Val(2), Val(N), u, 1, mx, my+1, mz, ops)
-            αy_p  = half
-        end
-        # --- −z face ---
-        if mz == 1
-            u_zm  = _uniform_face(Val(N), T, bzL)
-            Gu_zm = _face_gradient(Val(3), Val(N), u, 1, mx, my, mz, ops)
-            αz_m  = one(T)
-        else
-            u_zm  = _face_smatrix(Val(3), Val(N), u, N, mx, my, mz-1)
-            Gu_zm = _face_gradient(Val(3), Val(N), u, N, mx, my, mz-1, ops)
-            αz_m  = half
-        end
-        # --- +z face ---
-        if mz == Mz
-            u_zp  = _uniform_face(Val(N), T, bzR)
-            Gu_zp = _face_gradient(Val(3), Val(N), u, N, mx, my, mz, ops)
-            αz_p  = one(T)
-        else
-            u_zp  = _face_smatrix(Val(3), Val(N), u, 1, mx, my, mz+1)
-            Gu_zp = _face_gradient(Val(3), Val(N), u, 1, mx, my, mz+1, ops)
-            αz_p  = half
-        end
-
-        facex = FaceData(u_xm, u_xp, Gu_xm, Gu_xp, αx_m, αx_p)
-        facey = FaceData(u_ym, u_yp, Gu_ym, Gu_yp, αy_m, αy_p)
-        facez = FaceData(u_zm, u_zp, Gu_zm, Gu_zp, αz_m, αz_p)
-        apply_laplacian3d!(üe, ue, facex, facey, facez; ops, τ)
+    # − face (mesh face index `fm`)
+    nm = mesh.neighbour[fm, e]
+    if nm == 0
+        u_m  = _uniform_face(Val(N), T, bdry_values[mesh.bdry[fm, e]])
+        Gu_m = _face_gradient(axisV, Val(N), u,
+                              _face_self_row(Val(fm), Val(N)), e, ops)
+        α_m  = one(T)
+    else
+        nrow = _face_neigh_row(Val(fm), Val(N))
+        u_m  = _face_smatrix(axisV, Val(N), u, nrow, nm)
+        Gu_m = _face_gradient(axisV, Val(N), u, nrow, nm, ops)
+        α_m  = half
     end
 
-    ü .*= inv(dom.h^2)
+    # + face (mesh face index `fp`)
+    np = mesh.neighbour[fp, e]
+    if np == 0
+        u_p  = _uniform_face(Val(N), T, bdry_values[mesh.bdry[fp, e]])
+        Gu_p = _face_gradient(axisV, Val(N), u,
+                              _face_self_row(Val(fp), Val(N)), e, ops)
+        α_p  = one(T)
+    else
+        nrow = _face_neigh_row(Val(fp), Val(N))
+        u_p  = _face_smatrix(axisV, Val(N), u, nrow, np)
+        Gu_p = _face_gradient(axisV, Val(N), u, nrow, np, ops)
+        α_p  = half
+    end
+    return FaceData(u_m, u_p, Gu_m, Gu_p, α_m, α_p)
+end
+
+"""
+    rhs3d!(ü, u, u̇, bdry_values; mesh, ops, τ)
+
+3D RHS over the `HexMesh` `mesh`. State arrays are 4D, shape (N, N, N, Ne),
+with element ordering matching `mesh`. The 6-tuple `bdry_values` is indexed
+by the boundary tag stored on each outer face (`mesh.bdry[f, e]`), so
+`bdry_values[k]` is the uniform Dirichlet value at every outer face
+carrying tag `k`.
+
+Element-local: each iteration touches only `u[:,:,:, e]` and the boundary
+slices of its (up to six) immediate neighbours, looked up through
+`mesh.neighbour[f, e]`. Outer faces (`neighbour == 0`) use the boundary
+scalar plus the mirror-gradient convention.
+
+The Laplacian is scaled per element by `1/h_e²` where `h_e` is taken from
+the (axis-aligned, uniform) hex's vertex extent. For non-uniform or curved
+meshes this scaling will eventually be replaced by a per-node Jacobian /
+inverse-metric.
+"""
+function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
+                bdry_values::NTuple{6, T};
+                mesh::HexMesh{T}, ops::SBPOps{N,T}, τ) where {N, T}
+    @assert size(ü) == size(u̇) == size(u)
+    @assert size(u, 1) == size(u, 2) == size(u, 3) == N
+    @assert size(u, 4) == mesh.Ne
+
+    @inbounds for e in 1:mesh.Ne
+        ue = view(u,  :, :, :, e)
+        üe = view(ü, :, :, :, e)
+
+        facex = _axis_face_data(Val(1), Val(2), Val(N), u, e, mesh, bdry_values, ops)
+        facey = _axis_face_data(Val(3), Val(4), Val(N), u, e, mesh, bdry_values, ops)
+        facez = _axis_face_data(Val(5), Val(6), Val(N), u, e, mesh, bdry_values, ops)
+
+        apply_laplacian3d!(üe, ue, facex, facey, facez; ops, τ)
+
+        # Per-element 1/h² scaling. For axis-aligned uniform hexes the
+        # extent along any axis works; for curved or non-uniform hexes,
+        # replace with a per-node inverse-metric scaling. Corner 1 is the
+        # (−x, −y, −z) vertex; corner 2 is (+x, −y, −z), so corners 1→2
+        # span one edge of the element along x.
+        v1 = mesh.vertex_idx[1, e]
+        v2 = mesh.vertex_idx[2, e]
+        h_e = mesh.vertex_coords[1, v2] - mesh.vertex_coords[1, v1]
+        inv_h2 = T(1) / (h_e * h_e)
+        for k in 1:N, j in 1:N, i in 1:N
+            üe[i, j, k] *= inv_h2
+        end
+    end
+
     return ü
 end

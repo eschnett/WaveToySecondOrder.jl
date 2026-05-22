@@ -13,6 +13,11 @@ include("operators.jl")
 # `rhs!`, plus the diagnostic `build_global_laplacian`).
 include("kernels1d.jl")
 
+# Hex-mesh topology + geometry (`HexMesh`, `make_cubical_mesh`).
+# Decouples 3D kernels from any particular grid arrangement and prepares
+# the way for unstructured / multi-block / refined meshes.
+include("mesh.jl")
+
 # Per-element and global 3D kernels (`initialize3d!`, `apply_laplacian3d!`,
 # `rhs3d!`, plus axis abstractions and face-data helpers).
 include("kernels3d.jl")

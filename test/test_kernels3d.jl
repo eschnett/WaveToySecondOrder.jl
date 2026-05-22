@@ -3,7 +3,8 @@
 # the analytic separable eigenmode.
 
 using WaveToySecondOrder
-using WaveToySecondOrder: make_element, make_domain, make_operators,
+using WaveToySecondOrder: make_element, make_operators,
+    make_cubical_mesh, element_coords,
     apply_laplacian3d!, initialize3d!, rhs3d!, FaceData
 using OrdinaryDiffEqSymplecticRK
 using StaticArrays
@@ -58,40 +59,39 @@ using Test
         #   u(x,y,z,t) = sin(2π x)·sin(2π y)·sin(2π z) · cos(ω·t)
         # on the unit cube with homogeneous Dirichlet BC on all six outer
         # faces. ω² = kx² + ky² + kz² = 3·(2π)².
-        N = 5
-        M = 4
+        N    = 5
+        M    = 4
         elem = make_element(Float64, N)
         ops  = make_operators(elem)
-        dom  = make_domain(Float64, M, 0, 1)
+        mesh = make_cubical_mesh(Float64, M, 0.0, 1.0)
+        coords = element_coords(mesh, elem)
 
-        x = [x + dom.h * a for a in elem.xs, x in dom.xs]
-        y = x;  z = x
-        dx = dom.h * elem.h
+        dx = elem.h * (1 / M)        # node spacing within an element of width 1/M
 
-        u  = Array{Float64,6}(undef, N, N, N, M, M, M)
+        u  = Array{Float64,4}(undef, N, N, N, mesh.Ne)
         u̇  = similar(u)
 
         A  = 1.0
         kx = ky = kz = 2π
         ω  = sqrt(kx^2 + ky^2 + kz^2)
-        initialize3d!(u, u̇, x, y, z, 0.0; A, kx, ky, kz, ω)
+        initialize3d!(u, u̇, coords, 0.0; A, kx, ky, kz, ω)
 
         τ  = 3//2 * (N-1)^2
         dt = (1//2 * dx) / sqrt(3)
         t1 = 1.0   # ≈ 1.73 periods of the eigenmode
 
-        f!(ü, u̇, u, p, t) =
-            rhs3d!(ü, u, u̇, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0; dom, ops, τ)
+        bdry_values = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        f!(ü, u̇, u, p, t) = rhs3d!(ü, u, u̇, bdry_values; mesh, ops, τ)
         prob = SecondOrderODEProblem(f!, u̇, u, (0.0, t1))
         sol  = solve(prob, KahanLi8(); dt)
 
         u_exact = similar(u);  u̇_exact = similar(u)
-        initialize3d!(u_exact, u̇_exact, x, y, z, t1; A, kx, ky, kz, ω)
+        initialize3d!(u_exact, u̇_exact, coords, t1; A, kx, ky, kz, ω)
 
         # SecondOrderODEProblem state layout: [du; u]
-        n     = N^3 * M^3
+        n     = N^3 * mesh.Ne
         final = sol(t1)
-        u_num = reshape(final[n+1 : 2n], N, N, N, M, M, M)
+        u_num = reshape(final[n+1 : 2n], N, N, N, mesh.Ne)
 
         # Empirical error at this resolution is ≈ 5e-4; allow ~10× margin.
         @test maximum(abs, u_num - u_exact) < 5e-3
