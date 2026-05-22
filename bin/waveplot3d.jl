@@ -1,8 +1,9 @@
 using CairoMakie
+using OrdinaryDiffEqSymplecticRK
 using SixelTerm
 using WaveToySecondOrder
 
-W = WaveToySecondOrder
+const W = WaveToySecondOrder
 
 # Evolve
 
@@ -10,13 +11,33 @@ x0 = 0.0
 x1 = 1.0
 M  = 8                          # elements per axis (Mx = My = Mz = M)
 N  = 5                          # GLL nodes per element
-res = W.evolve3d(x0, x1, M, N)
-(; t0, t1, x, y, z, sol) = res
 
-# Analytic-solution parameters (must match what `evolve3d` hard-codes).
-A  = 1.0
+elem = W.make_element(Float64, N)
+ops  = W.make_operators(elem)
+dom  = W.make_domain(Float64, M, x0, x1)
+
+x = [x + dom.h * a for a in elem.xs, x in dom.xs]
+y = x
+z = x
+dx = dom.h * elem.h
+
+u   = Array{Float64, 6}(undef, N, N, N, M, M, M)
+u̇   = similar(u)
+
+t0, t1 = 0.0, 1.0
+A      = 1.0
 kx = ky = kz = 2π
-ω  = sqrt(kx^2 + ky^2 + kz^2)
+ω      = sqrt(kx^2 + ky^2 + kz^2)
+W.initialize3d!(u, u̇, x, y, z, t0; A, kx, ky, kz, ω)
+
+τ  = 3//2 * (N-1)^2             # SIPG threshold ~ 2·(N−1)² in unit coords
+dt = (1//2 * dx) / sqrt(3)      # CFL: 3D spectral radius ≈ 3× the 1D one
+
+bxL = bxR = byL = byR = bzL = bzR = 0.0    # homogeneous outer Dirichlet
+f!(ü, u̇, u, p, t) =
+    W.rhs3d!(ü, u, u̇, bxL, bxR, byL, byR, bzL, bzR; dom, ops, τ)
+prob = SecondOrderODEProblem(f!, u̇, u, (t0, t1))
+sol  = solve(prob, KahanLi8(); dt)
 
 # Pick a spacetime line through the domain at y = z = 0.25. The middle of
 # the domain (y = z = 0.5) is a zero of the sin(2π·y/z) eigenmode and would
@@ -36,12 +57,12 @@ Nt = 200                        # number of time samples
 ts = range(t0, t1, Nt)
 
 # Buffers
-n_dofs   = N^3 * M^3
-us       = Array{Float64}(undef, length(xs), Nt)   # u   along the spacetime line
-u̇s       = Array{Float64}(undef, length(xs), Nt)   # u̇ along the spacetime line
-l2_err   = Vector{Float64}(undef, Nt)              # L2 norm of error vs time
-u_exact  = Array{Float64, 6}(undef, N, N, N, M, M, M)
-u̇_exact  = similar(u_exact)
+n_dofs  = N^3 * M^3
+us      = Array{Float64}(undef, length(xs), Nt)   # u   along the spacetime line
+u̇s      = Array{Float64}(undef, length(xs), Nt)   # u̇ along the spacetime line
+l2_err  = Vector{Float64}(undef, Nt)              # L2 norm of error vs time
+u_exact = Array{Float64, 6}(undef, N, N, N, M, M, M)
+u̇_exact = similar(u_exact)
 
 # A reasonable proxy for the L2 norm on the GLL grid. (The proper H-weighted
 # norm would multiply each node by w_i·w_j·w_k·h_x·h_y·h_z; for a uniform
