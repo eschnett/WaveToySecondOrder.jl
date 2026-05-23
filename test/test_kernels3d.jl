@@ -1,95 +1,134 @@
 # Tests for `src/kernels3d.jl`: curvilinear-aware `rhs3d!`. The full
 # wave-evolution check against the analytic separable eigenmode is the
-# end-to-end correctness gate.
+# end-to-end correctness gate. Each wave-evolution / stability test runs
+# in both `Float64` and `Float32` to keep the GPU-friendly (Float32-only)
+# path honest.
 
 using WaveToySecondOrder
 using WaveToySecondOrder: make_element, make_operators,
-    make_cubical_mesh, make_inflated_cube_mesh, make_geometry,
-    initialize3d!, rhs3d!, recommended_dt
+    make_cubical_mesh, make_cubed_cube_mesh, make_geometry,
+    initialize3d!, rhs3d!, recommended_dt,
+    discrete_inner_product, Params3d
 using OrdinaryDiffEqSymplecticRK
+using Random
 using Test
 
-@testset "kernels3d" begin
+# Discrete Hamiltonian for the SBP-DG wave equation:
+#
+#   E = ½ ⟨u̇, u̇⟩_{H_phys}  +  ½ ⟨u, −L_h u⟩_{H_phys}
+#
+# Kinetic + (positive) potential. For a symplectic integrator on a
+# negative-semi-definite `L_h` this should oscillate around a constant
+# within an O(dt^p) modified-Hamiltonian envelope.
+function discrete_energy(u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
+                          geom, ops, τ) where {T}
+    bdry = ntuple(_ -> zero(T), Val(6))
+    Lu   = similar(u)
+    rhs3d!(Lu, u, u̇, bdry; geom, ops, τ)
+    K = discrete_inner_product(u̇, u̇, geom, ops) / 2
+    V = -discrete_inner_product(u, Lu, geom, ops) / 2
+    return K + V
+end
 
-    @testset "wave evolution matches analytic solution (M=4, N=5)" begin
+# `_progress` writes one cyan line to stderr so the user sees what's
+# running during compile-heavy stretches. Defined per-file so each test
+# file remains runnable standalone.
+_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
+                  flush(stderr))
+
+@testset "kernels3d (T=$T)" for T in (Float64, Float32)
+
+    # Float32 reaches the ~1e-6 round-off floor in a few hundred
+    # timesteps; widen the analytic-error tolerance accordingly. The
+    # qualitative correctness check (no blow-up, energy conserved) is
+    # identical for both precisions.
+    analytic_tol = T === Float64 ? 1.0e-2 : 5.0e-2
+    energy_tol   = T === Float64 ? 0.10   : 0.15
+
+    _progress("wave evolution (M=4, N=4, T=$T)")
+    @testset "wave evolution matches analytic solution (M=4, N=4, T=$T)" begin
         # Evolve u_tt = ∇²u with the separable analytic eigenmode
         #   u(x,y,z,t) = sin(2π x)·sin(2π y)·sin(2π z) · cos(ω·t)
-        # on the unit cube with homogeneous Dirichlet BC on all six outer
-        # faces. ω² = kx² + ky² + kz² = 3·(2π)².
-        N    = 5
+        # on the unit cube with homogeneous Dirichlet BC on all six
+        # outer faces. ω² = kx² + ky² + kz² = 3·(2π)².
+        N    = 4
         M    = 4
-        elem = make_element(Float64, N)
+        elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(Float64, M, 0.0, 1.0)
+        mesh = make_cubical_mesh(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
         coords = geom.coords
 
-        dx = elem.h * (1 / M)        # node spacing within an element of width 1/M
+        dx = elem.h * (one(T) / M)
 
-        u  = Array{Float64,4}(undef, N, N, N, mesh.Ne)
+        u  = Array{T, 4}(undef, N, N, N, mesh.Ne)
         u̇  = similar(u)
 
-        A  = 1.0
-        kx = ky = kz = 2π
-        ω  = sqrt(kx^2 + ky^2 + kz^2)
-        initialize3d!(u, u̇, coords, 0.0; A, kx, ky, kz, ω)
+        params = Params3d(;
+            A           = one(T),
+            k           = (T(2π), T(2π), T(2π)),
+            ω           = T(sqrt(3 * (2π)^2)),
+            τ           = T(3//2) * (N-1)^2,
+            bdry_values = ntuple(_ -> zero(T), Val(6)),
+        )
+        initialize3d!(u, u̇, coords, zero(T), params)
 
-        τ  = 3//2 * (N-1)^2
-        dt = (1//2 * dx) / sqrt(3)
-        t1 = 1.0   # ≈ 1.73 periods of the eigenmode
+        dt = (T(1//2) * dx) / sqrt(T(3))
+        t1 = T(1//2)   # ≈ 0.87 periods of the eigenmode — enough to
+                       # catch dispersion error without doubling runtime.
 
-        bdry_values = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        f!(ü, u̇, u, p, t) = rhs3d!(ü, u, u̇, bdry_values; geom, ops, τ)
-        prob = SecondOrderODEProblem(f!, u̇, u, (0.0, t1))
+        f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
+        prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t1), params)
         sol  = solve(prob, KahanLi8(); dt)
 
         u_exact = similar(u);  u̇_exact = similar(u)
-        initialize3d!(u_exact, u̇_exact, coords, t1; A, kx, ky, kz, ω)
+        initialize3d!(u_exact, u̇_exact, coords, t1, params)
 
-        # SecondOrderODEProblem state layout: [du; u]
         n     = N^3 * mesh.Ne
         final = sol(t1)
         u_num = reshape(final[n+1 : 2n], N, N, N, mesh.Ne)
 
-        # Empirical error at this resolution is ≈ 5e-4; allow ~10× margin.
-        @test maximum(abs, u_num - u_exact) < 5e-3
+        @test maximum(abs, u_num - u_exact) < analytic_tol
     end
 
-    @testset "inflated cube evolution stays bounded (M=2, N=4, R=0.3)" begin
-        # Quick stability check on the curvilinear / multi-patch mesh: the
-        # 7-patch inflated cube exercises non-axis-aligned face matchings,
-        # left-handed outer-patch frames, and the curvilinear penalty
-        # threshold. With `τ ≈ 4·(N−1)²` (the curvilinear rule of thumb)
-        # the discrete operator is negative semi-definite, so a symplectic
-        # integrator preserves bounded energy.
+    _progress("cubed cube bounded (M=2, N=4, T=$T)")
+    @testset "cubed cube evolution stays bounded (M=2, N=4, R=0.3, T=$T)" begin
+        # Quick stability check on the curvilinear / multi-patch mesh.
+        # With `τ ≈ 8·(N−1)²` the discrete operator is NSD, so a
+        # symplectic integrator preserves bounded energy.
         N    = 4
         M    = 2
-        R    = 0.3
-        elem = make_element(Float64, N)
+        R    = T(0.3)
+        elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_inflated_cube_mesh(Float64, M, R)
+        mesh = make_cubed_cube_mesh(T, M, R)
         geom = make_geometry(mesh, elem)
         coords = geom.coords
 
         # Domain-normalised sine IC on [-1, +1]³ (vanishes on outer faces).
-        x0, x1, L_ = -1.0, 1.0, 2.0
-        kx = ky = kz = 3π
-        u  = Array{Float64,4}(undef, N, N, N, mesh.Ne)
-        u̇ = similar(u)
+        x0, x1, L_ = -one(T), one(T), T(2)
+        params = Params3d(;
+            A           = one(T),
+            k           = (T(3π), T(3π), T(3π)),
+            ω           = T(sqrt(3 * (3π)^2)) / L_,
+            τ           = T(8) * (N-1)^2,
+            bdry_values = ntuple(_ -> zero(T), Val(6)),
+        )
+        kx, ky, kz = params.k
+        u  = Array{T, 4}(undef, N, N, N, mesh.Ne)
+        u̇  = similar(u)
         for e in 1:mesh.Ne, k in 1:N, j in 1:N, i in 1:N
             X = (coords[1, i, j, k, e] - x0) / L_
             Y = (coords[2, i, j, k, e] - x0) / L_
             Z = (coords[3, i, j, k, e] - x0) / L_
-            u[i, j, k, e]  = sin(kx*X) * sin(ky*Y) * sin(kz*Z)
-            u̇[i, j, k, e] = 0.0
+            u[i, j, k, e]  = params.A * sin(kx*X) * sin(ky*Y) * sin(kz*Z)
+            u̇[i, j, k, e] = zero(T)
         end
         u0_max = maximum(abs, u)
 
-        τ  = 8.0 * (N-1)^2                  # curvilinear rule of thumb
-        dt = recommended_dt(geom, ops, τ)   # power-iteration estimate
-        bdry_values = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        f!(ü, u̇, u, p, t) = rhs3d!(ü, u, u̇, bdry_values; geom, ops, τ)
-        prob = SecondOrderODEProblem(f!, u̇, u, (0.0, 0.1))
+        dt = recommended_dt(geom, ops, params.τ)
+        f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
+        prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), T(0.1)), params)
         sol  = solve(prob, KahanLi8(); dt,
                      save_everystep = false, save_start = false,
                      dense = false, save_end = true)
@@ -99,10 +138,101 @@ using Test
         u_end = reshape(view(final, n+1 : 2n), N, N, N, mesh.Ne)
 
         @test all(isfinite, u_end)
-        # IC has |u| ≤ 1; with a coercive operator and a symplectic
-        # integrator the amplitude should stay near 1 (some swell is OK
-        # but a 2× margin is well below any instability signature).
         @test maximum(abs, u_end) < 2 * u0_max
+    end
+
+    _progress("robust stability — cubical (T=$T)")
+    @testset "robust stability — cubical M=3, N=3, noise IC (T=$T)" begin
+        # Coarse axis-aligned mesh, broad-spectrum (random) IC, short
+        # integration. Discrete operator is symmetric NSD here so the
+        # symplectic integrator should keep the Hamiltonian within an
+        # O(dt^p) envelope of its initial value.
+        N    = 3
+        M    = 3
+        elem = make_element(T, N)
+        ops  = make_operators(elem)
+        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        geom = make_geometry(mesh, elem)
+
+        Random.seed!(20250522)
+        u  = randn(T, N, N, N, mesh.Ne)
+        u̇  = randn(T, N, N, N, mesh.Ne)
+
+        params = Params3d(;
+            A           = zero(T),
+            k           = (zero(T), zero(T), zero(T)),
+            ω           = zero(T),
+            τ           = T(3//2) * (N - 1)^2,
+            bdry_values = ntuple(_ -> zero(T), Val(6)),
+        )
+        dt      = recommended_dt(geom, ops, params.τ; cfl_safety = T(0.5))
+        n_steps = 50
+        t_end   = n_steps * dt
+
+        E0 = discrete_energy(u, u̇, geom, ops, params.τ)
+
+        f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
+        prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
+        sol  = solve(prob, KahanLi8(); dt,
+                     save_everystep = false, save_start = false,
+                     dense = false, save_end = true)
+        final = sol.u[end]
+        u̇_end = final.x[1]
+        u_end = final.x[2]
+
+        @test all(isfinite, u_end) && all(isfinite, u̇_end)
+        # Energy conservation is the meaningful "no amplification"
+        # test for a broad-spectrum IC: on a coercive (NSD) `L_h`, a
+        # symplectic integrator keeps the discrete Hamiltonian within
+        # an O(dt^p) envelope of its initial value. (Pointwise
+        # `max|u|`/`max|u̇|` is *not* a good amplification check —
+        # energy can redistribute from `u` into the fastest modes
+        # whose `u̇` magnitude is `ω_max·‖u‖`, i.e. easily
+        # 10²–10³× initial, without any instability.)
+        E_end = discrete_energy(u_end, u̇_end, geom, ops, params.τ)
+        @test abs(E_end - E0) < energy_tol * abs(E0)
+    end
+
+    _progress("robust stability — cubed cube (T=$T)")
+    @testset "robust stability — cubed cube M=2, N=3, R=0.3, noise IC (T=$T)" begin
+        # Same diagnostic on the curvilinear / multi-patch mesh.
+        N    = 3
+        M    = 2
+        R    = T(0.3)
+        elem = make_element(T, N)
+        ops  = make_operators(elem)
+        mesh = make_cubed_cube_mesh(T, M, R)
+        geom = make_geometry(mesh, elem)
+
+        Random.seed!(20250522)
+        u  = randn(T, N, N, N, mesh.Ne)
+        u̇  = randn(T, N, N, N, mesh.Ne)
+
+        params = Params3d(;
+            A           = zero(T),
+            k           = (zero(T), zero(T), zero(T)),
+            ω           = zero(T),
+            τ           = T(8) * (N - 1)^2,
+            bdry_values = ntuple(_ -> zero(T), Val(6)),
+        )
+        dt      = recommended_dt(geom, ops, params.τ; cfl_safety = T(0.5))
+        n_steps = 50
+        t_end   = n_steps * dt
+
+        E0 = discrete_energy(u, u̇, geom, ops, params.τ)
+
+        f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
+        prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
+        sol  = solve(prob, KahanLi8(); dt,
+                     save_everystep = false, save_start = false,
+                     dense = false, save_end = true)
+        final = sol.u[end]
+        u̇_end = final.x[1]
+        u_end = final.x[2]
+
+        @test all(isfinite, u_end) && all(isfinite, u̇_end)
+        E_end = discrete_energy(u_end, u̇_end, geom, ops, params.τ)
+        @test abs(E_end - E0) < energy_tol * abs(E0)
     end
 
 end

@@ -1,7 +1,7 @@
 # Tests for `src/mesh.jl`: `HexMesh`, `make_cubical_mesh`.
 
 using WaveToySecondOrder
-using WaveToySecondOrder: HexMesh, make_cubical_mesh, make_inflated_cube_mesh, nv
+using WaveToySecondOrder: HexMesh, make_cubical_mesh, make_cubed_cube_mesh, nv
 using Test
 
 count_zero_neighbours(m::HexMesh) = count(==(0), m.neighbour)
@@ -101,8 +101,8 @@ count_zero_neighbours(m::HexMesh) = count(==(0), m.neighbour)
         @test corner(e_far, 7) == [2.0, 2.0, 2.0]
     end
 
-    @testset "make_inflated_cube_mesh: neighbour count by topology" begin
-        # Build the 7-patch inflated cube. The outer surface is the cube
+    @testset "make_cubed_cube_mesh: neighbour count by topology" begin
+        # Build the 7-patch cubed cube. The outer surface is the cube
         # [-1, 1]³ tiled by 6·M² quads, one per outermost-shell element of
         # the six outer patches. The four "side" faces of each outer patch
         # are shared with the four adjacent outer patches along the cube
@@ -114,7 +114,7 @@ count_zero_neighbours(m::HexMesh) = count(==(0), m.neighbour)
         #   outer-shell (one outer face) → 5
         #   everything else              → 6
         M, R = 4, 0.1
-        m = make_inflated_cube_mesh(Float64, M, R)
+        m = make_cubed_cube_mesh(Float64, M, R)
 
         # Each element bumps each of its neighbours' counters. By neighbour
         # symmetry this equals the per-element count of non-zero neighbour

@@ -52,7 +52,84 @@ using Polyester: @batch
 using StaticArrays: SVector
 
 ################################################################################
-# Initialisation (unchanged from previous version)
+# Workspace
+
+"""
+    Rhs3dWorkspace{T, N}
+
+Per-thread scratch buffers consumed by `rhs3d!`. Allocate once before
+the main timestepping loop and pass via the `workspace` keyword of
+`rhs3d!`; the default behaviour (omit `workspace`) re-allocates the
+buffers on every call, which costs ~50 KB of garbage per invocation.
+
+# Fields
+
+* `Du_buf, W_buf :: Vector{Array{T, 4}}` — each entry has shape
+  `(3, N, N, N)`; the outer vector is sized to `Threads.maxthreadid()`
+  so each thread owns a private slot indexed by `Threads.threadid()`.
+"""
+struct Rhs3dWorkspace{T, N}
+    Du_buf :: Vector{Array{T, 4}}
+    W_buf  :: Vector{Array{T, 4}}
+end
+
+Rhs3dWorkspace{T, N}() where {T, N} = Rhs3dWorkspace{T, N}(
+    [Array{T, 4}(undef, 3, N, N, N) for _ in 1:Threads.maxthreadid()],
+    [Array{T, 4}(undef, 3, N, N, N) for _ in 1:Threads.maxthreadid()])
+
+"""
+    Rhs3dWorkspace(elem) → Rhs3dWorkspace{T, N}
+
+Convenience constructor that picks `T = eltype(elem.xs)` and `N = elem.N`.
+"""
+Rhs3dWorkspace(elem) = Rhs3dWorkspace{eltype(elem.xs), elem.N}()
+
+################################################################################
+# System parameters
+
+"""
+    Params3d{T}
+
+Bundle of system-level scalar parameters for the 3D wave equation:
+
+* `A` — IC amplitude.
+* `k :: NTuple{3, T}` — IC wavenumber vector `(kx, ky, kz)`.
+* `ω` — IC angular frequency.
+* `τ` — SIPG penalty constant for `rhs3d!`.
+* `bdry_values :: NTuple{6, T}` — per-face Dirichlet values, indexed
+  by the boundary-condition tag stored on each outer face
+  (`mesh.bdry[f, e]`).
+
+These are exactly the mesh-independent scalars that the driver assembles
+once and feeds to the IC setup and the RHS. Bundling them lets us pass
+the whole bundle as the `p` argument of a `SecondOrderODEProblem` and
+dispatch on `f!(ü, u̇, u, p::Params3d, t)` instead of capturing globals.
+"""
+struct Params3d{T}
+    A           :: T
+    k           :: NTuple{3, T}
+    ω           :: T
+    τ           :: T
+    bdry_values :: NTuple{6, T}
+end
+
+"""
+    Params3d(; A, k, ω, τ, bdry_values) → Params3d{T}
+
+Keyword constructor. The element type `T` is taken by promoting all
+inputs to a common floating-point type.
+"""
+function Params3d(; A, k, ω, τ, bdry_values)
+    T = promote_type(typeof(A), eltype(k), typeof(ω), typeof(τ), eltype(bdry_values))
+    return Params3d{T}(T(A),
+                       NTuple{3, T}(k),
+                       T(ω),
+                       T(τ),
+                       NTuple{6, T}(bdry_values))
+end
+
+################################################################################
+# Initialisation
 
 function initialize3d!(u::AbstractArray{T,3}, u̇::AbstractArray{T,3},
                        x::AbstractArray{T,3}, y::AbstractArray{T,3}, z::AbstractArray{T,3},
@@ -61,6 +138,14 @@ function initialize3d!(u::AbstractArray{T,3}, u̇::AbstractArray{T,3},
     @. u̇ = -A*ω * sin(kx*x) * sin(ky*y) * sin(kz*z) * sin(ω*t)
     return u, u̇
 end
+
+# `Params3d`-bundled variant.
+initialize3d!(u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
+              coords::AbstractArray{T,5}, t, params::Params3d{T}) where {T} =
+    initialize3d!(u, u̇, coords, t;
+                  A = params.A,
+                  kx = params.k[1], ky = params.k[2], kz = params.k[3],
+                  ω = params.ω)
 
 function initialize3d!(u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
                        coords::AbstractArray{T,5}, t;
@@ -145,6 +230,13 @@ end
     a_idx   = _face_axis_idx(Val(f))
     face_r  = _face_row(Val(f), Val(N))
     sgn_f   = _face_sign(Val(f), T)
+    sgn_c   = _cross_sign(Val(a_idx), T)
+    # Element-wise outward sign: `sgn_face · ε_perm · sign(det J)`. The
+    # cyclic-permutation factor `sgn_c` is compile-time; the handedness
+    # is one Int8 per element, looked up once before the face-node loop.
+    # Together they replace the per-face-node `cross · col_a` dot-product
+    # test that the kernel used to perform inside the loop.
+    sgn_out = sgn_f * sgn_c * T(geom.handedness[e])
     axis_p, axis_q = _tangent_axes(Val(a_idx))
 
     G   = ops.G
@@ -177,23 +269,12 @@ end
         tq_y = axis_q == 1 ? J21 : axis_q == 2 ? J22 : J23
         tq_z = axis_q == 1 ? J31 : axis_q == 2 ? J32 : J33
 
-        # Natural cross product of the tangent vectors (in physical space).
-        cx = tp_y * tq_z - tp_z * tq_y
-        cy = tp_z * tq_x - tp_x * tq_z
-        cz = tp_x * tq_y - tp_y * tq_x
-
-        # Determine the outward sign from the actual J column along axis a:
-        # the outward normal at face row 1 (resp. N) is anti-parallel (resp.
-        # parallel) to `col_a = ∂x/∂ξ_a` independent of element handedness.
-        col_a_x = a_idx == 1 ? J11 : a_idx == 2 ? J12 : J13
-        col_a_y = a_idx == 1 ? J21 : a_idx == 2 ? J22 : J23
-        col_a_z = a_idx == 1 ? J31 : a_idx == 2 ? J32 : J33
-        dot_ca  = cx * col_a_x + cy * col_a_y + cz * col_a_z   # = ε_{p,q,a} · det J
-        sgn_out = sgn_f * (dot_ca ≥ 0 ? one(T) : -one(T))
-
-        nx_u = sgn_out * cx
-        ny_u = sgn_out * cy
-        nz_u = sgn_out * cz
+        # Outward (un-normalised) face normal. `sgn_out` was computed
+        # once before the loop from `sgn_face · sgn_cyclic · handedness[e]`
+        # — uniform across the face, no per-node branch.
+        nx_u = sgn_out * (tp_y * tq_z - tp_z * tq_y)
+        ny_u = sgn_out * (tp_z * tq_x - tp_x * tq_z)
+        nz_u = sgn_out * (tp_x * tq_y - tp_y * tq_x)
 
         JF = sqrt(nx_u*nx_u + ny_u*ny_u + nz_u*nz_u)
         nx = nx_u / JF; ny = ny_u / JF; nz = nz_u / JF
@@ -295,7 +376,7 @@ implementation.
 semi-definite. Empirical rules of thumb (N = 5 GLL nodes per element):
 
 * **Axis-aligned cubical mesh**: `τ ≈ 1.5·(N−1)² = 24` is sufficient.
-* **Curvilinear / multi-patch mesh** (e.g. `make_inflated_cube_mesh`):
+* **Curvilinear / multi-patch mesh** (e.g. `make_cubed_cube_mesh`):
   the SIPG threshold rises significantly because the outer-patch
   elements are anisotropic and skewed. Use `τ ≈ 8·(N−1)² = 128` (for
   N=5). The threshold at which the operator first becomes NSD is around
@@ -310,9 +391,22 @@ slowly grow even with a symplectic integrator; you can verify
 coercivity for any (geom, ops, τ) tuple via [`discrete_laplacian`](@ref)
 on a small representative mesh.
 """
+# `Params3d`-bundled variant — pulls `τ` and `bdry_values` from `params`
+# and forwards to the canonical method below. The diagnostic helpers
+# (`discrete_laplacian`, `spectral_radius_estimate`) keep using the
+# canonical signature because they only care about `τ`.
+function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
+                params::Params3d{T};
+                geom::MeshGeometry{T, N}, ops::SBPOps{N, T},
+                workspace = nothing) where {N, T}
+    return rhs3d!(ü, u, u̇, params.bdry_values;
+                  geom, ops, τ = params.τ, workspace)
+end
+
 function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
                 bdry_values::NTuple{6, T};
-                geom::MeshGeometry{T, N}, ops::SBPOps{N, T}, τ) where {N, T}
+                geom::MeshGeometry{T, N}, ops::SBPOps{N, T}, τ,
+                workspace = nothing) where {N, T}
     @assert size(ü) == size(u̇) == size(u)
     @assert size(u, 1) == size(u, 2) == size(u, 3) == N
     @assert size(u, 4) == geom.mesh.Ne
@@ -329,9 +423,12 @@ function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArra
     # to `Threads.@threads`. Per-iteration `threadid()` is stable because
     # `@batch` does not migrate work between threads. Buffers are sized to
     # `maxthreadid()` since Julia's thread ids span the default and
-    # interactive thread pools.
-    Du_buf = [Array{T, 4}(undef, 3, N, N, N) for _ in 1:Threads.maxthreadid()]
-    W_buf  = [Array{T, 4}(undef, 3, N, N, N) for _ in 1:Threads.maxthreadid()]
+    # interactive thread pools. Pass `workspace::Rhs3dWorkspace` to reuse
+    # buffers across calls — the default `nothing` allocates fresh ones.
+    ws = workspace isa Rhs3dWorkspace ? workspace :
+                                        Rhs3dWorkspace{T, N}()
+    Du_buf = ws.Du_buf
+    W_buf  = ws.W_buf
 
     @inbounds @batch for e in 1:mesh.Ne
         tid = Threads.threadid()

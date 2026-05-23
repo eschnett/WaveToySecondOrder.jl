@@ -9,8 +9,12 @@ using LinearAlgebra
 using OrdinaryDiffEqSymplecticRK
 using Test
 
+_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
+                  flush(stderr))
+
 @testset "kernels1d" begin
 
+    _progress("operator-level identities (single + 2-element)")
     N, ns, x0, x1, h, xs = elem = make_element(Rational{Int64}, 5)
     ops = make_operators(elem)
     (; B, G, H, Hinv, HinvG_L, HinvG_R, D, L) = ops
@@ -97,6 +101,7 @@ using Test
         end
     end
 
+    _progress("global SAT stability + jump penalty")
     @testset "global L_SAT wave-equation stability" begin
         # Eigenvalues real and non-positive for τ above threshold.
         for M in (2, 3, 4)
@@ -130,12 +135,13 @@ using Test
         end
     end
 
-    @testset "wave evolution matches analytic solution (N=5, M=8)" begin
+    _progress("wave evolution (1D, N=4, M=8)")
+    @testset "wave evolution matches analytic solution (N=4, M=8)" begin
         # Evolve u_tt = u_xx with the analytic solution
         #   u(x,t) = sin(2π x) · cos(2π t)
         # on [0, 1] with homogeneous Dirichlet BC. The IC and target are both
-        # produced by `initialize!`. Use M=8 elements of N=5 GLL nodes.
-        N_e = 5
+        # produced by `initialize!`. Use M=8 elements of N=4 GLL nodes.
+        N_e = 4
         M   = 8
         elem  = make_element(Float64, N_e)
         ops_f = make_operators(elem)

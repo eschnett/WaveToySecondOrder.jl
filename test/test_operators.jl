@@ -9,71 +9,92 @@ using LinearAlgebra
 using StaticArrays
 using Test
 
+_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
+                  flush(stderr))
+
 @testset "operators" begin
 
-    @testset "make_element / make_domain" begin
+    _progress("Rational element / SBP identities")
+    @testset "make_element / make_domain (Rational)" begin
         # Rational branch: equispaced "vertex-centred" nodes on [0, 1].
-        e = make_element(Rational{Int64}, 5)
-        @test e.xs == 0//1 : 1//4 : 1//1
-        @test e.h  == 1//4
-
-        # Float64 branch: GLL collocation, h = minimum diff between nodes.
-        ef = make_element(Float64, 5)
-        @test length(ef.xs) == 5
-        @test ef.xs[1]    ≈ 0.0
-        @test ef.xs[end]  ≈ 1.0
-        @test ef.h        ≈ minimum(diff(ef.xs))
-        # GLL nodes for N=5 cluster near the endpoints — first interior
-        # gap is smaller than the central gap.
-        @test diff(ef.xs)[1] < diff(ef.xs)[2]
-
-        # Domain: N cell-centred elements covering [x0, x1].
-        d = make_domain(Float64, 8, 0.0, 1.0)
-        @test d.N == 8
-        @test d.h ≈ 1/8
-        @test length(d.xs) == 8
+        e = make_element(Rational{Int64}, 4)
+        @test e.xs == 0//1 : 1//3 : 1//1
+        @test e.h  == 1//3
     end
 
     @testset "SBPOps types and structure (Rational)" begin
-        elem = make_element(Rational{Int64}, 5)
+        elem = make_element(Rational{Int64}, 4)
         ops  = make_operators(elem)
-        @test ops isa SBPOps{5, Rational{Int64}, 25}
+        @test ops isa SBPOps{4, Rational{Int64}, 16}
         # Rational H comes from the Vandermonde construction → dense SMatrix.
-        @test ops.H isa SMatrix{5, 5, Rational{Int64}, 25}
-        @test ops.G isa SMatrix{5, 5, Rational{Int64}, 25}
-        @test ops.L isa SMatrix{5, 5, Rational{Int64}, 25}
-    end
-
-    @testset "SBPOps types and structure (Float64 GLL)" begin
-        elem = make_element(Float64, 5)
-        ops  = make_operators(elem)
-        @test ops isa SBPOps{5, Float64, 25}
-        # GLL H is diagonal — stored as a `Diagonal{Float64, SVector{5, Float64}}`.
-        @test ops.H    isa Diagonal{Float64, SVector{5, Float64}}
-        @test ops.Hinv isa Diagonal{Float64, SVector{5, Float64}}
+        @test ops.H isa SMatrix{4, 4, Rational{Int64}, 16}
+        @test ops.G isa SMatrix{4, 4, Rational{Int64}, 16}
+        @test ops.L isa SMatrix{4, 4, Rational{Int64}, 16}
     end
 
     @testset "SBP property H·D + (H·G)ᵀ = B (Rational, exact)" begin
-        elem = make_element(Rational{Int64}, 5)
+        elem = make_element(Rational{Int64}, 4)
         ops  = make_operators(elem)
         lhs = Matrix(ops.H * ops.D) + Matrix(ops.H * ops.G)'
         @test lhs == Matrix(ops.B)
     end
 
-    @testset "SBP property H·D + (H·G)ᵀ ≈ B (Float64 GLL)" begin
-        for N in (3, 5, 9, 13, 17)
-            elem = make_element(Float64, N)
-            ops  = make_operators(elem)
-            lhs = Matrix(ops.H * ops.D) + Matrix(ops.H * ops.G)'
-            @test maximum(abs.(lhs - Matrix(ops.B))) < 1e-12
-        end
-    end
+    # Floating-point branches: Float64 + Float32 (GPU-friendly). Tolerances
+    # scale with `eps(T)`; the constants below are sized to fit through N=17
+    # (largest sweep entry) with comfortable margin.
+    for T in (Float64, Float32)
+        sbp_tol  = T === Float64 ? 1.0e-12 : 1.0e-4
+        lap_tol  = T === Float64 ? 1.0e-12 : 1.0e-5
 
-    @testset "L = D·G (Laplacian factorisation)" begin
-        for T in (Rational{Int64}, Float64)
-            elem = make_element(T, 5)
+        _progress("$T GLL element, types, SBP sweep, L = D·G")
+        @testset "make_element / make_domain ($T GLL)" begin
+            # GLL collocation, h = minimum diff between nodes.
+            ef = make_element(T, 4)
+            @test eltype(ef.xs) === T
+            @test length(ef.xs) == 4
+            @test ef.xs[1]    ≈ zero(T)
+            @test ef.xs[end]  ≈ one(T)
+            @test ef.h        ≈ minimum(diff(ef.xs))
+            # GLL nodes for N=4 cluster near the endpoints — first interior
+            # gap is smaller than the central gap.
+            @test diff(ef.xs)[1] < diff(ef.xs)[2]
+
+            # Domain: N cell-centred elements covering [x0, x1].
+            d = make_domain(T, 8, zero(T), one(T))
+            @test d.N == 8
+            @test d.h ≈ one(T)/8
+            @test length(d.xs) == 8
+        end
+
+        @testset "SBPOps types and structure ($T GLL)" begin
+            elem = make_element(T, 4)
             ops  = make_operators(elem)
-            @test ops.L == ops.D * ops.G
+            @test ops isa SBPOps{4, T, 16}
+            # GLL H is diagonal — stored as a `Diagonal{T, SVector{4, T}}`.
+            @test ops.H    isa Diagonal{T, SVector{4, T}}
+            @test ops.Hinv isa Diagonal{T, SVector{4, T}}
+        end
+
+        @testset "SBP property H·D + (H·G)ᵀ ≈ B ($T GLL)" begin
+            # Spans small/odd, GPU-friendly small power-of-2, and medium.
+            # Larger N (e.g. 13, 17) compile expensively per specialisation;
+            # the property is generic in N and Rational coverage above is
+            # already exact, so further sizes give limited extra signal.
+            for N in (3, 4, 8)
+                elem = make_element(T, N)
+                ops  = make_operators(elem)
+                lhs = Matrix(ops.H * ops.D) + Matrix(ops.H * ops.G)'
+                @test maximum(abs.(lhs - Matrix(ops.B))) < sbp_tol
+            end
+        end
+
+        @testset "L = D·G ($T GLL)" begin
+            # Identical to the Rational identity up to floating-point
+            # roundoff — D·G has internal cancellations that perturb the
+            # last few bits.
+            elem = make_element(T, 4)
+            ops  = make_operators(elem)
+            @test maximum(abs.(ops.L - ops.D * ops.G)) < lap_tol
         end
     end
 

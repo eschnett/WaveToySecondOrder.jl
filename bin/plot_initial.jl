@@ -6,20 +6,20 @@ using WaveToySecondOrder
 const W = WaveToySecondOrder
 
 # Mesh choice mirrors `waveplot3d.jl`.
-mesh_kind = :inflated_cube      # :cubical | :inflated_cube
+mesh_kind = :cubed_cube      # :cubical | :cubed_cube
 
-N = 5                           # GLL nodes per element
+N = 4                           # GLL nodes per element
 M = 8                           # subdivisions per patch axis
-R = 0.1                         # inflated_cube: inner-patch radius
+R = 0.1                         # cubed_cube: inner-patch radius
 
 elem = W.make_element(Float64, N)
 
 if mesh_kind === :cubical
     x0, x1 = 0.0, 1.0
     mesh = W.make_cubical_mesh(Float64, M, x0, x1)
-elseif mesh_kind === :inflated_cube
+elseif mesh_kind === :cubed_cube
     x0, x1 = -1.0, 1.0
-    mesh = W.make_inflated_cube_mesh(Float64, M, R)
+    mesh = W.make_cubed_cube_mesh(Float64, M, R)
 else
     error("unknown mesh_kind: $mesh_kind")
 end

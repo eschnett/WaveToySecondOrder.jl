@@ -49,7 +49,7 @@ Connectivity + geometry of a conforming hexahedral mesh.
 * `orientation :: Matrix{Int8}` of shape `(6, Ne)` — `0..7` encoding of
   the D₄ transform that maps this face's local face-quadrature `(p, q)`
   coordinates to the matching face on the neighbour. `0` is the identity
-  (used everywhere on axis-aligned meshes and on the inflated-cube mesh
+  (used everywhere on axis-aligned meshes and on the cubed-cube mesh
   by construction). The transform table is documented in
   `_neigh_pq` in `kernels3d.jl`.
 * `bdry :: Matrix{Int8}` of shape `(6, Ne)` — boundary-condition tag,
@@ -259,13 +259,16 @@ function _compute_face_orientation(vs_self::NTuple{4, Int},
 end
 
 """
-    make_inflated_cube_mesh(::Type{T}, M::Int, R::Real) → HexMesh{T}
+    make_cubed_cube_mesh(::Type{T}, M::Int, R::Real) → HexMesh{T}
 
-Conforming hex mesh of the cube `[-1, 1]³` whose topology is the
-"inflated cube" / "cubed sphere": one central cubic patch `[-R, R]³`
-plus six radial-wedge patches connecting it to the six outer cube faces.
-All outer faces of the global domain are flat (the overall shape is
-still a cube), so the *outer* mesh boundary is `[-1, 1]³` exactly.
+Conforming hex mesh of the cube `[-1, 1]³` built from a "cubed-sphere"
+block topology applied to a cubic domain: one central cubic patch
+`[-R, R]³` plus six radial-wedge patches connecting it to the six outer
+cube faces. All outer faces of the global domain are flat (the overall
+shape is still a cube), so the *outer* mesh boundary is `[-1, 1]³`
+exactly — the geometry has cubed-sphere topology but a cube codomain.
+(The name `inflated_cube` is reserved for a future variant in which the
+outer boundary is curved to a sphere.)
 
 `M` is the mesh-resolution parameter: each of the seven patches is
 subdivided into `M` cells along each non-radial axis (so the inner patch
@@ -310,7 +313,7 @@ By construction, every patch's local axes are oriented so that, at any
 shared face, the (p, q) face-node coordinates on the two sides match
 directly — `orientation[f, e] = 0` everywhere.
 """
-function make_inflated_cube_mesh(::Type{T}, M::Int, R::Real) where {T}
+function make_cubed_cube_mesh(::Type{T}, M::Int, R::Real) where {T}
     @assert M ≥ 1
     @assert 0 < R < 1
 
@@ -473,7 +476,7 @@ end
 # `J[i, a] = ∂xᵢ / ∂ξₐ` (with `ξ₁ = ξ`, `ξ₂ = η`, `ξ₃ = ζ`) drops the
 # right-side fall-through but otherwise follows the same shape derivatives.
 # For axis-aligned hexes `J` is diagonal-constant; for curved/distorted
-# hexes (inflated-cube outer patches, future cubed-sphere blocks) `J` varies
+# hexes (cubed-cube outer patches, future cubed-sphere blocks) `J` varies
 # with position and must be inverted per node when applying operators.
 
 # Trilinear shape functions at one reference point. Returns the 8-tuple
@@ -574,6 +577,11 @@ metric-aware operator application.
   reference cube.
 * `detjac :: Array{T, 4}` of shape `(N, N, N, Ne)` — absolute value of
   `det J`, the per-node volume factor used by the integration weights.
+* `handedness :: Vector{Int8}` of length `Ne` — `±1`, the sign of
+  `det J` on element `e`. A non-degenerate hex has uniform-sign Jacobian
+  throughout, so a single scalar per element captures the handedness;
+  `_add_face_sat!` reads this to pick the outward face normal direction
+  without a per-face-node test.
 
 The curvilinear-Laplacian kernel composes these with the 1D quadrature
 weights from `ops.H` on the fly: per-node physical mass is
@@ -581,11 +589,12 @@ weights from `ops.H` on the fly: per-node physical mass is
 kernel is `Wmetric = Hphys · (J⁻¹ J⁻ᵀ)`.
 """
 struct MeshGeometry{T, N}
-    mesh   :: HexMesh{T}
-    coords :: Array{T, 5}
-    jac    :: Array{T, 6}
-    invjac :: Array{T, 6}
-    detjac :: Array{T, 4}
+    mesh       :: HexMesh{T}
+    coords     :: Array{T, 5}
+    jac        :: Array{T, 6}
+    invjac     :: Array{T, 6}
+    detjac     :: Array{T, 4}
+    handedness :: Vector{Int8}
 end
 
 """
@@ -601,12 +610,18 @@ function make_geometry(mesh::HexMesh{T}, elem) where {T}
     N  = elem.N
     ξs = elem.xs
     Ne = mesh.Ne
-    coords = Array{T, 5}(undef, 3, N, N, N, Ne)
-    jac    = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
-    invjac = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
-    detjac = Array{T, 4}(undef, N, N, N, Ne)
+    coords     = Array{T, 5}(undef, 3, N, N, N, Ne)
+    jac        = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
+    invjac     = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
+    detjac     = Array{T, 4}(undef, N, N, N, Ne)
+    handedness = Vector{Int8}(undef, Ne)
     @inbounds for e in 1:Ne
         verts = element_vertices(mesh, e)
+        # Sign of det(J) at element corner (ξ = η = ζ = 0). For a
+        # non-degenerate hex the sign is uniform throughout, so any
+        # single sample point determines the element's handedness.
+        J_corner   = trilinear_jacobian(verts, zero(T), zero(T), zero(T))
+        handedness[e] = det(J_corner) ≥ 0 ? Int8(1) : Int8(-1)
         for k in 1:N, j in 1:N, i in 1:N
             ξ, η, ζ = ξs[i], ξs[j], ξs[k]
             p  = trilinear_map(verts, ξ, η, ζ)
@@ -623,7 +638,7 @@ function make_geometry(mesh::HexMesh{T}, elem) where {T}
             detjac[i, j, k, e] = dJ
         end
     end
-    return MeshGeometry{T, N}(mesh, coords, jac, invjac, detjac)
+    return MeshGeometry{T, N}(mesh, coords, jac, invjac, detjac, handedness)
 end
 
 """
