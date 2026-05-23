@@ -1,58 +1,15 @@
-# Tests for `src/kernels3d.jl`: per-element `apply_laplacian3d!`, `FaceData`,
-# and the global `rhs3d!`. Includes a full 3D wave-evolution check against
-# the analytic separable eigenmode.
+# Tests for `src/kernels3d.jl`: curvilinear-aware `rhs3d!`. The full
+# wave-evolution check against the analytic separable eigenmode is the
+# end-to-end correctness gate.
 
 using WaveToySecondOrder
 using WaveToySecondOrder: make_element, make_operators,
-    make_cubical_mesh, element_coords,
-    apply_laplacian3d!, initialize3d!, rhs3d!, FaceData
+    make_cubical_mesh, make_inflated_cube_mesh, make_geometry,
+    initialize3d!, rhs3d!, recommended_dt
 using OrdinaryDiffEqSymplecticRK
-using StaticArrays
 using Test
 
 @testset "kernels3d" begin
-
-    @testset "apply_laplacian3d! recovers ∇²(x²+y²+z²) = 6" begin
-        # Single element on the unit cube. With exact Dirichlet data and
-        # exact boundary gradients on every outer face (α = 1 = full
-        # Nitsche), every SAT contribution vanishes for this quadratic, so
-        # the result is `L · u + L · u + L · u` along the three axes = 6.
-        elem = make_element(Float64, 5)
-        ops  = make_operators(elem)
-        xs   = elem.xs
-
-        u = [xs[i]^2 + xs[j]^2 + xs[k]^2 for i in 1:5, j in 1:5, k in 1:5]
-        Lu = similar(u)
-
-        # Face value slices: evaluate the polynomial at the two boundary
-        # planes orthogonal to each axis.
-        ux_m = SMatrix{5,5,Float64}([0.0     + xs[j]^2 + xs[k]^2 for j in 1:5, k in 1:5])
-        ux_p = SMatrix{5,5,Float64}([1.0     + xs[j]^2 + xs[k]^2 for j in 1:5, k in 1:5])
-        uy_m = SMatrix{5,5,Float64}([xs[i]^2 + 0.0     + xs[k]^2 for i in 1:5, k in 1:5])
-        uy_p = SMatrix{5,5,Float64}([xs[i]^2 + 1.0     + xs[k]^2 for i in 1:5, k in 1:5])
-        uz_m = SMatrix{5,5,Float64}([xs[i]^2 + xs[j]^2 + 0.0     for i in 1:5, j in 1:5])
-        uz_p = SMatrix{5,5,Float64}([xs[i]^2 + xs[j]^2 + 1.0     for i in 1:5, j in 1:5])
-
-        # Exact boundary gradients: ∂u/∂xᵢ = 2xᵢ, so 0 at the −face and 2
-        # at the +face for every axis.
-        Gminus = zero(SMatrix{5,5,Float64})
-        Gplus  = SMatrix{5,5,Float64}(fill(2.0, 5, 5))
-
-        facex = FaceData(ux_m, ux_p, Gminus, Gplus, 1.0, 1.0)
-        facey = FaceData(uy_m, uy_p, Gminus, Gplus, 1.0, 1.0)
-        facez = FaceData(uz_m, uz_p, Gminus, Gplus, 1.0, 1.0)
-
-        apply_laplacian3d!(Lu, u, facex, facey, facez; ops, τ=64.0)
-
-        @test maximum(abs, Lu .- 6.0) < 1e-10
-    end
-
-    @testset "FaceData has expected layout" begin
-        z  = zero(SMatrix{5,5,Float64})
-        fd = FaceData(z, z, z, z, 0.5, 0.5)
-        @test fd isa FaceData{5, Float64, 25}
-        @test isbitstype(typeof(fd))    # GPU-friendly value-type struct
-    end
 
     @testset "wave evolution matches analytic solution (M=4, N=5)" begin
         # Evolve u_tt = ∇²u with the separable analytic eigenmode
@@ -64,7 +21,8 @@ using Test
         elem = make_element(Float64, N)
         ops  = make_operators(elem)
         mesh = make_cubical_mesh(Float64, M, 0.0, 1.0)
-        coords = element_coords(mesh, elem)
+        geom = make_geometry(mesh, elem)
+        coords = geom.coords
 
         dx = elem.h * (1 / M)        # node spacing within an element of width 1/M
 
@@ -81,7 +39,7 @@ using Test
         t1 = 1.0   # ≈ 1.73 periods of the eigenmode
 
         bdry_values = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        f!(ü, u̇, u, p, t) = rhs3d!(ü, u, u̇, bdry_values; mesh, ops, τ)
+        f!(ü, u̇, u, p, t) = rhs3d!(ü, u, u̇, bdry_values; geom, ops, τ)
         prob = SecondOrderODEProblem(f!, u̇, u, (0.0, t1))
         sol  = solve(prob, KahanLi8(); dt)
 
@@ -95,6 +53,56 @@ using Test
 
         # Empirical error at this resolution is ≈ 5e-4; allow ~10× margin.
         @test maximum(abs, u_num - u_exact) < 5e-3
+    end
+
+    @testset "inflated cube evolution stays bounded (M=2, N=4, R=0.3)" begin
+        # Quick stability check on the curvilinear / multi-patch mesh: the
+        # 7-patch inflated cube exercises non-axis-aligned face matchings,
+        # left-handed outer-patch frames, and the curvilinear penalty
+        # threshold. With `τ ≈ 4·(N−1)²` (the curvilinear rule of thumb)
+        # the discrete operator is negative semi-definite, so a symplectic
+        # integrator preserves bounded energy.
+        N    = 4
+        M    = 2
+        R    = 0.3
+        elem = make_element(Float64, N)
+        ops  = make_operators(elem)
+        mesh = make_inflated_cube_mesh(Float64, M, R)
+        geom = make_geometry(mesh, elem)
+        coords = geom.coords
+
+        # Domain-normalised sine IC on [-1, +1]³ (vanishes on outer faces).
+        x0, x1, L_ = -1.0, 1.0, 2.0
+        kx = ky = kz = 3π
+        u  = Array{Float64,4}(undef, N, N, N, mesh.Ne)
+        u̇ = similar(u)
+        for e in 1:mesh.Ne, k in 1:N, j in 1:N, i in 1:N
+            X = (coords[1, i, j, k, e] - x0) / L_
+            Y = (coords[2, i, j, k, e] - x0) / L_
+            Z = (coords[3, i, j, k, e] - x0) / L_
+            u[i, j, k, e]  = sin(kx*X) * sin(ky*Y) * sin(kz*Z)
+            u̇[i, j, k, e] = 0.0
+        end
+        u0_max = maximum(abs, u)
+
+        τ  = 8.0 * (N-1)^2                  # curvilinear rule of thumb
+        dt = recommended_dt(geom, ops, τ)   # power-iteration estimate
+        bdry_values = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        f!(ü, u̇, u, p, t) = rhs3d!(ü, u, u̇, bdry_values; geom, ops, τ)
+        prob = SecondOrderODEProblem(f!, u̇, u, (0.0, 0.1))
+        sol  = solve(prob, KahanLi8(); dt,
+                     save_everystep = false, save_start = false,
+                     dense = false, save_end = true)
+
+        n     = N^3 * mesh.Ne
+        final = sol.u[end]
+        u_end = reshape(view(final, n+1 : 2n), N, N, N, mesh.Ne)
+
+        @test all(isfinite, u_end)
+        # IC has |u| ≤ 1; with a coercive operator and a symplectic
+        # integrator the amplitude should stay near 1 (some swell is OK
+        # but a 2× margin is well below any instability signature).
+        @test maximum(abs, u_end) < 2 * u0_max
     end
 
 end

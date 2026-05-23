@@ -9,7 +9,7 @@ const W = WaveToySecondOrder
 mesh_kind = :inflated_cube      # :cubical | :inflated_cube
 
 N = 5                           # GLL nodes per element
-M = 8                           # cubical: elements per axis
+M = 8                           # subdivisions per patch axis
 R = 0.1                         # inflated_cube: inner-patch radius
 
 elem = W.make_element(Float64, N)
@@ -19,7 +19,7 @@ if mesh_kind === :cubical
     mesh = W.make_cubical_mesh(Float64, M, x0, x1)
 elseif mesh_kind === :inflated_cube
     x0, x1 = -1.0, 1.0
-    mesh = W.make_inflated_cube_mesh(Float64, N, R)
+    mesh = W.make_inflated_cube_mesh(Float64, M, R)
 else
     error("unknown mesh_kind: $mesh_kind")
 end

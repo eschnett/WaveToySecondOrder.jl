@@ -40,9 +40,18 @@ Connectivity + geometry of a conforming hexahedral mesh.
 * `neighbour :: Matrix{Int}` of shape `(6, Ne)` — element ID of the
   neighbour across each of the six faces (face ordering as above). `0`
   marks an outer-boundary face.
-* `orientation :: Matrix{Int8}` of shape `(6, Ne)` — `0..7` encoding the
-  rotation + reflection that maps this face's local `(p, q)` coordinates
-  to the neighbour's. `0` everywhere on axis-aligned meshes.
+* `neighbour_face :: Matrix{Int8}` of shape `(6, Ne)` — face index of
+  the neighbour element that abuts face `f` of `e`. For an axis-aligned
+  cubical mesh this is just the opposite face index along the same axis
+  (`(2,1,4,3,6,5)[f]`); for multi-patch meshes where the two sides have
+  different orthogonal-axis conventions it can be any of the six values.
+  `0` on outer-boundary faces (where `neighbour == 0`).
+* `orientation :: Matrix{Int8}` of shape `(6, Ne)` — `0..7` encoding of
+  the D₄ transform that maps this face's local face-quadrature `(p, q)`
+  coordinates to the matching face on the neighbour. `0` is the identity
+  (used everywhere on axis-aligned meshes and on the inflated-cube mesh
+  by construction). The transform table is documented in
+  `_neigh_pq` in `kernels3d.jl`.
 * `bdry :: Matrix{Int8}` of shape `(6, Ne)` — boundary-condition tag,
   nonzero only on outer faces.
 * `vertex_coords :: Matrix{T}` of shape `(3, Nv)` — Cartesian coordinates
@@ -52,12 +61,13 @@ Connectivity + geometry of a conforming hexahedral mesh.
   vertex ordering above).
 """
 struct HexMesh{T}
-    Ne            :: Int
-    neighbour     :: Matrix{Int}
-    orientation   :: Matrix{Int8}
-    bdry          :: Matrix{Int8}
-    vertex_coords :: Matrix{T}
-    vertex_idx    :: Matrix{Int}
+    Ne             :: Int
+    neighbour      :: Matrix{Int}
+    neighbour_face :: Matrix{Int8}
+    orientation    :: Matrix{Int8}
+    bdry           :: Matrix{Int8}
+    vertex_coords  :: Matrix{T}
+    vertex_idx     :: Matrix{Int}
 end
 
 """
@@ -99,11 +109,12 @@ function make_cubical_mesh(::Type{T}, Mx::Int, My::Int, Mz::Int, x0, x1) where {
     Nvx, Nvy, Nvz = Mx + 1, My + 1, Mz + 1
     Nv = Nvx * Nvy * Nvz
 
-    neighbour     = zeros(Int,  6, Ne)
-    orientation   = zeros(Int8, 6, Ne)
-    bdry          = zeros(Int8, 6, Ne)
-    vertex_coords = Matrix{T}(undef, 3, Nv)
-    vertex_idx    = Matrix{Int}(undef, 8, Ne)
+    neighbour      = zeros(Int,  6, Ne)
+    neighbour_face = zeros(Int8, 6, Ne)
+    orientation    = zeros(Int8, 6, Ne)
+    bdry           = zeros(Int8, 6, Ne)
+    vertex_coords  = Matrix{T}(undef, 3, Nv)
+    vertex_idx     = Matrix{Int}(undef, 8, Ne)
 
     # --- shared vertex grid ------------------------------------------------
     vidx(vx, vy, vz) = vx + (vy - 1) * Nvx + (vz - 1) * Nvx * Nvy
@@ -117,16 +128,25 @@ function make_cubical_mesh(::Type{T}, Mx::Int, My::Int, Mz::Int, x0, x1) where {
     # --- per-element connectivity + neighbour table ------------------------
     lidx(mx, my, mz) = mx + (my - 1) * Mx + (mz - 1) * Mx * My
 
+    # Opposite face along the same axis: 1↔2 (-x/+x), 3↔4 (-y/+y), 5↔6 (-z/+z).
+    OPP = (Int8(2), Int8(1), Int8(4), Int8(3), Int8(6), Int8(5))
+
     for mz in 1:Mz, my in 1:My, mx in 1:Mx
         e = lidx(mx, my, mz)
 
         # Neighbours and boundary tags
-        if mx == 1;   bdry[1, e] = 1;  else  neighbour[1, e] = lidx(mx-1, my, mz);  end
-        if mx == Mx;  bdry[2, e] = 2;  else  neighbour[2, e] = lidx(mx+1, my, mz);  end
-        if my == 1;   bdry[3, e] = 3;  else  neighbour[3, e] = lidx(mx, my-1, mz);  end
-        if my == My;  bdry[4, e] = 4;  else  neighbour[4, e] = lidx(mx, my+1, mz);  end
-        if mz == 1;   bdry[5, e] = 5;  else  neighbour[5, e] = lidx(mx, my, mz-1);  end
-        if mz == Mz;  bdry[6, e] = 6;  else  neighbour[6, e] = lidx(mx, my, mz+1);  end
+        if mx == 1;   bdry[1, e] = 1
+        else  neighbour[1, e] = lidx(mx-1, my, mz); neighbour_face[1, e] = OPP[1]  end
+        if mx == Mx;  bdry[2, e] = 2
+        else  neighbour[2, e] = lidx(mx+1, my, mz); neighbour_face[2, e] = OPP[2]  end
+        if my == 1;   bdry[3, e] = 3
+        else  neighbour[3, e] = lidx(mx, my-1, mz); neighbour_face[3, e] = OPP[3]  end
+        if my == My;  bdry[4, e] = 4
+        else  neighbour[4, e] = lidx(mx, my+1, mz); neighbour_face[4, e] = OPP[4]  end
+        if mz == 1;   bdry[5, e] = 5
+        else  neighbour[5, e] = lidx(mx, my, mz-1); neighbour_face[5, e] = OPP[5]  end
+        if mz == Mz;  bdry[6, e] = 6
+        else  neighbour[6, e] = lidx(mx, my, mz+1); neighbour_face[6, e] = OPP[6]  end
 
         # Eight corner indices in canonical (Gmsh) ordering.
         vertex_idx[1, e] = vidx(mx,   my,   mz  )
@@ -139,7 +159,8 @@ function make_cubical_mesh(::Type{T}, Mx::Int, My::Int, Mz::Int, x0, x1) where {
         vertex_idx[8, e] = vidx(mx,   my+1, mz+1)
     end
 
-    return HexMesh{T}(Ne, neighbour, orientation, bdry, vertex_coords, vertex_idx)
+    return HexMesh{T}(Ne, neighbour, neighbour_face, orientation,
+                      bdry, vertex_coords, vertex_idx)
 end
 
 # Cubic convenience: equal element count in each direction.
@@ -163,8 +184,82 @@ const FACE_LOCAL_VERTICES = (
     (5, 6, 7, 8),
 )
 
+# Face-local (p̃, q̃) ∈ {(0,0), (1,0), (0,1), (1,1)} for each of the 4
+# canonical face-corner vertices, per face. `(0, 0)` denotes face-local
+# `(1, 1)` (i.e. p=1, q=1) at the chosen `N`; the binary form is
+# resolution-independent.
+#
+# These are *not* uniform across the six faces: faces 4 and 6 walk the
+# corners in a different (p, q) order than faces 1, 2, 3, 5 because the
+# Gmsh-canonical Hex8 vertex numbering is itself non-uniform around the
+# six faces. The table is derived once from `FACE_LOCAL_VERTICES`
+# (corner i ↦ its `(±x, ±y, ±z)` sign pattern, then projected onto the
+# face's two tangent axes).
+const FACE_LOCAL_PQ = (
+    ((0, 0), (1, 0), (0, 1), (1, 1)),  # face 1 (−x), tangent (y, z)
+    ((0, 0), (1, 0), (0, 1), (1, 1)),  # face 2 (+x), tangent (y, z)
+    ((0, 0), (1, 0), (0, 1), (1, 1)),  # face 3 (−y), tangent (x, z)
+    ((1, 0), (0, 0), (1, 1), (0, 1)),  # face 4 (+y), tangent (x, z) — corner order (3, 4, 7, 8)
+    ((0, 0), (1, 0), (1, 1), (0, 1)),  # face 5 (−z), tangent (x, y) — corner order (1, 2, 3, 4)
+    ((0, 0), (1, 0), (1, 1), (0, 1)),  # face 6 (+z), tangent (x, y) — corner order (5, 6, 7, 8)
+)
+
+# D₄ orientation transform: maps self's face-local `(p, q)` into the
+# neighbour's `(p, q)`. Resolves the eight rotations + reflections of
+# the unit square. Used by `_compute_face_orientation` and by the
+# kernel `_add_face_sat!`.
+@inline function _neigh_pq(o::Integer, p::Integer, q::Integer, N::Integer)
+    if     o == 0;  return (p,         q        )
+    elseif o == 1;  return (q,         N + 1 - p)
+    elseif o == 2;  return (N + 1 - p, N + 1 - q)
+    elseif o == 3;  return (N + 1 - q, p        )
+    elseif o == 4;  return (N + 1 - p, q        )
+    elseif o == 5;  return (q,         p        )
+    elseif o == 6;  return (p,         N + 1 - q)
+    else            return (N + 1 - q, N + 1 - p)
+    end
+end
+
+# Compute the D₄ orientation that maps self's face-local (p, q) into the
+# neighbour's. Given the canonical 4-tuple of global vertex IDs on each
+# side, plus the two face indices (`f_self`, `f_neigh`) needed to look
+# up where in face-local (p, q) each canonical-corner index lives.
+function _compute_face_orientation(vs_self::NTuple{4, Int},
+                                    vs_neigh::NTuple{4, Int},
+                                    f_self::Integer,
+                                    f_neigh::Integer)::Int8
+    # Position-in-the-unit-square for each canonical index, both sides.
+    pq_self_table  = FACE_LOCAL_PQ[f_self]
+    pq_neigh_table = FACE_LOCAL_PQ[f_neigh]
+
+    # For each canonical-index `i` on self, find the canonical-index `j`
+    # on the neighbour where the same global vertex appears.
+    j1 = findfirst(==(vs_self[1]), vs_neigh)
+    j2 = findfirst(==(vs_self[2]), vs_neigh)
+    @assert j1 !== nothing && j2 !== nothing "face-vertex mismatch"
+
+    p_s1, q_s1 = pq_self_table[1]      # self vertex 1's face-local position (0/1, 0/1)
+    p_s2, q_s2 = pq_self_table[2]
+    p_n1, q_n1 = pq_neigh_table[j1]    # the same vertex's position on the neighbour
+    p_n2, q_n2 = pq_neigh_table[j2]
+
+    # Search the eight D₄ transforms for the one that maps both
+    # `(p_s1, q_s1) → (p_n1, q_n1)` and `(p_s2, q_s2) → (p_n2, q_n2)`.
+    # Use `N = 2` (so face-local 1↔1 and N↔N), i.e. 0/1 in/out coords.
+    # (Equivalent to taking `_neigh_pq(o, p+1, q+1, 2) - 1`.)
+    for o in 0:7
+        pa, qa = _neigh_pq(o, p_s1 + 1, q_s1 + 1, 2)
+        pb, qb = _neigh_pq(o, p_s2 + 1, q_s2 + 1, 2)
+        if pa - 1 == p_n1 && qa - 1 == q_n1 &&
+           pb - 1 == p_n2 && qb - 1 == q_n2
+            return Int8(o)
+        end
+    end
+    error("no D₄ transform matches face vertex orderings: $vs_self $vs_neigh f $f_self $f_neigh")
+end
+
 """
-    make_inflated_cube_mesh(::Type{T}, N::Int, R::Real) → HexMesh{T}
+    make_inflated_cube_mesh(::Type{T}, M::Int, R::Real) → HexMesh{T}
 
 Conforming hex mesh of the cube `[-1, 1]³` whose topology is the
 "inflated cube" / "cubed sphere": one central cubic patch `[-R, R]³`
@@ -172,11 +267,15 @@ plus six radial-wedge patches connecting it to the six outer cube faces.
 All outer faces of the global domain are flat (the overall shape is
 still a cube), so the *outer* mesh boundary is `[-1, 1]³` exactly.
 
+`M` is the mesh-resolution parameter: each of the seven patches is
+subdivided into `M` cells along each non-radial axis (so the inner patch
+has `M³` cells and each outer patch has `L·M²`).
+
 # Geometry
 
 For the +x patch (the other five are obtained by axis permutation /
-reflection), with local indices `i ∈ 0..L`, `j ∈ 0..N`, `k ∈ 0..N` and
-`s_j = -1 + 2j/N`, `t_k = -1 + 2k/N`:
+reflection), with local indices `i ∈ 0..L`, `j ∈ 0..M`, `k ∈ 0..M` and
+`s_j = -1 + 2j/M`, `t_k = -1 + 2k/M`:
 
     r          = R · α^i        (radial coordinate)
     (x, y, z)  = (r,  s_j·r,  t_k·r)
@@ -187,22 +286,22 @@ matches the inner cube's `[-R, R]²` face at `i = 0` and the outer cube's
 
 # Element count
 
-`N^3` cells in the inner patch + `6·L·N²` cells in the six outer patches.
+`M³` cells in the inner patch + `6·L·M²` cells in the six outer patches.
 
 # `L` and radial spacing (step 2 of the construction)
 
 We want each outer-patch cell to be roughly cubical: angular width
-`2r/N` should match the radial width `r_{i+1} − r_i`. With geometric
+`2r/M` should match the radial width `r_{i+1} − r_i`. With geometric
 spacing `r_i = R·α^i` the cell aspect is constant in `α`:
 
-    r_{i+1} - r_i = r_i · (α - 1),  angular size = 2 r_i / N
+    r_{i+1} - r_i = r_i · (α - 1),  angular size = 2 r_i / M
 
-so isotropic ⇒ `α - 1 ≈ 2/N`. The radial endpoint constraint `r_L = 1`
+so isotropic ⇒ `α - 1 ≈ 2/M`. The radial endpoint constraint `r_L = 1`
 fixes `α = (1/R)^(1/L)`, so we pick
 
-    L = round( log(1/R) / log(1 + 2/N) )
+    L = round( log(1/R) / log(1 + 2/M) )
 
-and use the resulting `α`. For `N = 5`, `R = 0.1` this gives `L = 7`,
+and use the resulting `α`. For `M = 5`, `R = 0.1` this gives `L = 7`,
 `α ≈ 1.389`.
 
 # Orientation
@@ -211,14 +310,14 @@ By construction, every patch's local axes are oriented so that, at any
 shared face, the (p, q) face-node coordinates on the two sides match
 directly — `orientation[f, e] = 0` everywhere.
 """
-function make_inflated_cube_mesh(::Type{T}, N::Int, R::Real) where {T}
-    @assert N ≥ 1
+function make_inflated_cube_mesh(::Type{T}, M::Int, R::Real) where {T}
+    @assert M ≥ 1
     @assert 0 < R < 1
 
     Rv = T(R)
 
     # --- Step 2: pick L and the radial node positions -------------------
-    L = max(1, round(Int, log(1/R) / log(1 + 2/N)))
+    L = max(1, round(Int, log(1/R) / log(1 + 2/M)))
     α = (1/Rv)^(1/T(L))
     radial = [Rv * α^(j-1) for j in 1:L+1]
     radial[end] = one(T)        # snap the outer node to exactly 1
@@ -234,20 +333,20 @@ function make_inflated_cube_mesh(::Type{T}, N::Int, R::Real) where {T}
         length(vertex_dict) + 1
     end
 
-    # Inner cube grid (i, j, k) ∈ 0..N × 0..N × 0..N → vertex index.
-    cube_v = Array{Int, 3}(undef, N+1, N+1, N+1)
-    for c in 0:N, b in 0:N, a in 0:N
-        s = T(-1 + 2*a/N); t = T(-1 + 2*b/N); u = T(-1 + 2*c/N)
+    # Inner cube grid (i, j, k) ∈ 0..M × 0..M × 0..M → vertex index.
+    cube_v = Array{Int, 3}(undef, M+1, M+1, M+1)
+    for c in 0:M, b in 0:M, a in 0:M
+        s = T(-1 + 2*a/M); t = T(-1 + 2*b/M); u = T(-1 + 2*c/M)
         cube_v[a+1, b+1, c+1] = add_vertex!(s*Rv, t*Rv, u*Rv)
     end
 
-    # Outer-patch vertex grids: 6 grids of shape (L+1, N+1, N+1).
+    # Outer-patch vertex grids: 6 grids of shape (L+1, M+1, M+1).
     function build_patch_vertices(dir::Int)
-        v = Array{Int, 3}(undef, L+1, N+1, N+1)
-        for c in 0:N, b in 0:N, a in 0:L
+        v = Array{Int, 3}(undef, L+1, M+1, M+1)
+        for c in 0:M, b in 0:M, a in 0:L
             r  = radial[a+1]
-            sb = T(-1 + 2*b/N)
-            tc = T(-1 + 2*c/N)
+            sb = T(-1 + 2*b/M)
+            tc = T(-1 + 2*c/M)
             x, y, z = if dir == 1       # +x
                 ( r,    sb*r, tc*r)
             elseif dir == 2             # −x
@@ -276,7 +375,7 @@ function make_inflated_cube_mesh(::Type{T}, N::Int, R::Real) where {T}
     end
 
     # --- Step 3b: build the per-element 8-corner connectivity -----------
-    Ne = N^3 + 6 * L * N^2
+    Ne = M^3 + 6 * L * M^2
     vertex_idx = Matrix{Int}(undef, 8, Ne)
 
     function fill_corners!(e, vg, i, j, k)
@@ -291,32 +390,43 @@ function make_inflated_cube_mesh(::Type{T}, N::Int, R::Real) where {T}
     end
 
     e = 0
-    for k in 1:N, j in 1:N, i in 1:N
+    for k in 1:M, j in 1:M, i in 1:M
         e += 1; fill_corners!(e, cube_v, i, j, k)
     end
     for vg in patch_v
-        for k in 1:N, j in 1:N, i in 1:L
+        for k in 1:M, j in 1:M, i in 1:L
             e += 1; fill_corners!(e, vg, i, j, k)
         end
     end
     @assert e == Ne
 
-    # --- Step 3c: derive neighbour table from face-vertex signatures ----
+    # --- Step 3c: derive neighbour, neighbour_face, orientation ---------
     # Two faces match iff their *sets* of four global vertex IDs are equal;
-    # we sort each face's vertex tuple to get a canonical hashable signature.
-    neighbour = zeros(Int, 6, Ne)
-    face_sig  = Dict{NTuple{4, Int}, Tuple{Int, Int}}()
+    # we sort each face's vertex tuple to get a canonical hashable
+    # signature. When a match is found, the order of the 4 vertices in
+    # the two elements' canonical face-vertex lists yields the D₄
+    # orientation that maps self's face-local (p, q) into the neighbour's.
+    neighbour      = zeros(Int,  6, Ne)
+    neighbour_face = zeros(Int8, 6, Ne)
+    orientation    = zeros(Int8, 6, Ne)
+    face_sig       = Dict{NTuple{4, Int},
+                          Tuple{Int, Int, NTuple{4, Int}}}()
     @inbounds for ee in 1:Ne, f in 1:6
-        flv = FACE_LOCAL_VERTICES[f]
+        flv  = FACE_LOCAL_VERTICES[f]
         face = (vertex_idx[flv[1], ee], vertex_idx[flv[2], ee],
                 vertex_idx[flv[3], ee], vertex_idx[flv[4], ee])
         sig  = NTuple{4, Int}(sort!(collect(face)))
-        prev = get(face_sig, sig, (0, 0))
+        prev = get(face_sig, sig, (0, 0, (0, 0, 0, 0)))
         if prev[1] == 0
-            face_sig[sig] = (ee, f)
+            face_sig[sig] = (ee, f, face)
         else
-            neighbour[f,        ee     ] = prev[1]
-            neighbour[prev[2],  prev[1]] = ee
+            ee_o, f_o, face_o = prev
+            neighbour[f,   ee] = ee_o
+            neighbour[f_o, ee_o] = ee
+            neighbour_face[f,   ee] = f_o
+            neighbour_face[f_o, ee_o] = f
+            orientation[f,   ee]   = _compute_face_orientation(face,   face_o, f,   f_o)
+            orientation[f_o, ee_o] = _compute_face_orientation(face_o, face,   f_o, f  )
         end
     end
 
@@ -338,10 +448,8 @@ function make_inflated_cube_mesh(::Type{T}, N::Int, R::Real) where {T}
             Int8(0)
     end
 
-    # Orientation: zero by construction (see docstring).
-    orientation = zeros(Int8, 6, Ne)
-
-    return HexMesh{T}(Ne, neighbour, orientation, bdry, vertex_coords, vertex_idx)
+    return HexMesh{T}(Ne, neighbour, neighbour_face, orientation,
+                      bdry, vertex_coords, vertex_idx)
 end
 
 # ----------------------------------------------------------------------

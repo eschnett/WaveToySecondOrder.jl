@@ -103,7 +103,7 @@ count_zero_neighbours(m::HexMesh) = count(==(0), m.neighbour)
 
     @testset "make_inflated_cube_mesh: neighbour count by topology" begin
         # Build the 7-patch inflated cube. The outer surface is the cube
-        # [-1, 1]³ tiled by 6·N² quads, one per outermost-shell element of
+        # [-1, 1]³ tiled by 6·M² quads, one per outermost-shell element of
         # the six outer patches. The four "side" faces of each outer patch
         # are shared with the four adjacent outer patches along the cube
         # edges, so each outer-shell element loses exactly one neighbour
@@ -113,8 +113,8 @@ count_zero_neighbours(m::HexMesh) = count(==(0), m.neighbour)
         # Per-element neighbour counts therefore split into just two bins:
         #   outer-shell (one outer face) → 5
         #   everything else              → 6
-        N, R = 4, 0.1
-        m = make_inflated_cube_mesh(Float64, N, R)
+        M, R = 4, 0.1
+        m = make_inflated_cube_mesh(Float64, M, R)
 
         # Each element bumps each of its neighbours' counters. By neighbour
         # symmetry this equals the per-element count of non-zero neighbour
@@ -136,12 +136,12 @@ count_zero_neighbours(m::HexMesh) = count(==(0), m.neighbour)
 
         @test n3 == 0
         @test n4 == 0
-        @test n5 == 6 * N^2
+        @test n5 == 6 * M^2
         @test n6 == m.Ne - n5
 
         # Cross-check: total outer-face slots equals tally of missing neighbours.
         outer_slots = 3*n3 + 2*n4 + 1*n5
-        @test outer_slots == 6 * N^2
+        @test outer_slots == 6 * M^2
         @test outer_slots == count_zero_neighbours(m)
     end
 
