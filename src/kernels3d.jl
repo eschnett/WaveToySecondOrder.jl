@@ -48,41 +48,10 @@
 #      per-node physical mass `H_phys = H_ref · |det J|` to recover
 #      `L u` in physical units.
 
-using Polyester: @batch
-using StaticArrays: SVector
-
-################################################################################
-# Workspace
-
-"""
-    Rhs3dWorkspace{T, N}
-
-Per-thread scratch buffers consumed by `rhs3d!`. Allocate once before
-the main timestepping loop and pass via the `workspace` keyword of
-`rhs3d!`; the default behaviour (omit `workspace`) re-allocates the
-buffers on every call, which costs ~50 KB of garbage per invocation.
-
-# Fields
-
-* `Du_buf, W_buf :: Vector{Array{T, 4}}` — each entry has shape
-  `(3, N, N, N)`; the outer vector is sized to `Threads.maxthreadid()`
-  so each thread owns a private slot indexed by `Threads.threadid()`.
-"""
-struct Rhs3dWorkspace{T, N}
-    Du_buf :: Vector{Array{T, 4}}
-    W_buf  :: Vector{Array{T, 4}}
-end
-
-Rhs3dWorkspace{T, N}() where {T, N} = Rhs3dWorkspace{T, N}(
-    [Array{T, 4}(undef, 3, N, N, N) for _ in 1:Threads.maxthreadid()],
-    [Array{T, 4}(undef, 3, N, N, N) for _ in 1:Threads.maxthreadid()])
-
-"""
-    Rhs3dWorkspace(elem) → Rhs3dWorkspace{T, N}
-
-Convenience constructor that picks `T = eltype(elem.xs)` and `N = elem.N`.
-"""
-Rhs3dWorkspace(elem) = Rhs3dWorkspace{eltype(elem.xs), elem.N}()
+using KernelAbstractions
+using KernelAbstractions: @kernel, @index, @Const,
+                          get_backend, synchronize
+using StaticArrays: MArray, SVector
 
 ################################################################################
 # System parameters
@@ -221,9 +190,10 @@ end
 @inline function _add_face_sat!(::Val{f}, üe::AbstractArray{T,3},
                                  ue::AbstractArray{T,3},
                                  u_global::AbstractArray{T,4},
-                                 Du::AbstractArray{T,4},
+                                 Du,
                                  e::Int,
-                                 geom::MeshGeometry{T, N}, mesh::HexMesh{T},
+                                 geom::MeshGeometry{T, N},
+                                 conn::MeshConnectivity,
                                  bdry_values::NTuple{6, T},
                                  ops::SBPOps{N, T}, τ,
                                  H_1d::SVector{N, T}) where {f, N, T}
@@ -236,22 +206,24 @@ end
     # is one Int8 per element, looked up once before the face-node loop.
     # Together they replace the per-face-node `cross · col_a` dot-product
     # test that the kernel used to perform inside the loop.
-    sgn_out = sgn_f * sgn_c * T(geom.handedness[e])
+    # Unchecked reads — keeping them out of an escaping boundscheck
+    # path matters for GPU code-gen (see comment in `_rhs3d_element!`).
+    @inbounds sgn_out = sgn_f * sgn_c * T(geom.handedness[e])
     axis_p, axis_q = _tangent_axes(Val(a_idx))
 
     G   = ops.G
-    nbr = mesh.neighbour[f, e]
-    tag = mesh.bdry[f, e]
+    @inbounds nbr      = conn.neighbour[f, e]
+    @inbounds tag      = conn.bdry[f, e]
     α   = nbr == 0 ? one(T) : one(T) / 2
 
     # Neighbour-side face index, axis, row, and (p, q) orientation.
     # Pulled at runtime — different shared faces can pair self's face with
     # any of the neighbour's six faces and with any of the eight D₄
     # orientations.
-    nbr_face = Int(mesh.neighbour_face[f, e])
+    @inbounds nbr_face = Int(conn.neighbour_face[f, e])
     nbr_a    = (nbr_face + 1) ÷ 2
     nbr_row  = isodd(nbr_face) ? 1 : N
-    nbr_o    = mesh.orientation[f, e]
+    @inbounds nbr_o    = conn.orientation[f, e]
 
     @inbounds for q in 1:N, p in 1:N
         i, j, k = _face_volume_idx(Val(a_idx), face_r, p, q)
@@ -362,7 +334,7 @@ end
 
 Curvilinear-aware 3D RHS over the mesh carried by `geom :: MeshGeometry`.
 State arrays are 4-D, shape `(N, N, N, Ne)`, with element ordering
-matching `geom.mesh`. The 6-tuple `bdry_values` is indexed by the
+matching `geom`. The 6-tuple `bdry_values` is indexed by the
 boundary-condition tag stored on each outer face (`mesh.bdry[f, e]`).
 
 The kernel assumes a **diagonal** 1D mass matrix (`ops.H` is the GLL
@@ -397,47 +369,44 @@ on a small representative mesh.
 # canonical signature because they only care about `τ`.
 function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
                 params::Params3d{T};
-                geom::MeshGeometry{T, N}, ops::SBPOps{N, T},
-                workspace = nothing) where {N, T}
+                geom::MeshGeometry{T, N}, ops::SBPOps{N, T}) where {N, T}
     return rhs3d!(ü, u, u̇, params.bdry_values;
-                  geom, ops, τ = params.τ, workspace)
+                  geom, ops, τ = params.τ)
 end
 
-function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
-                bdry_values::NTuple{6, T};
-                geom::MeshGeometry{T, N}, ops::SBPOps{N, T}, τ,
-                workspace = nothing) where {N, T}
-    @assert size(ü) == size(u̇) == size(u)
-    @assert size(u, 1) == size(u, 2) == size(u, 3) == N
-    @assert size(u, 4) == geom.mesh.Ne
+# Per-element compute: the five-step SBP-SAT body for a single element
+# `e`. Called from the `_rhs3d_kernel!` KA kernel — one source of truth
+# for the kernel math, dispatched once per element. The scratch arrays
+# `Du` and `W` are workitem-local `MArray`s, sized `(3, N, N, N)` ≈ 192
+# floats each at N=4. On both CPU and GPU the compiler escape-promotes
+# them to stack/registers as long as every array access inside the body
+# is `@inbounds`-guarded — `Base.view` and any non-`@inbounds` scalar
+# index would otherwise drag the MArray onto the boundscheck slow path
+# and prevent promotion. See JuliaLang/julia#39308 and the `aview`
+# comment in KA's `src/cpu.jl`.
+#
+# We allocate the MArrays directly rather than via `KA.@private` because
+# the CPU `@private` lowering builds one workgroup-wide MArray of shape
+# `(Dims..., workgroupsize)` (so 192·64 = 12 288 floats at our settings)
+# — too large to stack-promote, which forces a per-call heap allocation
+# we don't need. Allocating a per-workitem MArray here is equivalent on
+# GPU and substantially cheaper on CPU.
+@inline function _rhs3d_element!(ü::AbstractArray{T, 4}, u::AbstractArray{T, 4},
+                                  e::Int,
+                                  geom::MeshGeometry{T, N},
+                                  ops::SBPOps{N, T}, τ::T,
+                                  bdry_values::NTuple{6, T},
+                                  H_1d::SVector{N, T},
+                                  ::Val{N}) where {T, N}
+    G  = ops.G
 
-    mesh = geom.mesh
-    G    = ops.G
-    H_1d = SVector{N, T}(ntuple(i -> ops.H[i, i], Val(N)))
+    Du = MArray{Tuple{3, N, N, N}, T}(undef)
+    W  = MArray{Tuple{3, N, N, N}, T}(undef)
 
-    # Per-thread scratch buffers. The per-element loop is embarrassingly
-    # parallel (each iteration only writes to `view(ü, :, :, :, e)` and
-    # reads global `u`), so we split it with `Polyester.@batch`. Polyester
-    # uses a persistent worker pool (no per-call task allocation, no
-    # scheduler overhead), giving near-zero parallel-launch cost relative
-    # to `Threads.@threads`. Per-iteration `threadid()` is stable because
-    # `@batch` does not migrate work between threads. Buffers are sized to
-    # `maxthreadid()` since Julia's thread ids span the default and
-    # interactive thread pools. Pass `workspace::Rhs3dWorkspace` to reuse
-    # buffers across calls — the default `nothing` allocates fresh ones.
-    ws = workspace isa Rhs3dWorkspace ? workspace :
-                                        Rhs3dWorkspace{T, N}()
-    Du_buf = ws.Du_buf
-    W_buf  = ws.W_buf
+    @inbounds ue = @view u[:, :, :, e]
+    @inbounds üe = @view ü[:, :, :, e]
 
-    @inbounds @batch for e in 1:mesh.Ne
-        tid = Threads.threadid()
-        Du  = Du_buf[tid]
-        W   = W_buf[tid]
-
-        ue = view(u,  :, :, :, e)
-        üe = view(ü, :, :, :, e)
-
+    @inbounds begin
         # 1. Reference-axis gradients.
         for k in 1:N, j in 1:N, i in 1:N
             s1 = zero(T); s2 = zero(T); s3 = zero(T)
@@ -484,12 +453,13 @@ function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArra
         end
 
         # 4. Per-face SBP-SAT contributions.
-        _add_face_sat!(Val(1), üe, ue, u, Du, e, geom, mesh, bdry_values, ops, τ, H_1d)
-        _add_face_sat!(Val(2), üe, ue, u, Du, e, geom, mesh, bdry_values, ops, τ, H_1d)
-        _add_face_sat!(Val(3), üe, ue, u, Du, e, geom, mesh, bdry_values, ops, τ, H_1d)
-        _add_face_sat!(Val(4), üe, ue, u, Du, e, geom, mesh, bdry_values, ops, τ, H_1d)
-        _add_face_sat!(Val(5), üe, ue, u, Du, e, geom, mesh, bdry_values, ops, τ, H_1d)
-        _add_face_sat!(Val(6), üe, ue, u, Du, e, geom, mesh, bdry_values, ops, τ, H_1d)
+        conn = geom.conn
+        _add_face_sat!(Val(1), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
+        _add_face_sat!(Val(2), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
+        _add_face_sat!(Val(3), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
+        _add_face_sat!(Val(4), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
+        _add_face_sat!(Val(5), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
+        _add_face_sat!(Val(6), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
 
         # 5. Divide by H_phys per node.
         for k in 1:N, j in 1:N, i in 1:N
@@ -497,6 +467,54 @@ function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArra
             üe[i, j, k] /= Hp
         end
     end
+    return nothing
+end
+
+# KernelAbstractions wrapper: each workitem processes one element.
+# One code path for every backend (CPU, CUDA, AMDGPU, Metal). The
+# kernel is intentionally trivial — `_rhs3d_element!` holds the math
+# and allocates its own per-workitem `MArray` scratch.
+@kernel function _rhs3d_kernel!(ü::AbstractArray{T},
+                                 @Const(u::AbstractArray{T}),
+                                 geom, ops, τ::T,
+                                 bdry_values, H_1d,
+                                 ::Val{N}) where {T, N}
+    e = @index(Global, Linear)
+    _rhs3d_element!(ü, u, e, geom, ops, τ, bdry_values, H_1d, Val(N))
+end
+
+# Workgroup size for the per-element kernel. Small enough that on the
+# CPU backend the per-launch `Threads.@threads :static` chunking gets
+# multiple workgroups (so all threads see work even on small meshes);
+# large enough that on GPU backends it matches a warp/wavefront. 64 is
+# the sweet spot we measured on CPU and is conventional on CUDA/Metal.
+const _RHS3D_WORKGROUPSIZE = 64
+
+function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
+                bdry_values::NTuple{6, T};
+                geom::MeshGeometry{T, N}, ops::SBPOps{N, T}, τ) where {N, T}
+    @assert size(ü) == size(u̇) == size(u)
+    @assert size(u, 1) == size(u, 2) == size(u, 3) == N
+    @assert size(u, 4) == geom.Ne
+
+    H_1d = SVector{N, T}(ntuple(i -> ops.H[i, i], Val(N)))
+    backend = get_backend(u)
+
+    _rhs3d_kernel!(backend, _RHS3D_WORKGROUPSIZE)(
+        ü, u,
+        geom, ops, T(τ), bdry_values, H_1d, Val(N);
+        ndrange = geom.Ne)
+    # Intentionally not `synchronize(backend)`. KA's queues are async-
+    # by-default and successive operations on the same array honour
+    # ordering automatically — the integrator's per-stage broadcasts
+    # all chain correctly behind this kernel without a host-side
+    # wait. A forced sync here would commit the Metal command buffer
+    # after every RHS call and turn an O(launches-per-sample) cost
+    # into an O(launches-per-stage) cost, which dominates wall time
+    # for small problems where each kernel invocation is short. The
+    # host-visible sync points (`copyto!` to a host array, `Array(…)`,
+    # reductions like `discrete_l2_norm`) each drain the queue at
+    # their natural call site.
 
     return ü
 end
@@ -522,9 +540,13 @@ Intended for analysis — eigenvalues, symmetry, condition number — not
 for production timestepping. Cost is `O(N⁶ · Ne²)` element operations,
 i.e. one `rhs3d!` call per degree of freedom.
 
+**Host-only.** The per-column basis-vector trick uses scalar indexing
+on a flat host vector; if `geom` is device-resident, migrate it back
+with a fresh `make_geometry(mesh, elem)` first.
+
 The per-node physical mass `H_phys` (which makes `H_phys · L_h` the
-symmetric "stiffness" matrix) is available as `vec(geom.Hphys_diag())`
-or recoverable directly from `ops.H` and `geom.detjac`.
+symmetric "stiffness" matrix) is available as
+[`physical_mass_diagonal`](@ref).
 
 # Keyword arguments
 
@@ -536,7 +558,7 @@ or recoverable directly from `ops.H` and `geom.detjac`.
 function discrete_laplacian(geom::MeshGeometry{T, N}, ops::SBPOps{N, T}, τ;
                             bdry_values::NTuple{6, T} = ntuple(_ -> zero(T), Val(6)),
                             drop_tol = zero(T)) where {N, T}
-    Ne   = geom.mesh.Ne
+    Ne   = geom.Ne
     ndof = N^3 * Ne
     u  = zeros(T, N, N, N, Ne)
     u̇ = zeros(T, N, N, N, Ne)
@@ -577,11 +599,19 @@ practice. Cost is `≈ iters` calls to `rhs3d!`.
 """
 function spectral_radius_estimate(geom::MeshGeometry{T, N}, ops::SBPOps{N, T}, τ;
                                    iters::Int = 60, tol = T(1e-4)) where {N, T}
-    Ne   = geom.mesh.Ne
+    Ne   = geom.Ne
     bdry = ntuple(_ -> zero(T), Val(6))
-    x  = randn(T, N, N, N, Ne)
-    y  = similar(x)
-    u̇ = zeros(T, N, N, N, Ne)
+
+    # Allocate working vectors on the same backend as the geometry so
+    # power iteration runs in-place on whichever backend the caller
+    # has chosen (CPU, Metal, CUDA, …). `randn!` and the broadcast
+    # operations used below all have GPU-portable implementations.
+    backend = get_backend(geom.coords)
+    x = KernelAbstractions.allocate(backend, T, N, N, N, Ne)
+    y = KernelAbstractions.allocate(backend, T, N, N, N, Ne)
+    u̇ = KernelAbstractions.allocate(backend, T, N, N, N, Ne)
+    Random.randn!(x)
+    fill!(u̇, zero(T))
 
     nx = sqrt(sum(abs2, x))
     nx == 0 && return zero(T)
@@ -590,11 +620,11 @@ function spectral_radius_estimate(geom::MeshGeometry{T, N}, ops::SBPOps{N, T}, �
     λ_prev = zero(T)
     @inbounds for k in 1:iters
         rhs3d!(y, x, u̇, bdry; geom, ops, τ)
-        # Rayleigh quotient ⟨x, L x⟩ — `x` is already normalised.
-        λ = zero(T)
-        @simd for I in eachindex(x)
-            λ += x[I] * y[I]
-        end
+        # Rayleigh quotient ⟨x, L x⟩ — `x` is already normalised. The
+        # two-array `mapreduce` works for both host and GPU arrays;
+        # the previous `@simd` form scalar-indexed and would have
+        # crashed on device arrays.
+        λ = mapreduce(*, +, x, y; init = zero(T))
         ny = sqrt(sum(abs2, y))
         ny == 0 && return abs(λ)
         if k > 5 && abs(λ - λ_prev) ≤ tol * abs(λ)
@@ -650,14 +680,16 @@ in this inner product on a coercive mesh.
 function discrete_inner_product(u::AbstractArray{T, 4}, v::AbstractArray{T, 4},
                                  geom::MeshGeometry{T, N},
                                  ops::SBPOps{N, T}) where {N, T}
-    @assert size(u) == size(v) == (N, N, N, geom.mesh.Ne)
-    H_1d = SVector{N, T}(ntuple(i -> ops.H[i, i], Val(N)))
-    s = zero(T)
-    @inbounds for e in 1:geom.mesh.Ne, k in 1:N, j in 1:N, i in 1:N
-        Hp = H_1d[i] * H_1d[j] * H_1d[k] * geom.detjac[i, j, k, e]
-        s += Hp * u[i, j, k, e] * v[i, j, k, e]
-    end
-    return s
+    @assert size(u) == size(v) == size(geom.Hphys) == (N, N, N, geom.Ne)
+    # Three-array `mapreduce` — works for plain `Array` on CPU and for
+    # `MtlArray` / `CuArray` / `ROCArray` on their respective backends
+    # via the GPUArrays.jl broadcast-backed `mapreducedim!`. The per-
+    # node physical mass `geom.Hphys` is precomputed at `make_geometry`
+    # so no auxiliary closure or capture is needed here. `ops` is
+    # accepted only to preserve the public signature; the mass diagonal
+    # already lives in `geom`.
+    return mapreduce((uᵢ, vᵢ, hᵢ) -> uᵢ * vᵢ * hᵢ, +, u, v, geom.Hphys;
+                     init = zero(T))
 end
 
 """
@@ -677,14 +709,11 @@ Diagonal of the global mass matrix `H_phys`, in the same linear node
 ordering as `vec(u)`. Useful in conjunction with [`discrete_laplacian`](@ref)
 to form `H_phys · L_h` or to solve the generalized eigenproblem
 `L_h · v = λ · v` against the physical inner product.
+
+Host-only analysis tool. The result is always a CPU `Vector{T}`; if
+`geom.Hphys` is device-resident it is brought back to host. `ops` is
+accepted for signature compatibility but no longer consulted — the
+per-node physical mass lives in `geom.Hphys` since `make_geometry`.
 """
-function physical_mass_diagonal(geom::MeshGeometry{T, N}, ops::SBPOps{N, T}) where {N, T}
-    Ne = geom.mesh.Ne
-    H_1d = SVector{N, T}(ntuple(i -> ops.H[i, i], Val(N)))
-    out = Vector{T}(undef, N^3 * Ne)
-    @inbounds for e in 1:Ne, k in 1:N, j in 1:N, i in 1:N
-        idx = i + (j-1)*N + (k-1)*N^2 + (e-1)*N^3
-        out[idx] = H_1d[i] * H_1d[j] * H_1d[k] * geom.detjac[i, j, k, e]
-    end
-    return out
-end
+physical_mass_diagonal(geom::MeshGeometry{T, N}, ops::SBPOps{N, T}) where {N, T} =
+    vec(Array(geom.Hphys))

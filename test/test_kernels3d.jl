@@ -8,10 +8,22 @@ using WaveToySecondOrder
 using WaveToySecondOrder: make_element, make_operators,
     make_cubical_mesh, make_cubed_cube_mesh, make_geometry,
     initialize3d!, rhs3d!, recommended_dt,
-    discrete_inner_product, Params3d
+    discrete_inner_product, Params3d, to_device
+using KernelAbstractions: CPU
 using OrdinaryDiffEqSymplecticRK
 using Random
 using Test
+
+# `Metal` is a weak dep (`[weakdeps]` in Project.toml). Try to load it;
+# if it's not installed or not functional on this machine, the GPU
+# testset further down is skipped silently. Non-Apple CI runners and
+# pure-CPU users therefore see no failure here.
+const HAS_METAL = try
+    @eval using Metal
+    Metal.functional()
+catch
+    false
+end
 
 # Discrete Hamiltonian for the SBP-DG wave equation:
 #
@@ -235,4 +247,122 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
         @test abs(E_end - E0) < energy_tol * abs(E0)
     end
 
+    _progress("device migration round-trip (T=$T)")
+    @testset "to_device round-trip on CPU backend (T=$T)" begin
+        # Exercises the GPU-staging code path even though we never leave
+        # the CPU: `to_device(geom, CPU())` allocates fresh backing arrays
+        # via `KernelAbstractions.allocate` and `copyto!`s every kernel-
+        # read field. The kernel then runs on those arrays. Result must
+        # be bit-identical to the original `geom` path because nothing
+        # has been promoted, demoted, or rearranged.
+        N    = 3
+        M    = 2
+        elem = make_element(T, N)
+        ops  = make_operators(elem)
+        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        geom = make_geometry(mesh, elem)
+
+        u  = randn(T, N, N, N, mesh.Ne)
+        u̇  = randn(T, N, N, N, mesh.Ne)
+        ü_host = similar(u);  ü_dev = similar(u)
+
+        params = Params3d(;
+            A           = zero(T),
+            k           = (zero(T), zero(T), zero(T)),
+            ω           = zero(T),
+            τ           = T(3//2) * (N - 1)^2,
+            bdry_values = ntuple(_ -> zero(T), Val(6)),
+        )
+
+        geom_dev = to_device(geom, CPU())
+        @test geom_dev.coords ≈ geom.coords   # round-trip preserves data
+        @test geom_dev !== geom               # …in a new container
+        @test geom_dev.conn.neighbour == geom.conn.neighbour
+
+        rhs3d!(ü_host, u, u̇, params; geom,     ops)
+        rhs3d!(ü_dev,  u, u̇, params; geom = geom_dev, ops)
+        @test ü_host == ü_dev
+    end
+end
+
+# GPU evolution on Metal. Gated on `Metal.functional()` so the test
+# silently skips on machines without an Apple GPU (e.g. CI runners).
+# Verifies that the full chain works end-to-end on the GPU:
+#   • `to_device(geom, MetalBackend())` migrates geometry
+#   • state allocated as `MtlArray{Float32}`
+#   • `rhs3d!` runs on Metal
+#   • `recommended_dt` runs on Metal (exercises the new device-aware
+#     `spectral_radius_estimate`)
+#   • `discrete_inner_product` runs on Metal (exercises the new
+#     `mapreduce`-based reduction)
+#   • short evolve via `SecondOrderODEProblem + CandyRoz4`
+# and that the final result is bit-identical to the host path.
+if HAS_METAL
+    @testset "GPU evolution on Metal (Float32)" begin
+        _progress("Metal evolve + recommended_dt + discrete_energy")
+        T    = Float32
+        N    = 4
+        M    = 2
+        elem = make_element(T, N)
+        ops  = make_operators(elem)
+        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        geom = make_geometry(mesh, elem)
+
+        params = Params3d(;
+            A           = one(T),
+            k           = (T(2π), T(2π), T(2π)),
+            ω           = T(sqrt(3 * (2π)^2)),
+            τ           = T(3//2) * (N - 1)^2,
+            bdry_values = ntuple(_ -> zero(T), Val(6)),
+        )
+
+        # Host reference.
+        u_host  = Array{T, 4}(undef, N, N, N, mesh.Ne)
+        u̇_host  = similar(u_host)
+        initialize3d!(u_host, u̇_host, geom.coords, T(0), params)
+        E0_host = discrete_inner_product(u̇_host, u̇_host, geom, ops) / 2
+        Random.seed!(20260523)
+        dt_host = recommended_dt(geom, ops, params.τ; cfl_safety = T(0.5))
+        @test isfinite(dt_host) && dt_host > 0
+
+        # Migrate geometry + state to Metal.
+        backend  = MetalBackend()
+        geom_dev = to_device(geom, backend)
+        u_dev    = MtlArray(u_host)
+        u̇_dev    = MtlArray(u̇_host)
+
+        # `discrete_inner_product` on device → should match host.
+        E0_dev = discrete_inner_product(u̇_dev, u̇_dev, geom_dev, ops) / 2
+        @test isapprox(E0_dev, E0_host; rtol = sqrt(eps(T)))
+
+        # `recommended_dt` on device → should match host within power-
+        # iteration tolerance (random seed differs between backends, so
+        # don't expect bit-identity, just same order of magnitude).
+        Random.seed!(20260523)
+        dt_dev = recommended_dt(geom_dev, ops, params.τ; cfl_safety = T(0.5))
+        @test isfinite(dt_dev) && dt_dev > 0
+        @test 0.5f0 * dt_host < dt_dev < 2 * dt_host
+
+        # Short evolution. Use `dt_host` for both so the integrator does
+        # exactly the same arithmetic on both backends → bit-identity.
+        t_end = T(20) * dt_host
+        f_host!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom,     ops)
+        f_dev!( ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom = geom_dev, ops)
+
+        prob_host = SecondOrderODEProblem(f_host!, u̇_host, u_host, (T(0), t_end), params)
+        prob_dev  = SecondOrderODEProblem(f_dev!,  u̇_dev,  u_dev,  (T(0), t_end), params)
+
+        sol_host = solve(prob_host, CandyRoz4(); dt = dt_host,
+                         save_everystep = false, save_start = false,
+                         dense = false, save_end = true)
+        sol_dev  = solve(prob_dev,  CandyRoz4(); dt = dt_host,
+                         save_everystep = false, save_start = false,
+                         dense = false, save_end = true)
+
+        u_host_end = sol_host.u[end].x[2]
+        u_dev_end  = Array(sol_dev.u[end].x[2])
+        @test all(isfinite, u_host_end)
+        @test all(isfinite, u_dev_end)
+        @test u_host_end == u_dev_end   # bit-identical
+    end
 end

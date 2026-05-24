@@ -1,4 +1,5 @@
 using CairoMakie
+using KernelAbstractions
 using OrdinaryDiffEqSymplecticRK
 using ProgressMeter
 using SixelTerm
@@ -66,10 +67,20 @@ end
 # the RHS closure `f!` doesn't pay dynamic-dispatch costs on each of the
 # integrator's per-step stage evaluations.
 function main(; T::Type = Float64,
+                backend = CPU(),
                 mesh_kind::Symbol = :cubical,
                 N::Int = 5,
                 M::Int = 8,
                 R::Real = 0.1)
+
+    # When the caller asks for a non-CPU backend the geometry and state
+    # are migrated to the device; only host-side analysis bits (slice
+    # sampling, 2-D `interpolate_field` snapshot) ever materialise back
+    # to host arrays via `Array(::AbstractGPUArray)`. Apple GPUs only
+    # support `Float32`, so use `T = Float32, backend = MetalBackend()`.
+    on_cpu = backend isa CPU
+    on_cpu || T <: AbstractFloat ||
+        error("non-CPU backend requires a floating-point T; got $T")
 
     elem = W.make_element(T, N)
     ops  = W.make_operators(elem)
@@ -83,13 +94,17 @@ function main(; T::Type = Float64,
     else
         error("unknown mesh_kind: $mesh_kind")
     end
-    geom   = W.make_geometry(mesh, elem)         # coords + per-node Jacobian
-    coords = geom.coords                         # (3, N, N, N, Ne)
+
+    # `geom_host` always lives on the CPU (vertex search,
+    # `interpolate_field`, the IC loop and the per-sample slice
+    # extraction all read its `coords` on the host). `geom` is what
+    # the kernels see — equal to `geom_host` on CPU, a device-resident
+    # copy on GPU.
+    geom_host = W.make_geometry(mesh, elem)
+    geom      = on_cpu ? geom_host : W.to_device(geom_host, backend)
+    coords    = geom_host.coords                  # (3, N, N, N, Ne), host
 
     dx = min_node_spacing(coords)
-
-    u  = Array{T, 4}(undef, N, N, N, mesh.Ne)
-    u̇  = similar(u)
 
     t0, t1 = zero(T), one(T)
     L_ = x1 - x0
@@ -108,17 +123,27 @@ function main(; T::Type = Float64,
         bdry_values = ntuple(_ -> zero(T), Val(6)),
     )
 
-    # Domain-normalised sine with 3 extrema (2 interior nodes) per
-    # direction. The (x − x0)/(x1 − x0) normalisation makes it vanish on
-    # the outer boundary of whichever domain is selected.
+    # Build the IC on host, then `copyto!` to the device if needed —
+    # the analytic formula is a host scalar loop that would be slow if
+    # we tried to scalar-index a `MtlArray`.
+    u_host  = Array{T, 4}(undef, N, N, N, mesh.Ne)
+    u̇_host  = similar(u_host)
     A         = params.A
     kx, ky, kz = params.k
     @inbounds for e in 1:mesh.Ne, k in 1:N, j in 1:N, i in 1:N
         X = (coords[1, i, j, k, e] - x0) / L_
         Y = (coords[2, i, j, k, e] - x0) / L_
         Z = (coords[3, i, j, k, e] - x0) / L_
-        u[i, j, k, e]  = A * sin(kx*X) * sin(ky*Y) * sin(kz*Z)
-        u̇[i, j, k, e] = zero(T)
+        u_host[i, j, k, e]  = A * sin(kx*X) * sin(ky*Y) * sin(kz*Z)
+        u̇_host[i, j, k, e] = zero(T)
+    end
+    if on_cpu
+        u, u̇ = u_host, u̇_host
+    else
+        u  = KernelAbstractions.allocate(backend, T, size(u_host)...)
+        u̇  = KernelAbstractions.allocate(backend, T, size(u̇_host)...)
+        copyto!(u,  u_host)
+        copyto!(u̇, u̇_host)
     end
 
     # `cfl_safety = 0.5` (vs the default 0.9) gives a margin for two
@@ -129,13 +154,11 @@ function main(; T::Type = Float64,
     # factor when the spectrum is clustered.
     dt  = W.recommended_dt(geom, ops, params.τ; cfl_safety = T(1//2))
     alg = pick_integrator(N)
-    println("integrator = $(typeof(alg).name.name)   τ = $(params.τ)   ",
+    println("integrator = $(typeof(alg).name.name)   backend = $(typeof(backend).name.name)   ",
+            "τ = $(params.τ)   ",
             "dt = $(round(dt, sigdigits=4))   dx_min = $(round(dx, sigdigits=4))")
 
-    # Pre-allocate per-thread RHS scratch buffers so the per-call
-    # allocation pressure stays out of the integrator loop.
-    workspace = W.Rhs3dWorkspace(elem)
-    f!(ü, u̇, u, p::W.Params3d, t) = W.rhs3d!(ü, u, u̇, p; geom, ops, workspace)
+    f!(ü, u̇, u, p::W.Params3d, t) = W.rhs3d!(ü, u, u̇, p; geom, ops)
     prob = SecondOrderODEProblem(f!, u̇, u, (t0, t1), params)
 
     # Initialise the integrator. We turn off all in-solver state storage —
@@ -162,8 +185,19 @@ function main(; T::Type = Float64,
     us      = Array{T}(undef, Ns, Nt)
     u̇s      = Array{T}(undef, Ns, Nt)
     l2_err  = Vector{T}(undef, Nt)
-    u_exact = similar(u)
+    u_exact = similar(u)           # same backend as state
     err_buf = similar(u)
+    # Slice/finiteness/scalar-index work happens on host. On CPU these
+    # alias `u` directly; on GPU they're per-sample copies via
+    # `copyto!`, which is cheap relative to `Nt` integrator steps.
+    u_arr_host  = on_cpu ? u_host  : Array{T, 4}(undef, N, N, N, mesh.Ne)
+    u̇_arr_host  = on_cpu ? u̇_host  : Array{T, 4}(undef, N, N, N, mesh.Ne)
+    # Normalised coordinate views for broadcasting the analytic field
+    # over the (possibly device-resident) `geom.coords`. Views work the
+    # same on CPU/GPU and avoid intermediate allocations in the broadcast.
+    Xv = @view geom.coords[1, :, :, :, :]
+    Yv = @view geom.coords[2, :, :, :, :]
+    Zv = @view geom.coords[3, :, :, :, :]
 
     prog = Progress(length(ts);
                     desc = "Evolving + sampling (mesh=$(mesh_kind), τ=$(params.τ)): ",
@@ -179,25 +213,30 @@ function main(; T::Type = Float64,
         # two partitions directly — no copy, no allocation.
         u̇_arr = integrator.u.x[1]
         u_arr  = integrator.u.x[2]
-        @assert all(isfinite, u_arr) && all(isfinite, u̇_arr)
+
+        # Bring slice / scalar-index work to host. On CPU these are
+        # identity copies (the source and destination alias the same
+        # buffer); on GPU they're a small device→host transfer.
+        on_cpu || copyto!(u_arr_host,  u_arr)
+        on_cpu || copyto!(u̇_arr_host, u̇_arr)
+        @assert all(isfinite, u_arr_host) && all(isfinite, u̇_arr_host)
 
         # Spacetime slice along the x-axis at (y_target, z_target).
         for (p, (e, ii, jj, kk)) in enumerate(slice_idx)
-            us[p, n] = u_arr[ii, jj, kk, e]
-            u̇s[p, n] = u̇_arr[ii, jj, kk, e]
+            us[p, n] = u_arr_host[ii, jj, kk, e]
+            u̇s[p, n] = u̇_arr_host[ii, jj, kk, e]
         end
 
         # Physical-mass-weighted L² norm of the error vs the analytic
         # sin·sin·sin·cos(ωt) eigenmode (which satisfies the wave equation
         # with homogeneous Dirichlet on either [0,1]³ or [-1,1]³). The error
         # is fully truncation/dispersion error from the discretisation.
-        ct = cos(params.ω * t)
-        @inbounds for e in 1:mesh.Ne, k in 1:N, j in 1:N, i in 1:N
-            X = (coords[1, i, j, k, e] - x0) / L_
-            Y = (coords[2, i, j, k, e] - x0) / L_
-            Z = (coords[3, i, j, k, e] - x0) / L_
-            u_exact[i, j, k, e] = A * sin(kx*X) * sin(ky*Y) * sin(kz*Z) * ct
-        end
+        # Broadcast over device arrays — produces an MtlArray on Metal.
+        ct = T(cos(params.ω * t))
+        @. u_exact = A *
+                     sin(kx * (Xv - x0) / L_) *
+                     sin(ky * (Yv - x0) / L_) *
+                     sin(kz * (Zv - x0) / L_) * ct
         err_buf .= u_arr .- u_exact
         l2_err[n] = W.discrete_l2_norm(err_buf, geom, ops)
     end
@@ -211,8 +250,11 @@ function main(; T::Type = Float64,
     xs_xy  = range(x0, x1; length = Ng)
     ys_xy  = range(x0, x1; length = Ng)
     pts_xy = [SVector{3,T}(x, y, zero(T)) for x in xs_xy, y in ys_xy]
-    u_final = integrator.u.x[2]
-    u_xy    = W.interpolate_field(geom, elem, u_final, pts_xy)
+    # `interpolate_field` is host-only (Newton iteration with brute-
+    # force vertex search). Materialise `u_final` on host first if it
+    # lives on a device.
+    u_final = on_cpu ? integrator.u.x[2] : Array(integrator.u.x[2])
+    u_xy    = W.interpolate_field(mesh, elem, u_final, pts_xy)
 
     # Element-boundary segments lying on z = 0: collect the 12 edges per
     # element and keep only those whose endpoint vertices both sit on the
@@ -279,7 +321,21 @@ function main(; T::Type = Float64,
     return fig
 end
 
-# Default run: cubed_cube mesh, N = 4 GLL nodes per element, M = 8 elements per axis.
-main(; mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
+# Default run: cubed_cube mesh, N = 4 GLL nodes per element, M = 8
+# elements per axis, on CPU. To run on Apple Silicon's Metal GPU, add
+# `using Metal` and pass `T = Float32, backend = MetalBackend()`:
+#
+#     using Metal
+#     main(; T = Float32, backend = MetalBackend(),
+#            mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
+
+# main(; mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
+
+# main(; T = Float32,
+#        mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
+
+using Metal
+main(; T = Float32, backend = MetalBackend(),
+       mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
 
 nothing

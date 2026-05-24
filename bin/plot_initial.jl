@@ -51,12 +51,12 @@ Ng = 120
 xs = range(x0, x1; length = Ng)
 ys = range(x0, x1; length = Ng)
 pts_xy = [SVector(x, y, xmid) for x in xs, y in ys]
-u_xy = W.interpolate_field(geom, elem, u, pts_xy)
+u_xy = W.interpolate_field(mesh, elem, u, pts_xy)
 
 # (x, z) plane at y = xmid -------------------------------------------------
 zs = range(x0, x1; length = Ng)
 pts_xz = [SVector(x, xmid, z) for x in xs, z in zs]
-u_xz = W.interpolate_field(geom, elem, u, pts_xz)
+u_xz = W.interpolate_field(mesh, elem, u, pts_xz)
 
 # Figure -------------------------------------------------------------------
 fig = Figure(; size = (1000, 500))

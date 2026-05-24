@@ -1,8 +1,11 @@
 module WaveToySecondOrder
 
+using Adapt
 using FastGaussQuadrature
+using KernelAbstractions
 using LinearAlgebra
 using PolynomialBases: LobattoLegendre
+using Random
 using StaticArrays
 
 # Discrete SBP-SAT operators on a single element, plus the SAT increment

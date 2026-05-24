@@ -10,7 +10,6 @@ ops  = W.make_operators(elem)
 params = W.Params3d(; A = 0.0, k = (0.0, 0.0, 0.0), ω = 0.0,
                       τ = 1.5 * (N - 1)^2,
                       bdry_values = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
-ws = W.Rhs3dWorkspace(elem)
 
 # Cubical sweep
 println("\n--- cubical mesh ---")
@@ -21,7 +20,7 @@ for M in (2, 4, 8, 12)
     u̇  = randn(N, N, N, mesh.Ne)
     ü  = similar(u)
 
-    b = @benchmark W.rhs3d!($ü, $u, $u̇, $params; geom=$geom, ops=$ops, workspace=$ws)
+    b = @benchmark W.rhs3d!($ü, $u, $u̇, $params; geom=$geom, ops=$ops)
     t_per_elt = minimum(b.times) / mesh.Ne
     println("  M=$M  ($(mesh.Ne) elements)  total=$(round(minimum(b.times)/1e3, digits=1)) μs  ",
             "per-element=$(round(t_per_elt, digits=1)) ns  allocs=$(b.allocs)  bytes=$(b.memory)")
@@ -36,7 +35,7 @@ for (M, R) in ((4, 0.1), (8, 0.1), (4, 0.3))
     u̇  = randn(N, N, N, mesh.Ne)
     ü  = similar(u)
 
-    b = @benchmark W.rhs3d!($ü, $u, $u̇, $params; geom=$geom, ops=$ops, workspace=$ws)
+    b = @benchmark W.rhs3d!($ü, $u, $u̇, $params; geom=$geom, ops=$ops)
     t_per_elt = minimum(b.times) / mesh.Ne
     println("  M=$M  R=$R  ($(mesh.Ne) elements)  total=$(round(minimum(b.times)/1e3, digits=1)) μs  ",
             "per-element=$(round(t_per_elt, digits=1)) ns  allocs=$(b.allocs)  bytes=$(b.memory)")

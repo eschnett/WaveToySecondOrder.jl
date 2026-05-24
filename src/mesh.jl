@@ -37,9 +37,13 @@ Connectivity + geometry of a conforming hexahedral mesh.
 # Fields
 
 * `Ne :: Int` — number of elements.
-* `neighbour :: Matrix{Int}` of shape `(6, Ne)` — element ID of the
+* `neighbour :: Matrix{Int32}` of shape `(6, Ne)` — element ID of the
   neighbour across each of the six faces (face ordering as above). `0`
-  marks an outer-boundary face.
+  marks an outer-boundary face. Stored as `Int32` rather than `Int` so
+  that `nbr` reads from inside the GPU kernel stay 32-bit (Apple
+  Silicon GPUs emulate 64-bit integer arithmetic, which costs ~4× on
+  every 4-D array offset computation in `_add_face_sat!`). 2^31 ≫
+  any realistic element count, so the narrower type is safe.
 * `neighbour_face :: Matrix{Int8}` of shape `(6, Ne)` — face index of
   the neighbour element that abuts face `f` of `e`. For an axis-aligned
   cubical mesh this is just the opposite face index along the same axis
@@ -60,15 +64,65 @@ Connectivity + geometry of a conforming hexahedral mesh.
   indices into `vertex_coords` of its eight corners (in the canonical
   vertex ordering above).
 """
-struct HexMesh{T}
-    Ne             :: Int
-    neighbour      :: Matrix{Int}
-    neighbour_face :: Matrix{Int8}
-    orientation    :: Matrix{Int8}
-    bdry           :: Matrix{Int8}
-    vertex_coords  :: Matrix{T}
-    vertex_idx     :: Matrix{Int}
+# `MeshConnectivity` bundles only what the kernel reads from a mesh: the
+# four connectivity matrices, indexed by `(face, element)`. Whoever
+# launches the kernel sees this as one bitstype-friendly argument, so
+# GPU adaptation can replace its arrays with `MtlDeviceMatrix` (etc.)
+# in one shot. `HexMesh` (below) embeds a `MeshConnectivity` plus the
+# host-only vertex metadata that the kernel never touches.
+struct MeshConnectivity{MI, MI8}
+    neighbour      :: MI
+    neighbour_face :: MI8
+    orientation    :: MI8
+    bdry           :: MI8
 end
+
+# `HexMesh{T}` is parametrised on the *concrete* storage types of the
+# kernel-read connectivity matrices (via `conn::MeshConnectivity`) so
+# that they may live on a GPU as `CuArray`, `MtlArray`, `ROCArray`, etc.
+# Host-only fields (`vertex_coords`, `vertex_idx`) stay concrete
+# `Matrix` — they are read by plotting and diagnostics, never by the
+# kernel, so there is no benefit to migrating them onto a device.
+# A `Base.getproperty` forwarder below preserves `mesh.neighbour` /
+# `mesh.bdry` / etc. so existing host code does not need updating.
+struct HexMesh{T, MI, MI8}
+    Ne            :: Int
+    conn          :: MeshConnectivity{MI, MI8}
+    vertex_coords :: Matrix{T}
+    vertex_idx    :: Matrix{Int}
+
+    function HexMesh{T}(Ne::Int,
+                        conn::MeshConnectivity{MI, MI8},
+                        vertex_coords::Matrix{T},
+                        vertex_idx::Matrix{Int}) where {T, MI, MI8}
+        new{T, MI, MI8}(Ne, conn, vertex_coords, vertex_idx)
+    end
+
+    # Back-compat constructor matching the old flat-field signature.
+    function HexMesh{T}(Ne::Int,
+                        neighbour::MI, neighbour_face::MI8,
+                        orientation::MI8, bdry::MI8,
+                        vertex_coords::Matrix{T},
+                        vertex_idx::Matrix{Int}) where {T, MI, MI8}
+        new{T, MI, MI8}(Ne,
+                        MeshConnectivity{MI, MI8}(neighbour, neighbour_face,
+                                                  orientation, bdry),
+                        vertex_coords, vertex_idx)
+    end
+end
+
+# `mesh.neighbour` etc. forward to `mesh.conn.*` so existing call sites
+# (mesh-build code, tests, diagnostics) keep working without churn.
+@inline function Base.getproperty(m::HexMesh, name::Symbol)
+    if name === :neighbour || name === :neighbour_face ||
+       name === :orientation || name === :bdry
+        getfield(getfield(m, :conn), name)
+    else
+        getfield(m, name)
+    end
+end
+Base.propertynames(m::HexMesh) = (:Ne, :conn, :vertex_coords, :vertex_idx,
+                                  :neighbour, :neighbour_face, :orientation, :bdry)
 
 """
     nv(mesh::HexMesh) → Int
@@ -109,7 +163,7 @@ function make_cubical_mesh(::Type{T}, Mx::Int, My::Int, Mz::Int, x0, x1) where {
     Nvx, Nvy, Nvz = Mx + 1, My + 1, Mz + 1
     Nv = Nvx * Nvy * Nvz
 
-    neighbour      = zeros(Int,  6, Ne)
+    neighbour      = zeros(Int32, 6, Ne)
     neighbour_face = zeros(Int8, 6, Ne)
     orientation    = zeros(Int8, 6, Ne)
     bdry           = zeros(Int8, 6, Ne)
@@ -409,7 +463,7 @@ function make_cubed_cube_mesh(::Type{T}, M::Int, R::Real) where {T}
     # signature. When a match is found, the order of the 4 vertices in
     # the two elements' canonical face-vertex lists yields the D₄
     # orientation that maps self's face-local (p, q) into the neighbour's.
-    neighbour      = zeros(Int,  6, Ne)
+    neighbour      = zeros(Int32, 6, Ne)
     neighbour_face = zeros(Int8, 6, Ne)
     orientation    = zeros(Int8, 6, Ne)
     face_sig       = Dict{NTuple{4, Int},
@@ -561,13 +615,19 @@ end
     MeshGeometry{T, N}
 
 Per-node geometric data for a `HexMesh`, evaluated at the GLL collocation
-points of a 1D reference element with `N` nodes. Built once at mesh setup
-time and consumed by the kernels for IC evaluation, plotting, and
-metric-aware operator application.
+points of a 1D reference element with `N` nodes. Holds *only* what the
+kernel reads — the underlying `HexMesh` topology (vertices and their
+indices into the connectivity) is **not** carried here; keep your own
+reference to it for host-side queries (`element_vertices`, plotting,
+`locate_point`, etc.).
 
 # Fields
 
-* `mesh   :: HexMesh{T}` — the underlying topology + vertex coordinates.
+* `Ne :: Int` — element count. Mirrors `mesh.Ne` of the originating
+  `HexMesh` and is used as the kernel `ndrange`.
+* `conn :: MeshConnectivity{MI, MI8}` — the four connectivity matrices
+  copied across from `mesh.conn`. Kernel-resident; backed by `Array`
+  on the host and by the appropriate device array on GPU backends.
 * `coords :: Array{T, 5}` of shape `(3, N, N, N, Ne)` — physical (x, y, z)
   coordinate of every collocation point.
 * `jac    :: Array{T, 6}` of shape `(3, 3, N, N, N, Ne)` — Jacobian
@@ -577,6 +637,12 @@ metric-aware operator application.
   reference cube.
 * `detjac :: Array{T, 4}` of shape `(N, N, N, Ne)` — absolute value of
   `det J`, the per-node volume factor used by the integration weights.
+* `Hphys :: Array{T, 4}` of shape `(N, N, N, Ne)` — the per-node
+  physical mass `H_ref[i]·H_ref[j]·H_ref[k]·|det J|`. Precomputed
+  here so that GPU-portable reductions (`discrete_inner_product`,
+  `discrete_l2_norm`, `spectral_radius_estimate`) can run as a single
+  `mapreduce` over device arrays without re-deriving the mass per
+  node from the 1D quadrature weights and the Jacobian on each call.
 * `handedness :: Vector{Int8}` of length `Ne` — `±1`, the sign of
   `det J` on element `e`. A non-degenerate hex has uniform-sign Jacobian
   throughout, so a single scalar per element captures the handedness;
@@ -588,13 +654,27 @@ weights from `ops.H` on the fly: per-node physical mass is
 `Hphys = H_ref[i] H_ref[j] H_ref[k] · |det J|` and the weak-form stiffness
 kernel is `Wmetric = Hphys · (J⁻¹ J⁻ᵀ)`.
 """
-struct MeshGeometry{T, N}
-    mesh       :: HexMesh{T}
-    coords     :: Array{T, 5}
-    jac        :: Array{T, 6}
-    invjac     :: Array{T, 6}
-    detjac     :: Array{T, 4}
-    handedness :: Vector{Int8}
+# `MeshGeometry{T, N}` is parametrised on the concrete storage types of
+# every kernel-read field so it can be device-resident on any backend.
+# All fields are bitstype-adaptable, so KA's launch-time recursive
+# `adapt` migrates everything to device types in one shot — there is no
+# special handling of any host-only field, because there is none.
+struct MeshGeometry{T, N, MC, A5, A6, A4, V1}
+    Ne         :: Int
+    conn       :: MC
+    coords     :: A5
+    jac        :: A6
+    invjac     :: A6
+    detjac     :: A4
+    Hphys      :: A4
+    handedness :: V1
+
+    function MeshGeometry{T, N}(Ne::Int, conn::MC,
+                                coords::A5, jac::A6, invjac::A6,
+                                detjac::A4, Hphys::A4,
+                                handedness::V1) where {T, N, MC, A5, A6, A4, V1}
+        new{T, N, MC, A5, A6, A4, V1}(Ne, conn, coords, jac, invjac, detjac, Hphys, handedness)
+    end
 end
 
 """
@@ -604,16 +684,27 @@ Evaluate the trilinear element map of every hex in `mesh` at the GLL
 collocation points of the reference element `elem` (using `elem.xs ∈
 [0, 1]` as reference coordinates), and bundle the resulting physical
 coordinates, Jacobians, inverse Jacobians, and `|det J|` into a
-`MeshGeometry`.
+`MeshGeometry`. The returned geometry copies `mesh.conn` by reference;
+the caller retains ownership of the `HexMesh` (with its vertex data)
+for host-side queries.
 """
 function make_geometry(mesh::HexMesh{T}, elem) where {T}
     N  = elem.N
     ξs = elem.xs
     Ne = mesh.Ne
+
+    # 1D GLL quadrature weights, used to build the per-node physical
+    # mass `Hphys`. We pull them from a fresh `SBPOps` rather than
+    # depending on the user to pass `ops` in — operator construction
+    # is `O(N²)` and runs once at mesh setup, so the cost is invisible.
+    ops_ref = make_operators(elem)
+    H_1d    = SVector{N, T}(ntuple(i -> ops_ref.H[i, i], Val(N)))
+
     coords     = Array{T, 5}(undef, 3, N, N, N, Ne)
     jac        = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
     invjac     = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
     detjac     = Array{T, 4}(undef, N, N, N, Ne)
+    Hphys      = Array{T, 4}(undef, N, N, N, Ne)
     handedness = Vector{Int8}(undef, Ne)
     @inbounds for e in 1:Ne
         verts = element_vertices(mesh, e)
@@ -636,10 +727,101 @@ function make_geometry(mesh::HexMesh{T}, elem) where {T}
                 end
             end
             detjac[i, j, k, e] = dJ
+            Hphys[i, j, k, e]  = H_1d[i] * H_1d[j] * H_1d[k] * dJ
         end
     end
-    return MeshGeometry{T, N}(mesh, coords, jac, invjac, detjac, handedness)
+    return MeshGeometry{T, N}(Ne, mesh.conn,
+                              coords, jac, invjac, detjac, Hphys, handedness)
 end
+
+################################################################################
+# Device migration
+
+"""
+    to_device(mesh::HexMesh, backend) → HexMesh
+    to_device(geom::MeshGeometry, backend) → MeshGeometry
+
+Move every kernel-read array of `mesh` / `geom` onto `backend` (a
+`KernelAbstractions.Backend` instance — `CPU()`, `CUDABackend()`,
+`MetalBackend()`, `ROCBackend()`). For `mesh`, this migrates the four
+connectivity matrices; the host-only `vertex_coords` / `vertex_idx`
+are left as plain CPU `Matrix`. For `geom`, it migrates `coords`,
+`jac`, `invjac`, `detjac`, `handedness`, and the embedded mesh.
+
+The CPU → CPU case is a no-op-shaped copy: every allocation goes
+through `KernelAbstractions.allocate(backend, …)` which on the CPU
+backend just calls `Array{T}(undef, …)`. Round-tripping through
+`to_device(g, CPU())` is therefore a valid smoke test that exercises
+the migration path without requiring a GPU.
+"""
+function to_device(mesh::HexMesh{T}, backend) where {T}
+    nb  = KernelAbstractions.allocate(backend, Int32, size(mesh.neighbour))
+    nbf = KernelAbstractions.allocate(backend, Int8, size(mesh.neighbour_face))
+    ori = KernelAbstractions.allocate(backend, Int8, size(mesh.orientation))
+    bdr = KernelAbstractions.allocate(backend, Int8, size(mesh.bdry))
+    copyto!(nb,  mesh.neighbour)
+    copyto!(nbf, mesh.neighbour_face)
+    copyto!(ori, mesh.orientation)
+    copyto!(bdr, mesh.bdry)
+    new_conn = MeshConnectivity(nb, nbf, ori, bdr)
+    return HexMesh{T}(mesh.Ne, new_conn, mesh.vertex_coords, mesh.vertex_idx)
+end
+
+function to_device(geom::MeshGeometry{T, N}, backend) where {T, N}
+    conn_dev = to_device(geom.conn, backend)
+    coords  = KernelAbstractions.allocate(backend, T,    size(geom.coords))
+    jac     = KernelAbstractions.allocate(backend, T,    size(geom.jac))
+    invjac  = KernelAbstractions.allocate(backend, T,    size(geom.invjac))
+    detjac  = KernelAbstractions.allocate(backend, T,    size(geom.detjac))
+    Hphys   = KernelAbstractions.allocate(backend, T,    size(geom.Hphys))
+    hand    = KernelAbstractions.allocate(backend, Int8, size(geom.handedness))
+    copyto!(coords, geom.coords)
+    copyto!(jac,    geom.jac)
+    copyto!(invjac, geom.invjac)
+    copyto!(detjac, geom.detjac)
+    copyto!(Hphys,  geom.Hphys)
+    copyto!(hand,   geom.handedness)
+    return MeshGeometry{T, N}(geom.Ne, conn_dev,
+                              coords, jac, invjac, detjac, Hphys, hand)
+end
+
+# `MeshConnectivity` device migration — used both directly (when a
+# caller migrates a HexMesh) and indirectly through `to_device(geom)`.
+function to_device(conn::MeshConnectivity, backend)
+    nb  = KernelAbstractions.allocate(backend, Int32, size(conn.neighbour))
+    nbf = KernelAbstractions.allocate(backend, Int8, size(conn.neighbour_face))
+    ori = KernelAbstractions.allocate(backend, Int8, size(conn.orientation))
+    bdr = KernelAbstractions.allocate(backend, Int8, size(conn.bdry))
+    copyto!(nb,  conn.neighbour)
+    copyto!(nbf, conn.neighbour_face)
+    copyto!(ori, conn.orientation)
+    copyto!(bdr, conn.bdry)
+    return MeshConnectivity(nb, nbf, ori, bdr)
+end
+
+# `Adapt.adapt_structure` rules. When KernelAbstractions launches a
+# kernel on a GPU backend, it walks each argument with `Adapt.adapt(to,
+# arg)` and replaces host arrays with their device representations
+# (`CuArray` → `CuDeviceArray`, `MtlArray` → `MtlDeviceArray`, etc.).
+# `MeshConnectivity` and `MeshGeometry` participate in that walk by
+# recursively adapting every field. No special rule is needed for
+# `HexMesh`: it is host-only and never crosses a kernel boundary.
+Adapt.adapt_structure(to, c::MeshConnectivity) = MeshConnectivity(
+    Adapt.adapt(to, c.neighbour),
+    Adapt.adapt(to, c.neighbour_face),
+    Adapt.adapt(to, c.orientation),
+    Adapt.adapt(to, c.bdry))
+
+Adapt.adapt_structure(to, geom::MeshGeometry{T, N}) where {T, N} =
+    MeshGeometry{T, N}(
+        geom.Ne,
+        Adapt.adapt(to, geom.conn),
+        Adapt.adapt(to, geom.coords),
+        Adapt.adapt(to, geom.jac),
+        Adapt.adapt(to, geom.invjac),
+        Adapt.adapt(to, geom.detjac),
+        Adapt.adapt(to, geom.Hphys),
+        Adapt.adapt(to, geom.handedness))
 
 """
     element_coords(mesh, elem) → Array{T, 5}
@@ -745,32 +927,33 @@ function tensor_interp(ue::AbstractArray{T, 3},
 end
 
 """
-    interpolate_field(geom, elem, u, p; default) → T
+    interpolate_field(mesh, elem, u, p; default) → T
 
 Evaluate the per-element field `u` (shape `(N, N, N, Ne)`) at the
-physical point `p` by locating the element containing `p`, inverting the
-trilinear element map, and applying tensor-product Lagrange interpolation
-on the GLL nodes `elem.xs`. Returns `default` if `p` lies outside the
-mesh. Brute-force, intended for visualisation.
+physical point `p` by locating the element of `mesh::HexMesh` that
+contains `p`, inverting the trilinear element map, and applying
+tensor-product Lagrange interpolation on the GLL nodes `elem.xs`.
+Returns `default` if `p` lies outside the mesh. Brute-force, intended
+for visualisation.
 """
-function interpolate_field(geom::MeshGeometry{T, N}, elem,
+function interpolate_field(mesh::HexMesh{T}, elem,
                             u::AbstractArray{T, 4},
                             p::SVector{3, T};
-                            default = T(NaN)) where {T, N}
-    e, ξ = locate_point(geom.mesh, p)
+                            default = T(NaN)) where {T}
+    e, ξ = locate_point(mesh, p)
     e == 0 && return default
     return tensor_interp(view(u, :, :, :, e), ξ[1], ξ[2], ξ[3], elem.xs)
 end
 
 # Vectorised convenience: take any iterable of points and return an
 # array of values with the same shape.
-function interpolate_field(geom::MeshGeometry{T}, elem,
+function interpolate_field(mesh::HexMesh{T}, elem,
                             u::AbstractArray{T, 4},
                             points::AbstractArray{<:SVector{3, T}};
                             default = T(NaN)) where {T}
     out = similar(points, T)
     for I in eachindex(points)
-        out[I] = interpolate_field(geom, elem, u, points[I]; default)
+        out[I] = interpolate_field(mesh, elem, u, points[I]; default)
     end
     return out
 end
