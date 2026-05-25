@@ -412,7 +412,15 @@ end
     nz_u = sgn_out * (tp_x * tq_y - tp_y * tq_x)
     JF = sqrt(nx_u*nx_u + ny_u*ny_u + nz_u*nz_u)
     nx = nx_u / JF; ny = ny_u / JF; nz = nz_u / JF
-    hF = sqrt(JF)
+    # SIPG penalty length scale: the perpendicular element thickness
+    # `h_F = |K_e| / |F|`, i.e. `detjac / JF` evaluated at this face
+    # node. (NOT `sqrt(JF)`, which is the face geometric mean — for
+    # axis-aligned uniform elements the two coincide, but on stretched
+    # elements `sqrt(JF)` under-penalises by exactly the aspect ratio.
+    # This was the source of the +30 000 localised eigenvalue on the
+    # outermost layer of the inflated-cube shell at M = 8.)
+    @inbounds dJ = geom.detjac[i, j, k, e]
+    hF = dJ / JF
 
     @inbounds Ji11 = geom.invjac[1,1,i,j,k,e]; @inbounds Ji12 = geom.invjac[1,2,i,j,k,e]; @inbounds Ji13 = geom.invjac[1,3,i,j,k,e]
     @inbounds Ji21 = geom.invjac[2,1,i,j,k,e]; @inbounds Ji22 = geom.invjac[2,2,i,j,k,e]; @inbounds Ji23 = geom.invjac[2,3,i,j,k,e]

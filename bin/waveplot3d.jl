@@ -124,7 +124,7 @@ function main(; T::Type = Float64,
 
     dx = min_node_spacing(coords)
 
-    t0, t1 = zero(T), one(T) / 10
+    t0, t1 = zero(T), one(T)
     L_ = x1 - x0
 
     # Initial-condition family. The IC is *independent* of the mesh:
@@ -156,30 +156,18 @@ function main(; T::Type = Float64,
     # Bounding-box centre for the radial IC.
     ic_center = ((x0 + x1) / 2, (x0 + x1) / 2, (x0 + x1) / 2)
 
-    # Bundle the system parameters. SIPG penalty rule of thumb scales
-    # with the worst element aspect ratio:
-    #
-    #   :cubical       (AR ≈ 1)  → ~1.5·(N−1)²
-    #   :cubed_cube    (AR ≲ 2)  → ~8·(N−1)²
-    #   :inflated_cube (AR ≲ 10 on the outermost shell layer at r = R2)
-    #                            → ~32·(N−1)²
-    #
-    # The inflated-cube value is empirical: a localised mode living on
-    # the outermost shell elements has eigenvalue λ ≈ +30 000 at
-    # τ = 8·(N−1)² with the default mesh constants and M = 8, growing
-    # at ~177/unit time and tripping the integrator's `unstable_check`
-    # before t = 0.15. Bumping to 32·(N−1)² drives that mode negative
-    # at the cost of `dt ≈ 1/√τ → ~2×` smaller. See the discussion of
-    # option (B) for a principled adaptive τ — TODO.
-    τ_mesh = mesh_kind === :cubical       ? T(3//2) * (N-1)^2 :
-             mesh_kind === :cubed_cube    ? T(8)    * (N-1)^2 :
-             mesh_kind === :inflated_cube ? T(32)   * (N-1)^2 :
-             error("unknown mesh_kind: $mesh_kind")
+    # Bundle the system parameters. The SIPG penalty is now a single
+    # global constant depending only on the polynomial degree: the
+    # kernel uses the local face-perpendicular thickness `h_F = |K_e|/|F|`
+    # at each face node, so aspect-ratio rescaling happens inside
+    # `_face_sat_compute!` automatically. `τ ≈ 1.5·(N−1)²` is the
+    # reference-cube constant that keeps the discrete operator NSD on
+    # any of the supported meshes.
     params = W.Params3d(;
         A           = one(T),
         k           = (ic_k, ic_k, ic_k),
         ω           = ic_ω,
-        τ           = τ_mesh,
+        τ           = T(3//2) * (N-1)^2,
         bdry_values = ntuple(_ -> zero(T), Val(6)),
     )
 

@@ -2,10 +2,7 @@
 
 - more mesh connectivity test cases; count V E F?
 - use enum for patch kinds
-- better initial conditions for inflated cube
 - equal angles in outermost shell in inflated cube
-- different \tau for different elements?
-  - choose \tau for fiducial element, then scale?
 - use actual eigenvalue solver in `spectral_radius_estimate`
 
 # Long-term ideas
