@@ -28,6 +28,7 @@ Gmsh = "0.3.1"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1.10.0"
 Metal = "1"
+CUDA = "6"
 OrdinaryDiffEqSymplecticRK = "2.1.0"
 PolynomialBases = "0.4.25"
 ProgressMeter = "1.11.0"
@@ -38,9 +39,8 @@ julia = "1.10"
 
 [weakdeps]
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 
 [extensions]
 WaveToySecondOrderMetalExt = "Metal"
-
-[extras]
-MPIPreferences = "3da0fdf6-3ccc-4f1b-acd9-58baa6c99267"
+WaveToySecondOrderCUDAExt = "CUDA"

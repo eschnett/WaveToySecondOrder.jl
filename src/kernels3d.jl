@@ -133,6 +133,101 @@ function initialize3d!(u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
 end
 
 ################################################################################
+# Analytic standing-wave eigenmodes
+#
+# Each of the functions below fills `u` and `u̇ = ∂_t u` at time `t` for
+# one family of exact solutions to `ü = ∇² u`. They are pure broadcasts
+# over `coords` (the 5-D `(3, N, N, N, Ne)` array), so they work
+# unchanged on host arrays and on GPU device arrays. Used both to seed
+# the initial condition and to evaluate the analytic reference at each
+# diagnostic time sample.
+#
+# The `ic_kind` argument in `bin/waveplot3d.jl` selects between these.
+
+"""
+    eigenmode_cartesian!(u, u̇, coords, t; A, kx, ky, kz, ω, x0, x1)
+
+Standing-wave eigenmode of `ü = ∇² u` on the cube `[x0, x1]³` with
+homogeneous Dirichlet BC on the six cube faces:
+
+```
+u(x, y, z, t) = A · sin(kx · X) · sin(ky · Y) · sin(kz · Z) · cos(ω t)
+```
+
+with normalised coordinates `X = (x - x0)/(x1 - x0)`, similarly for
+`Y, Z`. The exact-eigenmode dispersion relation is
+`ω = √(kx² + ky² + kz²) / (x1 - x0)`. Choosing `kx, ky, kz` as integer
+multiples of `π` makes the IC vanish on the six cube faces, so the
+homogeneous Dirichlet BC is satisfied exactly.
+
+Fills both `u` and `u̇` in-place at time `t`.
+"""
+function eigenmode_cartesian!(u::AbstractArray{T},
+                                u̇::AbstractArray{T},
+                                coords::AbstractArray{T},
+                                t::Real;
+                                A, kx, ky, kz, ω, x0, x1) where {T}
+    Xv = @view coords[1, :, :, :, :]
+    Yv = @view coords[2, :, :, :, :]
+    Zv = @view coords[3, :, :, :, :]
+    A_  = T(A)
+    kx_ = T(kx);  ky_ = T(ky);  kz_ = T(kz)
+    ω_  = T(ω)
+    x0_ = T(x0)
+    L_  = T(x1 - x0)
+    ct  = cos(ω_ * T(t))
+    st  = sin(ω_ * T(t))
+    @. u  =  A_      * sin(kx_ * (Xv - x0_) / L_) *
+                       sin(ky_ * (Yv - x0_) / L_) *
+                       sin(kz_ * (Zv - x0_) / L_) * ct
+    @. u̇ = -A_ * ω_ * sin(kx_ * (Xv - x0_) / L_) *
+                       sin(ky_ * (Yv - x0_) / L_) *
+                       sin(kz_ * (Zv - x0_) / L_) * st
+    return u, u̇
+end
+
+"""
+    eigenmode_radial!(u, u̇, coords, t; A, R, n = 1, center = (0, 0, 0))
+
+Spherically-symmetric (`l = 0`, `n`-th radial) eigenmode of
+`ü = ∇² u` on the ball `|x − center| ≤ R` with homogeneous Dirichlet
+BC on `|x − center| = R`:
+
+```
+u(r, t) = A · sinc(n · r / R) · cos(ω t),    r = |x − center|
+```
+
+where `sinc(y) = sin(πy)/(πy)` (Julia's `Base.sinc`), and the
+eigenfrequency is `ω = nπ / R`. The IC vanishes at `r = R` (since
+`sin(nπ) = 0`) so the Dirichlet BC is satisfied exactly.
+
+`n ≥ 1` selects the radial node count; `n = 1` is the fundamental.
+`sinc` handles the removable singularity at `r = 0` (value `A · cos(ω t)`).
+
+Fills both `u` and `u̇` in-place at time `t`.
+"""
+function eigenmode_radial!(u::AbstractArray{T},
+                            u̇::AbstractArray{T},
+                            coords::AbstractArray{T},
+                            t::Real;
+                            A, R, n::Integer = 1,
+                            center = (zero(T), zero(T), zero(T))) where {T}
+    Xv = @view coords[1, :, :, :, :]
+    Yv = @view coords[2, :, :, :, :]
+    Zv = @view coords[3, :, :, :, :]
+    A_ = T(A)
+    R_ = T(R)
+    n_ = T(n)
+    ω  = n_ * T(π) / R_
+    ct = cos(ω * T(t))
+    st = sin(ω * T(t))
+    cx = T(center[1]);  cy = T(center[2]);  cz = T(center[3])
+    @. u  =  A_     * sinc(n_ * sqrt((Xv - cx)^2 + (Yv - cy)^2 + (Zv - cz)^2) / R_) * ct
+    @. u̇ = -A_ * ω * sinc(n_ * sqrt((Xv - cx)^2 + (Yv - cy)^2 + (Zv - cz)^2) / R_) * st
+    return u, u̇
+end
+
+################################################################################
 # Face axis bookkeeping
 #
 # Face index convention (matches `HexMesh`):
@@ -192,7 +287,7 @@ end
     end
 end
 
-# `_neigh_pq` is defined in `mesh.jl` (alongside `_compute_face_orientation`).
+# `_neigh_pq` is defined in `mesh.jl`.
 
 # Decode workitem-local `(i, j, k) ∈ Int32(1):Int32(N)` from KA's
 # `@index(Local, Linear)`. Backends return `Int` (CPU) or `Int32`

@@ -6,7 +6,8 @@
 
 using WaveToySecondOrder
 using WaveToySecondOrder: make_element, make_operators,
-    make_cubical_mesh, make_cubed_cube_mesh, make_geometry,
+    make_cubical_mesh, make_cubed_cube_mesh, make_inflated_cube_mesh,
+    make_geometry,
     initialize3d!, rhs3d!, recommended_dt,
     discrete_inner_product, Params3d, to_device
 using KernelAbstractions: CPU
@@ -232,6 +233,53 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
         t_end   = n_steps * dt
 
         E0 = discrete_energy(u, u̇, geom, ops, params.τ)
+
+        f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
+        prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
+        sol  = solve(prob, KahanLi8(); dt,
+                     save_everystep = false, save_start = false,
+                     dense = false, save_end = true)
+        final = sol.u[end]
+        u̇_end = final.x[1]
+        u_end = final.x[2]
+
+        @test all(isfinite, u_end) && all(isfinite, u̇_end)
+        E_end = discrete_energy(u_end, u̇_end, geom, ops, params.τ)
+        @test abs(E_end - E0) < energy_tol * abs(E0)
+    end
+
+    _progress("robust stability — inflated cube (T=$T)")
+    @testset "robust stability — inflated cube M=2, N=3, noise IC (T=$T)" begin
+        # Same diagnostic on the 13-patch inflated cube mesh: random IC
+        # exercises the full spectrum of the discrete operator on the
+        # curved inflation + shell patches, and energy must stay bounded
+        # under a symplectic integrator on the NSD `L_h`. The outer
+        # sphere `r = R2` carries homogeneous Dirichlet via
+        # `bdry_values[1] = 0`.
+        N    = 3
+        M    = 2
+        elem = make_element(T, N)
+        ops  = make_operators(elem)
+        mesh = make_inflated_cube_mesh(T, 1.0, 2.0, 3.0, M)
+        geom = make_geometry(mesh, elem)
+
+        Random.seed!(20250524)
+        u  = randn(T, N, N, N, mesh.Ne)
+        u̇  = randn(T, N, N, N, mesh.Ne)
+
+        params = Params3d(;
+            A           = zero(T),
+            k           = (zero(T), zero(T), zero(T)),
+            ω           = zero(T),
+            τ           = T(8) * (N - 1)^2,
+            bdry_values = ntuple(_ -> zero(T), Val(6)),
+        )
+        dt      = recommended_dt(geom, ops, params.τ; cfl_safety = T(0.5))
+        n_steps = 50
+        t_end   = n_steps * dt
+
+        E0 = discrete_energy(u, u̇, geom, ops, params.τ)
+        @test isfinite(E0) && E0 > 0       # NSD `L_h` ⇒ `V ≥ 0`, `K ≥ 0`
 
         f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)

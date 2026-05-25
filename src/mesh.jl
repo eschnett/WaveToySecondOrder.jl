@@ -54,8 +54,8 @@ Connectivity + geometry of a conforming hexahedral mesh.
   the D₄ transform that maps this face's local face-quadrature `(p, q)`
   coordinates to the matching face on the neighbour. `0` is the identity
   (used everywhere on axis-aligned meshes and on the cubed-cube mesh
-  by construction). The transform table is documented in
-  `_neigh_pq` in `kernels3d.jl`.
+  by construction). The transform table is documented in `_neigh_pq`
+  below.
 * `bdry :: Matrix{Int8}` of shape `(6, Ne)` — boundary-condition tag,
   nonzero only on outer faces.
 * `vertex_coords :: Matrix{T}` of shape `(3, Nv)` — Cartesian coordinates
@@ -131,137 +131,510 @@ Number of distinct mesh vertices.
 """
 nv(mesh::HexMesh) = size(mesh.vertex_coords, 2)
 
+# ----------------------------------------------------------------------
+# Skeleton-based mesh construction
+#
+# Two-stage mesh build that uses *integer-only* dedup for vertex
+# identification. Stage 1 builds a `SkeletonMesh` — a small structure
+# carrying the patch list and inter-patch face connectivity at the
+# combinatorial level (no floating-point coordinates). Stage 2
+# (`_skeleton_to_mesh`) enumerates per-patch vertices as integer
+# 4-tuples `(p, i, j, k)`, unifies face-shared ids via union-find,
+# assigns dense canonical ids, and only then evaluates the family-
+# specific parametric map to produce coordinates.
+#
+# This replaces the earlier position-keyed `Dict{NTuple{3, T}, Int}`
+# dedup, which broke at M=4 inflated cube because cube and patch
+# vertex positions computed via different floating-point expressions
+# rounded to 1-ULP-different values for non-power-of-2 divisions
+# (e.g. `0.05000000000000002` vs `0.05` for `L = 0.1`). Integer
+# dedup eliminates that class of bug entirely.
+#
+# Step 1 of the cleanup wires `make_cubical_mesh` through this path;
+# the cubed cube and inflated cube builders follow in later steps.
+
+"""
+    PatchSpec{T}
+
+Combinatorial + parametric description of one patch in a multi-block
+hex mesh.
+
+# Fields
+
+* `Ma, Mb, Mc :: Int` — element counts along the patch's three local
+  axes. The patch contains `Ma·Mb·Mc` elements and
+  `(Ma+1)·(Mb+1)·(Mc+1)` pre-dedup vertices.
+* `family :: Symbol` — selects the parametric vertex map used at
+  coordinate-assignment time. Currently supported:
+    * `:cubical` — axis-aligned `[a_lo, a_hi] × [b_lo, b_hi] × [c_lo, c_hi]`.
+  Curvilinear families (`:inflation_*`, `:shell_*`) will be added when
+  `make_cubed_cube_mesh` and `make_inflated_cube_mesh` are rewired.
+* `a_lo, a_hi, b_lo, b_hi, c_lo, c_hi :: T` — affine ranges in the
+  patch's local `(a, b, c)` parameter space. The reference cube
+  `[0, 1]³` is mapped to these before the family-specific transform.
+* `L, R1, R2 :: T` — analytic constants used by curvilinear families;
+  zero for `:cubical`. Stored on every `PatchSpec` so each patch
+  carries everything it needs to evaluate its own vertices.
+"""
+struct PatchSpec{T}
+    Ma     :: Int
+    Mb     :: Int
+    Mc     :: Int
+    family :: Symbol
+    a_lo   :: T
+    a_hi   :: T
+    b_lo   :: T
+    b_hi   :: T
+    c_lo   :: T
+    c_hi   :: T
+    L      :: T
+    R1     :: T
+    R2     :: T
+end
+
+"""
+    FaceLink
+
+One entry in a `SkeletonMesh`'s 6×n_patches face-connectivity table.
+Two flavours, selected by `kind`:
+
+* `kind = :interior` — face is shared with another patch face. Carries
+  `(neigh_patch, neigh_face, orientation ∈ 0..7)`.
+* `kind = :boundary` — face is on the domain boundary. Carries only
+  `boundary_tag ∈ 1..127`.
+
+Use `interior_link(np, nf, o)` / `boundary_link(tag)` to construct.
+"""
+struct FaceLink
+    kind         :: Symbol
+    neigh_patch  :: Int
+    neigh_face   :: Int
+    orientation  :: Int8
+    boundary_tag :: Int8
+end
+
+interior_link(np::Integer, nf::Integer, o::Integer) =
+    FaceLink(:interior, Int(np), Int(nf), Int8(o), Int8(0))
+boundary_link(tag::Integer) =
+    FaceLink(:boundary, 0, 0, Int8(0), Int8(tag))
+
+"""
+    SkeletonMesh{T}
+
+Patch list + 6×n_patches face-link table. `_skeleton_to_mesh(skel)`
+instantiates the full `HexMesh{T}` from this skeleton.
+"""
+struct SkeletonMesh{T}
+    patches :: Vector{PatchSpec{T}}
+    faces   :: Matrix{FaceLink}
+end
+
+# ----- Per-face index helpers (skeleton scope) ------------------------
+
+# Element counts along the two tangent axes of face `f` in patch `ps`.
+@inline function _face_tangent_counts(f::Integer, ps::PatchSpec)
+    if f == 1 || f == 2
+        return (ps.Mb, ps.Mc)
+    elseif f == 3 || f == 4
+        return (ps.Ma, ps.Mc)
+    else                       # f == 5 or 6
+        return (ps.Ma, ps.Mb)
+    end
+end
+
+# Face-local 0-based vertex `(pp, qq)` → patch vertex `(i, j, k)`.
+@inline function _face_vert_to_ijk(f::Integer, pp::Integer, qq::Integer,
+                                     ps::PatchSpec)
+    if f == 1
+        return (0,     pp,    qq   )
+    elseif f == 2
+        return (ps.Ma, pp,    qq   )
+    elseif f == 3
+        return (pp,    0,     qq   )
+    elseif f == 4
+        return (pp,    ps.Mb, qq   )
+    elseif f == 5
+        return (pp,    qq,    0    )
+    else
+        return (pp,    qq,    ps.Mc)
+    end
+end
+
+# Element `(a, b, c)` projected onto face `f` → face-cell `(p_cell, q_cell)`.
+@inline function _face_cell_to_pq(f::Integer, a::Integer, b::Integer, c::Integer)
+    if f == 1 || f == 2
+        return (b, c)
+    elseif f == 3 || f == 4
+        return (a, c)
+    else
+        return (a, b)
+    end
+end
+
+# Face-cell `(p_cell, q_cell)` on face `f` → element `(a, b, c)`.
+@inline function _face_cell_to_abc(f::Integer, p_cell::Integer, q_cell::Integer,
+                                    ps::PatchSpec)
+    if f == 1
+        return (1,      p_cell, q_cell)
+    elseif f == 2
+        return (ps.Ma,  p_cell, q_cell)
+    elseif f == 3
+        return (p_cell, 1,      q_cell)
+    elseif f == 4
+        return (p_cell, ps.Mb,  q_cell)
+    elseif f == 5
+        return (p_cell, q_cell, 1     )
+    else
+        return (p_cell, q_cell, ps.Mc )
+    end
+end
+
+# D₄ transform on 0-indexed face-vertex coordinates `(p, q) ∈ 0..Mt1 × 0..Mt2`.
+# Even `o` preserves the (p, q) dim ordering, odd `o` swaps it
+# (so the neighbour's tangent counts come out as `(Mt2, Mt1)`).
+@inline function _neigh_pq_vertex(o::Integer, p::Integer, q::Integer,
+                                    Mt1::Integer, Mt2::Integer)
+    if     o == 0;  return (p,        q       )
+    elseif o == 1;  return (q,        Mt1 - p )
+    elseif o == 2;  return (Mt1 - p,  Mt2 - q )
+    elseif o == 3;  return (Mt2 - q,  p       )
+    elseif o == 4;  return (Mt1 - p,  q       )
+    elseif o == 5;  return (q,        p       )
+    elseif o == 6;  return (p,        Mt2 - q )
+    else            return (Mt2 - q,  Mt1 - p )
+    end
+end
+
+# Same D₄ transform on 1-indexed face cells, `(b, c) ∈ 1..Mt1 × 1..Mt2`,
+# used to identify the neighbour element across a cross-patch face link.
+@inline function _neigh_pq_cell(o::Integer, b::Integer, c::Integer,
+                                  Mt1::Integer, Mt2::Integer)
+    if     o == 0;  return (b,             c            )
+    elseif o == 1;  return (c,             Mt1 + 1 - b  )
+    elseif o == 2;  return (Mt1 + 1 - b,   Mt2 + 1 - c  )
+    elseif o == 3;  return (Mt2 + 1 - c,   b            )
+    elseif o == 4;  return (Mt1 + 1 - b,   c            )
+    elseif o == 5;  return (c,             b            )
+    elseif o == 6;  return (b,             Mt2 + 1 - c  )
+    else            return (Mt2 + 1 - c,   Mt1 + 1 - b  )
+    end
+end
+
+# Family-dispatched coordinate map: given integer vertex
+# `(i, j, k) ∈ 0..Ma × 0..Mb × 0..Mc` of patch `ps`, return the
+# physical `(x, y, z)`. Each family interprets `(a_lo, a_hi, b_lo,
+# b_hi, c_lo, c_hi)` and `(L, R1, R2)` according to its own
+# parameterisation.
+function _patch_vertex_position(ps::PatchSpec{T}, i::Integer,
+                                  j::Integer, k::Integer) where {T}
+    if ps.family === :cubical
+        ξ = T(i) / T(ps.Ma)
+        η = T(j) / T(ps.Mb)
+        ζ = T(k) / T(ps.Mc)
+        return (ps.a_lo + (ps.a_hi - ps.a_lo) * ξ,
+                ps.b_lo + (ps.b_hi - ps.b_lo) * η,
+                ps.c_lo + (ps.c_hi - ps.c_lo) * ζ)
+    elseif ps.family === :wedge_pos_x || ps.family === :wedge_neg_x ||
+           ps.family === :wedge_pos_y || ps.family === :wedge_neg_y ||
+           ps.family === :wedge_pos_z || ps.family === :wedge_neg_z
+        # Radial wedge (cubed-cube outer patch). Geometric radial
+        # spacing `r(a) = R1·(R2/R1)^a` so each cell stays roughly
+        # cubical; angular axes `(b, c) ∈ [-1, 1]²`.
+        a = ps.a_lo + (ps.a_hi - ps.a_lo) * (T(i) / T(ps.Ma))
+        b = ps.b_lo + (ps.b_hi - ps.b_lo) * (T(j) / T(ps.Mb))
+        c = ps.c_lo + (ps.c_hi - ps.c_lo) * (T(k) / T(ps.Mc))
+        r = ps.R1 * (ps.R2 / ps.R1)^a
+        if ps.family === :wedge_pos_x
+            return ( r,   b*r, c*r)
+        elseif ps.family === :wedge_neg_x
+            return (-r,   b*r, c*r)
+        elseif ps.family === :wedge_pos_y
+            return (b*r,  r,   c*r)
+        elseif ps.family === :wedge_neg_y
+            return (b*r, -r,   c*r)
+        elseif ps.family === :wedge_pos_z
+            return (b*r,  c*r,  r)
+        else  # :wedge_neg_z
+            return (b*r,  c*r, -r)
+        end
+    else
+        # Inflation / shell families (13-patch inflated cube).
+        # `kind ∈ 1..6` → inflation in +x/-x/+y/-y/+z/-z;
+        # `kind ∈ 7..12` → spherical-shell in the same direction order.
+        # Uses the right-handed `_patch_direction_vec` (with axis swaps
+        # for `-x, +y, -z`) — the corresponding non-trivial D₄
+        # orientations are encoded in the skeleton's face-link table.
+        kind = _family_to_kind(ps.family)
+        kind in Int8(1):Int8(12) || error("unknown patch family: $(ps.family)")
+        a = ps.a_lo + (ps.a_hi - ps.a_lo) * (T(i) / T(ps.Ma))
+        b = ps.b_lo + (ps.b_hi - ps.b_lo) * (T(j) / T(ps.Mb))
+        c = ps.c_lo + (ps.c_hi - ps.c_lo) * (T(k) / T(ps.Mc))
+        Q = sqrt(one(T) + (b * b + c * c))
+        dir = ((kind - Int8(1)) % Int8(6)) + Int8(1)
+        vx, vy, vz = _patch_direction_vec(dir, b, c)
+        if kind ≥ Int8(7)  # shell
+            r = (one(T) - a) * ps.R1 + a * ps.R2
+            f = r / Q
+        else               # inflation
+            f = (one(T) - a) * ps.L + a * ps.R1 / Q
+        end
+        return (f * vx, f * vy, f * vz)
+    end
+end
+
+"""
+    _family_to_kind(family::Symbol) → Int8
+
+Map a `PatchSpec.family` symbol to the integer `kind` tag used by
+`PatchInfo` (which the analytic-Jacobian `make_geometry(::InflatedCubeMesh)`
+dispatches on):
+
+* `:cubical`               → `0`
+* `:inflation_{pos,neg}_{x,y,z}` → `1..6`
+* `:shell_{pos,neg}_{x,y,z}`     → `7..12`
+* anything else            → `-1` (treated as "no PatchInfo needed")
+"""
+function _family_to_kind(family::Symbol)
+    family === :cubical          ? Int8(0)  :
+    family === :inflation_pos_x  ? Int8(1)  :
+    family === :inflation_neg_x  ? Int8(2)  :
+    family === :inflation_pos_y  ? Int8(3)  :
+    family === :inflation_neg_y  ? Int8(4)  :
+    family === :inflation_pos_z  ? Int8(5)  :
+    family === :inflation_neg_z  ? Int8(6)  :
+    family === :shell_pos_x      ? Int8(7)  :
+    family === :shell_neg_x      ? Int8(8)  :
+    family === :shell_pos_y      ? Int8(9)  :
+    family === :shell_neg_y      ? Int8(10) :
+    family === :shell_pos_z      ? Int8(11) :
+    family === :shell_neg_z      ? Int8(12) :
+    Int8(-1)
+end
+
+"""
+    _skeleton_to_mesh(skel::SkeletonMesh{T}) → HexMesh{T}
+
+Instantiate the full element-level `HexMesh{T}` from a `SkeletonMesh`:
+
+1. Per-patch pre-dedup vertex ids `(p, i, j, k)`.
+2. Union-find over face-shared ids using the skeleton's interior
+   `FaceLink`s and the integer D₄ orientation transform.
+3. Dense canonical vertex ids `1..Nv`.
+4. Coordinates from `_patch_vertex_position` at one representative
+   per canonical id.
+5. Per-element `vertex_idx`, `neighbour`, `neighbour_face`,
+   `orientation`, `bdry` tables — within-patch faces use trivial
+   sibling-element connectivity; cross-patch faces inherit
+   `(neighbour_face, orientation)` from the skeleton.
+
+No floating-point comparison is ever load-bearing.
+"""
+function _skeleton_to_mesh(skel::SkeletonMesh{T}) where {T}
+    n_patches = length(skel.patches)
+    @assert size(skel.faces) == (6, n_patches)
+
+    # Pre-dedup vertex / element offsets per patch.
+    vert_offs = Vector{Int}(undef, n_patches + 1)
+    elem_offs = Vector{Int}(undef, n_patches + 1)
+    vert_offs[1] = 0
+    elem_offs[1] = 0
+    for p in 1:n_patches
+        ps = skel.patches[p]
+        vert_offs[p+1] = vert_offs[p] + (ps.Ma + 1) * (ps.Mb + 1) * (ps.Mc + 1)
+        elem_offs[p+1] = elem_offs[p] + ps.Ma * ps.Mb * ps.Mc
+    end
+    Nv_pre = vert_offs[end]
+    Ne     = elem_offs[end]
+
+    # Pre-dedup vertex id for `(p, i, j, k)` and element id for `(p, a, b, c)`.
+    @inline function vid(p, i, j, k)
+        ps = skel.patches[p]
+        return vert_offs[p] + 1 + i + (ps.Ma + 1) * (j + (ps.Mb + 1) * k)
+    end
+    @inline function eid(p, a, b, c)
+        ps = skel.patches[p]
+        return elem_offs[p] + a + ps.Ma * ((b - 1) + ps.Mb * (c - 1))
+    end
+
+    # --- Union-find (path-compression + rank) -------------------------
+    parent = collect(1:Nv_pre)
+    rank   = zeros(Int, Nv_pre)
+    function uf_find(x)
+        while parent[x] != x
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        end
+        return x
+    end
+    function uf_union!(x, y)
+        rx, ry = uf_find(x), uf_find(y)
+        rx == ry && return
+        if     rank[rx] < rank[ry]; parent[rx] = ry
+        elseif rank[rx] > rank[ry]; parent[ry] = rx
+        else;                        parent[ry] = rx;  rank[rx] += 1
+        end
+        return
+    end
+
+    # Walk every interior face link once. The `(p, f) < (p2, f2)` guard
+    # processes each pair exactly once even when the skeleton lists both
+    # halves (which it normally does, for symmetry).
+    for p in 1:n_patches, f in 1:6
+        link = skel.faces[f, p]
+        link.kind === :interior || continue
+        p2 = link.neigh_patch
+        f2 = link.neigh_face
+        ((p, f) < (p2, f2)) || continue
+        o   = Int(link.orientation)
+        ps  = skel.patches[p]
+        ps2 = skel.patches[p2]
+        Mt1, Mt2 = _face_tangent_counts(f, ps)
+        for qq in 0:Mt2, pp in 0:Mt1
+            i1, j1, k1 = _face_vert_to_ijk(f, pp, qq, ps)
+            pp2, qq2 = _neigh_pq_vertex(o, pp, qq, Mt1, Mt2)
+            i2, j2, k2 = _face_vert_to_ijk(f2, pp2, qq2, ps2)
+            uf_union!(vid(p, i1, j1, k1), vid(p2, i2, j2, k2))
+        end
+    end
+
+    # --- Canonical dense ids -----------------------------------------
+    Nv = 0
+    canon = zeros(Int, Nv_pre)
+    for x in 1:Nv_pre
+        if uf_find(x) == x
+            Nv += 1
+            canon[x] = Nv
+        end
+    end
+    final = Vector{Int}(undef, Nv_pre)
+    for x in 1:Nv_pre
+        final[x] = canon[uf_find(x)]
+    end
+
+    # --- Coordinates (one evaluation per canonical id) ---------------
+    vertex_coords = Matrix{T}(undef, 3, Nv)
+    written = falses(Nv)
+    for p in 1:n_patches
+        ps = skel.patches[p]
+        for k in 0:ps.Mc, j in 0:ps.Mb, i in 0:ps.Ma
+            id = final[vid(p, i, j, k)]
+            written[id] && continue
+            x, y, z = _patch_vertex_position(ps, i, j, k)
+            vertex_coords[1, id] = x
+            vertex_coords[2, id] = y
+            vertex_coords[3, id] = z
+            written[id] = true
+        end
+    end
+    @assert all(written)
+
+    # --- Per-element tables ------------------------------------------
+    vertex_idx     = Matrix{Int}(undef, 8, Ne)
+    neighbour      = zeros(Int32, 6, Ne)
+    neighbour_face = zeros(Int8,  6, Ne)
+    orientation    = zeros(Int8,  6, Ne)
+    bdry           = zeros(Int8,  6, Ne)
+
+    # Opposite face along the same axis: 1↔2 (-x/+x), 3↔4 (-y/+y), 5↔6 (-z/+z).
+    OPP = (Int8(2), Int8(1), Int8(4), Int8(3), Int8(6), Int8(5))
+
+    for p in 1:n_patches
+        ps = skel.patches[p]
+        for c in 1:ps.Mc, b in 1:ps.Mb, a in 1:ps.Ma
+            e = eid(p, a, b, c)
+            # Gmsh-canonical 8 corner vertex ids.
+            vertex_idx[1, e] = final[vid(p, a - 1, b - 1, c - 1)]
+            vertex_idx[2, e] = final[vid(p, a,     b - 1, c - 1)]
+            vertex_idx[3, e] = final[vid(p, a,     b,     c - 1)]
+            vertex_idx[4, e] = final[vid(p, a - 1, b,     c - 1)]
+            vertex_idx[5, e] = final[vid(p, a - 1, b - 1, c    )]
+            vertex_idx[6, e] = final[vid(p, a,     b - 1, c    )]
+            vertex_idx[7, e] = final[vid(p, a,     b,     c    )]
+            vertex_idx[8, e] = final[vid(p, a - 1, b,     c    )]
+
+            # Per-face neighbour / orientation / bdry.
+            for (f, na, nb, nc, at_patch_boundary) in (
+                    (1, a - 1, b,     c,     a == 1     ),
+                    (2, a + 1, b,     c,     a == ps.Ma ),
+                    (3, a,     b - 1, c,     b == 1     ),
+                    (4, a,     b + 1, c,     b == ps.Mb ),
+                    (5, a,     b,     c - 1, c == 1     ),
+                    (6, a,     b,     c + 1, c == ps.Mc ),
+                )
+                if !at_patch_boundary
+                    neighbour[f, e]      = eid(p, na, nb, nc)
+                    neighbour_face[f, e] = OPP[f]
+                    orientation[f, e]    = Int8(0)
+                else
+                    link = skel.faces[f, p]
+                    if link.kind === :boundary
+                        bdry[f, e] = link.boundary_tag
+                    else
+                        p2 = link.neigh_patch
+                        f2 = link.neigh_face
+                        o  = Int(link.orientation)
+                        ps2 = skel.patches[p2]
+                        Mt1, Mt2 = _face_tangent_counts(f, ps)
+                        p_cell, q_cell = _face_cell_to_pq(f, a, b, c)
+                        p2c, q2c = _neigh_pq_cell(o, p_cell, q_cell, Mt1, Mt2)
+                        a2, b2, c2 = _face_cell_to_abc(f2, p2c, q2c, ps2)
+                        neighbour[f, e]      = eid(p2, a2, b2, c2)
+                        neighbour_face[f, e] = Int8(f2)
+                        orientation[f, e]    = Int8(o)
+                    end
+                end
+            end
+        end
+    end
+
+    return HexMesh{T}(Ne, neighbour, neighbour_face, orientation, bdry,
+                      vertex_coords, vertex_idx)
+end
+
 """
     make_cubical_mesh(::Type{T}, Mx, My, Mz, x0, x1) → HexMesh{T}
     make_cubical_mesh(::Type{T}, M, x0, x1)         → HexMesh{T}
 
 Axis-aligned conforming hex mesh of the cuboid `[x0, x1]³` with
-`Mx × My × Mz` (or `M × M × M`) elements.
+`Mx × My × Mz` (or `M × M × M`) elements. Backed by the skeleton-based
+build (`_skeleton_to_mesh`) over a single `:cubical` patch with all
+six faces tagged as domain boundary `1..6` (matching the face index
+ordering, as before).
 
-Element ordering is column-major over `(mx, my, mz)`:
+Element ordering remains column-major over `(mx, my, mz)`:
 
     e(mx, my, mz) = mx + (my-1)·Mx + (mz-1)·Mx·My
 
-Vertex ordering is column-major over `(vx, vy, vz)` with `Mx+1`,
-`My+1`, `Mz+1` vertices along each axis:
-
-    v(vx, vy, vz) = vx + (vy-1)·(Mx+1) + (vz-1)·(Mx+1)·(My+1)
-
-Inter-element faces are axis-aligned, so `orientation` is identically
-zero. Outer faces are tagged by axis/direction:
-
-    −x → 1     +x → 2     −y → 3     +y → 4     −z → 5     +z → 6
+`orientation` is identically zero (axis-aligned, single patch).
 """
 function make_cubical_mesh(::Type{T}, Mx::Int, My::Int, Mz::Int, x0, x1) where {T}
     @assert Mx ≥ 1 && My ≥ 1 && Mz ≥ 1
-    Ne = Mx * My * Mz
-    hx = (x1 - x0) / Mx
-    hy = (x1 - x0) / My
-    hz = (x1 - x0) / Mz
-
-    # Number of distinct vertices along each axis (one more than elements).
-    Nvx, Nvy, Nvz = Mx + 1, My + 1, Mz + 1
-    Nv = Nvx * Nvy * Nvz
-
-    neighbour      = zeros(Int32, 6, Ne)
-    neighbour_face = zeros(Int8, 6, Ne)
-    orientation    = zeros(Int8, 6, Ne)
-    bdry           = zeros(Int8, 6, Ne)
-    vertex_coords  = Matrix{T}(undef, 3, Nv)
-    vertex_idx     = Matrix{Int}(undef, 8, Ne)
-
-    # --- shared vertex grid ------------------------------------------------
-    vidx(vx, vy, vz) = vx + (vy - 1) * Nvx + (vz - 1) * Nvx * Nvy
-    for vz in 1:Nvz, vy in 1:Nvy, vx in 1:Nvx
-        v = vidx(vx, vy, vz)
-        vertex_coords[1, v] = T(x0) + (vx - 1) * T(hx)
-        vertex_coords[2, v] = T(x0) + (vy - 1) * T(hy)
-        vertex_coords[3, v] = T(x0) + (vz - 1) * T(hz)
+    z = zero(T)
+    patch = PatchSpec{T}(Mx, My, Mz, :cubical,
+                          T(x0), T(x1), T(x0), T(x1), T(x0), T(x1),
+                          z, z, z)
+    faces = Matrix{FaceLink}(undef, 6, 1)
+    for f in 1:6
+        faces[f, 1] = boundary_link(f)
     end
-
-    # --- per-element connectivity + neighbour table ------------------------
-    lidx(mx, my, mz) = mx + (my - 1) * Mx + (mz - 1) * Mx * My
-
-    # Opposite face along the same axis: 1↔2 (-x/+x), 3↔4 (-y/+y), 5↔6 (-z/+z).
-    OPP = (Int8(2), Int8(1), Int8(4), Int8(3), Int8(6), Int8(5))
-
-    for mz in 1:Mz, my in 1:My, mx in 1:Mx
-        e = lidx(mx, my, mz)
-
-        # Neighbours and boundary tags
-        if mx == 1;   bdry[1, e] = 1
-        else  neighbour[1, e] = lidx(mx-1, my, mz); neighbour_face[1, e] = OPP[1]  end
-        if mx == Mx;  bdry[2, e] = 2
-        else  neighbour[2, e] = lidx(mx+1, my, mz); neighbour_face[2, e] = OPP[2]  end
-        if my == 1;   bdry[3, e] = 3
-        else  neighbour[3, e] = lidx(mx, my-1, mz); neighbour_face[3, e] = OPP[3]  end
-        if my == My;  bdry[4, e] = 4
-        else  neighbour[4, e] = lidx(mx, my+1, mz); neighbour_face[4, e] = OPP[4]  end
-        if mz == 1;   bdry[5, e] = 5
-        else  neighbour[5, e] = lidx(mx, my, mz-1); neighbour_face[5, e] = OPP[5]  end
-        if mz == Mz;  bdry[6, e] = 6
-        else  neighbour[6, e] = lidx(mx, my, mz+1); neighbour_face[6, e] = OPP[6]  end
-
-        # Eight corner indices in canonical (Gmsh) ordering.
-        vertex_idx[1, e] = vidx(mx,   my,   mz  )
-        vertex_idx[2, e] = vidx(mx+1, my,   mz  )
-        vertex_idx[3, e] = vidx(mx+1, my+1, mz  )
-        vertex_idx[4, e] = vidx(mx,   my+1, mz  )
-        vertex_idx[5, e] = vidx(mx,   my,   mz+1)
-        vertex_idx[6, e] = vidx(mx+1, my,   mz+1)
-        vertex_idx[7, e] = vidx(mx+1, my+1, mz+1)
-        vertex_idx[8, e] = vidx(mx,   my+1, mz+1)
-    end
-
-    return HexMesh{T}(Ne, neighbour, neighbour_face, orientation,
-                      bdry, vertex_coords, vertex_idx)
+    skel = SkeletonMesh{T}([patch], faces)
+    return _skeleton_to_mesh(skel)
 end
 
 # Cubic convenience: equal element count in each direction.
 make_cubical_mesh(::Type{T}, M::Int, x0, x1) where {T} =
     make_cubical_mesh(T, M, M, M, x0, x1)
 
-# Hex face-corner index conventions (Gmsh canonical):
-#
-#   face 1 (−x / −i):  vertices 1, 4, 5, 8
-#   face 2 (+x / +i):  vertices 2, 3, 6, 7
-#   face 3 (−y / −j):  vertices 1, 2, 5, 6
-#   face 4 (+y / +j):  vertices 3, 4, 7, 8
-#   face 5 (−z / −k):  vertices 1, 2, 3, 4
-#   face 6 (+z / +k):  vertices 5, 6, 7, 8
-const FACE_LOCAL_VERTICES = (
-    (1, 4, 5, 8),
-    (2, 3, 6, 7),
-    (1, 2, 5, 6),
-    (3, 4, 7, 8),
-    (1, 2, 3, 4),
-    (5, 6, 7, 8),
-)
-
-# Face-local (p̃, q̃) ∈ {(0,0), (1,0), (0,1), (1,1)} for each of the 4
-# canonical face-corner vertices, per face. `(0, 0)` denotes face-local
-# `(1, 1)` (i.e. p=1, q=1) at the chosen `N`; the binary form is
-# resolution-independent.
-#
-# These are *not* uniform across the six faces: faces 4 and 6 walk the
-# corners in a different (p, q) order than faces 1, 2, 3, 5 because the
-# Gmsh-canonical Hex8 vertex numbering is itself non-uniform around the
-# six faces. The table is derived once from `FACE_LOCAL_VERTICES`
-# (corner i ↦ its `(±x, ±y, ±z)` sign pattern, then projected onto the
-# face's two tangent axes).
-const FACE_LOCAL_PQ = (
-    ((0, 0), (1, 0), (0, 1), (1, 1)),  # face 1 (−x), tangent (y, z)
-    ((0, 0), (1, 0), (0, 1), (1, 1)),  # face 2 (+x), tangent (y, z)
-    ((0, 0), (1, 0), (0, 1), (1, 1)),  # face 3 (−y), tangent (x, z)
-    ((1, 0), (0, 0), (1, 1), (0, 1)),  # face 4 (+y), tangent (x, z) — corner order (3, 4, 7, 8)
-    ((0, 0), (1, 0), (1, 1), (0, 1)),  # face 5 (−z), tangent (x, y) — corner order (1, 2, 3, 4)
-    ((0, 0), (1, 0), (1, 1), (0, 1)),  # face 6 (+z), tangent (x, y) — corner order (5, 6, 7, 8)
-)
-
 # D₄ orientation transform: maps self's face-local `(p, q)` into the
-# neighbour's `(p, q)`. Resolves the eight rotations + reflections of
-# the unit square. Used by `_compute_face_orientation` and by the
-# kernel `_add_face_sat!`.
+# neighbour's `(p, q)` using 1-indexed coordinates in `1..N`. Resolves
+# the eight rotations + reflections of the unit square. Used by the
+# kernel `_face_sat_compute!` to read across an inter-element face
+# when the two sides' tangent axes don't line up directly.
+#
+# This is the 1-indexed cousin of `_neigh_pq_vertex` (0-indexed,
+# 0..M) and `_neigh_pq_cell` (1-indexed cells, 1..M); the three are
+# the same group operation re-expressed for the index range each
+# caller works in.
 @inline function _neigh_pq(o::Integer, p::Integer, q::Integer, N::Integer)
     # Mirror in whatever integer type `p, q, N` are passed as. Callers
     # in the kernel pass `Int32` to keep the index chain off the
@@ -277,44 +650,6 @@ const FACE_LOCAL_PQ = (
     elseif o == 6;  return (p,        np1 - q)
     else            return (np1 - q,  np1 - p)
     end
-end
-
-# Compute the D₄ orientation that maps self's face-local (p, q) into the
-# neighbour's. Given the canonical 4-tuple of global vertex IDs on each
-# side, plus the two face indices (`f_self`, `f_neigh`) needed to look
-# up where in face-local (p, q) each canonical-corner index lives.
-function _compute_face_orientation(vs_self::NTuple{4, Int},
-                                    vs_neigh::NTuple{4, Int},
-                                    f_self::Integer,
-                                    f_neigh::Integer)::Int8
-    # Position-in-the-unit-square for each canonical index, both sides.
-    pq_self_table  = FACE_LOCAL_PQ[f_self]
-    pq_neigh_table = FACE_LOCAL_PQ[f_neigh]
-
-    # For each canonical-index `i` on self, find the canonical-index `j`
-    # on the neighbour where the same global vertex appears.
-    j1 = findfirst(==(vs_self[1]), vs_neigh)
-    j2 = findfirst(==(vs_self[2]), vs_neigh)
-    @assert j1 !== nothing && j2 !== nothing "face-vertex mismatch"
-
-    p_s1, q_s1 = pq_self_table[1]      # self vertex 1's face-local position (0/1, 0/1)
-    p_s2, q_s2 = pq_self_table[2]
-    p_n1, q_n1 = pq_neigh_table[j1]    # the same vertex's position on the neighbour
-    p_n2, q_n2 = pq_neigh_table[j2]
-
-    # Search the eight D₄ transforms for the one that maps both
-    # `(p_s1, q_s1) → (p_n1, q_n1)` and `(p_s2, q_s2) → (p_n2, q_n2)`.
-    # Use `N = 2` (so face-local 1↔1 and N↔N), i.e. 0/1 in/out coords.
-    # (Equivalent to taking `_neigh_pq(o, p+1, q+1, 2) - 1`.)
-    for o in 0:7
-        pa, qa = _neigh_pq(o, p_s1 + 1, q_s1 + 1, 2)
-        pb, qb = _neigh_pq(o, p_s2 + 1, q_s2 + 1, 2)
-        if pa - 1 == p_n1 && qa - 1 == q_n1 &&
-           pb - 1 == p_n2 && qb - 1 == q_n2
-            return Int8(o)
-        end
-    end
-    error("no D₄ transform matches face vertex orderings: $vs_self $vs_neigh f $f_self $f_neigh")
 end
 
 """
@@ -372,146 +707,488 @@ By construction, every patch's local axes are oriented so that, at any
 shared face, the (p, q) face-node coordinates on the two sides match
 directly — `orientation[f, e] = 0` everywhere.
 """
-function make_cubed_cube_mesh(::Type{T}, M::Int, R::Real) where {T}
+# Tangential-face connectivity for the six radial directions of a
+# cubed-cube topology. Indexed by direction `dir ∈ 1..6` and face
+# `f ∈ 3..6`:
+#
+#   `_WEDGE_NEIGHBOUR[dir][f - 2] = (neigh_dir, neigh_face)`
+#
+# All twelve cube-edge interfaces have orientation 0 because every
+# wedge's tangent (p, q) local axes point in the same physical
+# (x, y, z) direction at the shared edge (cubed-cube wedges use the
+# uniform no-axis-swap convention `v = (±1, b, c)` etc.).
+const _WEDGE_NEIGHBOUR = (
+    ((4, 4), (3, 4), (6, 4), (5, 4)),   # +x: faces 3,4,5,6 → -y +y -z +z
+    ((4, 3), (3, 3), (6, 3), (5, 3)),   # -x:                → -y +y -z +z
+    ((2, 4), (1, 4), (6, 6), (5, 6)),   # +y:                → -x +x -z +z
+    ((2, 3), (1, 3), (6, 5), (5, 5)),   # -y:                → -x +x -z +z
+    ((2, 6), (1, 6), (4, 6), (3, 6)),   # +z:                → -x +x -y +y
+    ((2, 5), (1, 5), (4, 5), (3, 5)),   # -z:                → -x +x -y +y
+)
+
+# Tangential-face connectivity for the inflation / shell patches of an
+# inflated-cube mesh. Same indexing scheme as `_WEDGE_NEIGHBOUR` but
+# DIFFERENT entries: the inflated cube's `_patch_direction_vec` is
+# right-handed with axis-swaps for the negative-leading-axis directions
+# (`-x: v = (-1, c, b)`, `+y: v = (c, 1, b)`, `-z: v = (c, b, -1)`),
+# which changes which face of each neighbour patch meets a given cube
+# edge. Derived once on paper from the patch parameterisations; all
+# twelve cube-edge orientations remain 0 (verified by Gmsh vertex
+# correspondence at each edge).
+const _INFLATION_NEIGHBOUR = (
+    ((4, 4), (3, 6), (6, 6), (5, 4)),   # +x: faces 3,4,5,6 → -y4 +y6 -z6 +z4
+    ((6, 5), (5, 3), (4, 3), (3, 5)),   # -x:                → -z5 +z3 -y3 +y5
+    ((6, 4), (5, 6), (2, 6), (1, 4)),   # +y:                → -z4 +z6 -x6 +x4
+    ((2, 5), (1, 3), (6, 3), (5, 5)),   # -y:                → -x5 +x3 -z3 +z5
+    ((2, 4), (1, 6), (4, 6), (3, 4)),   # +z:                → -x4 +x6 -y6 +y4
+    ((4, 5), (3, 3), (2, 3), (1, 5)),   # -z:                → -y5 +y3 -x3 +x5
+)
+
+function _cubed_cube_skeleton(::Type{T}, M::Int, R::Real) where {T}
     @assert M ≥ 1
     @assert 0 < R < 1
-
     Rv = T(R)
 
-    # --- Step 2: pick L and the radial node positions -------------------
+    # Radial element count `L` per outer patch — same heuristic as the
+    # pre-skeleton implementation: pick `L` such that the cell aspect
+    # `(α - 1) ≈ 2/M` with `α = (1/R)^(1/L)`.
     L = max(1, round(Int, log(1/R) / log(1 + 2/M)))
-    α = (1/Rv)^(1/T(L))
-    radial = [Rv * α^(j-1) for j in 1:L+1]
-    radial[end] = one(T)        # snap the outer node to exactly 1
 
-    # --- Step 3a: build the vertex coordinate table ---------------------
-    # All 7 patches generate vertices on the same shared grid; vertices
-    # that two patches both produce (faces, edges and corners of the
-    # inner cube; edges and corners between adjacent outer patches) get
-    # de-duplicated by exact-position `Dict` lookup. Inputs are computed
-    # with identical floating-point ops on either side so they hash equal.
-    vertex_dict = Dict{NTuple{3, T}, Int}()
-    add_vertex!(x, y, z) = get!(vertex_dict, (x, y, z)) do
-        length(vertex_dict) + 1
+    z = zero(T)
+    o = one(T)
+
+    # Patch 1: inner cube `[-R, R]³`.
+    inner = PatchSpec{T}(M, M, M, :cubical,
+                          -Rv, Rv, -Rv, Rv, -Rv, Rv,
+                          z, z, z)
+
+    # Patches 2..7: outer wedges in the dir order (+x, -x, +y, -y, +z, -z).
+    # All wedges share the parameter ranges `a ∈ [0, 1]`, `b ∈ [-1, 1]`,
+    # `c ∈ [-1, 1]`; the family selects the embedding direction. The
+    # `(R1, R2)` slots hold the inner-cube half-edge and the outer-cube
+    # half-edge (1), used by `_patch_vertex_position` to compute
+    # `r(a) = R1 · (R2/R1)^a = R · (1/R)^a`.
+    wedge_families = (:wedge_pos_x, :wedge_neg_x,
+                      :wedge_pos_y, :wedge_neg_y,
+                      :wedge_pos_z, :wedge_neg_z)
+    patches = PatchSpec{T}[inner]
+    for fam in wedge_families
+        push!(patches, PatchSpec{T}(L, M, M, fam,
+                                     z, o, -o, o, -o, o,
+                                     z, Rv, o))
     end
 
-    # Inner cube grid (i, j, k) ∈ 0..M × 0..M × 0..M → vertex index.
-    cube_v = Array{Int, 3}(undef, M+1, M+1, M+1)
-    for c in 0:M, b in 0:M, a in 0:M
-        s = T(-1 + 2*a/M); t = T(-1 + 2*b/M); u = T(-1 + 2*c/M)
-        cube_v[a+1, b+1, c+1] = add_vertex!(s*Rv, t*Rv, u*Rv)
+    faces = Matrix{FaceLink}(undef, 6, length(patches))
+
+    # ---- Cube ↔ wedge interfaces. ----
+    # Inner cube face `f` → wedge whose direction matches that face,
+    # connecting at the wedge's face 1 (`a = 0`, inner-radial face).
+    # Vertex layout aligns so all six cube↔wedge interfaces have
+    # orientation 0.
+    #
+    #   f=1 (-x) → -x wedge (patch 3)
+    #   f=2 (+x) → +x wedge (patch 2)
+    #   f=3 (-y) → -y wedge (patch 5)
+    #   f=4 (+y) → +y wedge (patch 4)
+    #   f=5 (-z) → -z wedge (patch 7)
+    #   f=6 (+z) → +z wedge (patch 6)
+    cube_face_to_wedge_patch = (3, 2, 5, 4, 7, 6)
+    for f in 1:6
+        wp = cube_face_to_wedge_patch[f]
+        faces[f, 1]  = interior_link(wp, 1, 0)
+        faces[1, wp] = interior_link(1, f, 0)
     end
 
-    # Outer-patch vertex grids: 6 grids of shape (L+1, M+1, M+1).
-    function build_patch_vertices(dir::Int)
-        v = Array{Int, 3}(undef, L+1, M+1, M+1)
-        for c in 0:M, b in 0:M, a in 0:L
-            r  = radial[a+1]
-            sb = T(-1 + 2*b/M)
-            tc = T(-1 + 2*c/M)
-            x, y, z = if dir == 1       # +x
-                ( r,    sb*r, tc*r)
-            elseif dir == 2             # −x
-                (-r,    sb*r, tc*r)
-            elseif dir == 3             # +y
-                (sb*r,  r,    tc*r)
-            elseif dir == 4             # −y
-                (sb*r, -r,    tc*r)
-            elseif dir == 5             # +z
-                (sb*r, tc*r,  r   )
-            else                        # −z (dir == 6)
-                (sb*r, tc*r, -r   )
-            end
-            v[a+1, b+1, c+1] = add_vertex!(x, y, z)
+    # ---- Outer-cube boundary tags on each wedge's face 2. ----
+    # Match the original convention: -x=1, +x=2, -y=3, +y=4, -z=5, +z=6,
+    # indexed by direction `dir ∈ 1..6` of the wedge.
+    OUTER_TAG = (Int8(2), Int8(1), Int8(4), Int8(3), Int8(6), Int8(5))
+    for dir in 1:6
+        faces[2, dir + 1] = boundary_link(OUTER_TAG[dir])
+    end
+
+    # ---- Wedge ↔ wedge tangential faces. ----
+    # See `_WEDGE_NEIGHBOUR` (module-level constant) for the table.
+    for dir in 1:6
+        wp = dir + 1
+        for f in 3:6
+            neigh_dir, neigh_face = _WEDGE_NEIGHBOUR[dir][f - 2]
+            faces[f, wp] = interior_link(neigh_dir + 1, neigh_face, 0)
         end
-        return v
-    end
-    patch_v = ntuple(d -> build_patch_vertices(d), 6)
-
-    Nv = length(vertex_dict)
-    vertex_coords = Matrix{T}(undef, 3, Nv)
-    for (key, idx) in vertex_dict
-        vertex_coords[1, idx] = key[1]
-        vertex_coords[2, idx] = key[2]
-        vertex_coords[3, idx] = key[3]
     end
 
-    # --- Step 3b: build the per-element 8-corner connectivity -----------
-    Ne = M^3 + 6 * L * M^2
-    vertex_idx = Matrix{Int}(undef, 8, Ne)
+    return SkeletonMesh{T}(patches, faces)
+end
 
-    function fill_corners!(e, vg, i, j, k)
-        vertex_idx[1, e] = vg[i,   j,   k  ]
-        vertex_idx[2, e] = vg[i+1, j,   k  ]
-        vertex_idx[3, e] = vg[i+1, j+1, k  ]
-        vertex_idx[4, e] = vg[i,   j+1, k  ]
-        vertex_idx[5, e] = vg[i,   j,   k+1]
-        vertex_idx[6, e] = vg[i+1, j,   k+1]
-        vertex_idx[7, e] = vg[i+1, j+1, k+1]
-        vertex_idx[8, e] = vg[i,   j+1, k+1]
+"""
+    make_cubed_cube_mesh(::Type{T}, M::Int, R::Real) → HexMesh{T}
+
+Conforming hex mesh of the cube `[-1, 1]³` built from a "cubed-sphere"
+block topology applied to a cubic domain: one central cubic patch
+`[-R, R]³` plus six radial-wedge patches connecting it to the six outer
+cube faces. All outer faces of the global domain are flat (the overall
+shape is still a cube), so the *outer* mesh boundary is `[-1, 1]³`
+exactly — the geometry has cubed-sphere topology but a cube codomain.
+
+`M` is the mesh-resolution parameter: each of the seven patches is
+subdivided into `M` cells along each non-radial axis (so the inner patch
+has `M³` cells and each outer patch has `L·M²`).
+
+# Geometry
+
+For the +x patch (the other five are obtained by axis permutation /
+reflection), with local indices `i ∈ 0..L`, `j ∈ 0..M`, `k ∈ 0..M`,
+parametric coords `a = i/L`, `b = -1 + 2j/M`, `c = -1 + 2k/M`:
+
+    r          = R · (1/R)^a        (radial coordinate)
+    (x, y, z)  = (r,  b·r,  c·r)
+
+so the cross-section at radial level `i` is the square `[-r, r]²`,
+matching the inner cube's `[-R, R]²` face at `a = 0` and the outer
+cube's `[-1, 1]²` face at `a = 1`.
+
+# Element count
+
+`M³ + 6·L·M²` total — `M³` in the inner cube + `L·M²` per outer wedge.
+
+# `L` and radial spacing
+
+To keep each outer-patch cell roughly cubical, set radial-to-tangential
+aspect to 1: `α - 1 ≈ 2/M` with `α = (1/R)^(1/L)`. Solving for the
+endpoint constraint `r_L = 1` gives
+
+    L = round( log(1/R) / log(1 + 2/M) )
+
+For `M = 5, R = 0.1` this gives `L = 7, α ≈ 1.389`.
+
+# Orientation
+
+By construction, every patch's local axes are oriented so that, at any
+shared face, the `(p, q)` face-node coordinates on the two sides match
+directly — `orientation[f, e] = 0` everywhere.
+
+Built via the skeleton path (`_cubed_cube_skeleton` →
+`_skeleton_to_mesh`), so vertex deduplication and orientations are
+combinatorial / integer-keyed — no floating-point comparison is
+load-bearing.
+"""
+make_cubed_cube_mesh(::Type{T}, M::Int, R::Real) where {T} =
+    _skeleton_to_mesh(_cubed_cube_skeleton(T, M, R))
+
+"""
+    PatchInfo{T}
+
+Per-element parametric description used by `make_geometry` for elements
+of an `InflatedCubeMesh` that should be discretised with an analytic
+curvilinear map instead of the default trilinear interpolation of the
+eight corners.
+
+`kind` selects the patch family:
+
+* `0`     — trilinear (inner cube; the angular / radial fields are unused).
+* `1..6`  — inflation patch in directions `(+x, -x, +y, -y, +z, -z)`:
+  bridges the inner cube face at `r = L` (with `r = |x|/|y|/|z|`) to the
+  inner sphere at radius `R₁`.
+* `7..12` — spherical-shell patch in the same directional order:
+  bridges the inner sphere at `R₁` to the outer sphere at `R₂`.
+
+For curved patches, `(a_lo, a_hi)` is the radial parameter range
+(`s ∈ [0, 1]` for inflation, `ρ ∈ [0, 1]` for shell), `(b_lo, b_hi)` and
+`(c_lo, c_hi)` are the two tangent-angular ranges (each `⊂ [-1, 1]`).
+"""
+struct PatchInfo{T}
+    kind :: Int8
+    a_lo :: T
+    a_hi :: T
+    b_lo :: T
+    b_hi :: T
+    c_lo :: T
+    c_hi :: T
+end
+
+"""
+    InflatedCubeMesh{T}
+
+A 13-patch conforming hex mesh:
+
+* one axis-aligned inner cube `[-L, L]³` (`M³` elements),
+* six inflation patches that bridge each cube face to the inner sphere
+  at radius `R₁` (`M_i × M × M` elements each),
+* six spherical-shell patches that bridge the inner sphere `R₁` to the
+  outer sphere `R₂` (`M_s × M × M` elements each).
+
+Total element count: `M³ + 6 · M² · (M_i + M_s)`.
+
+# Fields
+
+* `base :: HexMesh{T}` — connectivity + trilinear vertex info. Host-side
+  queries (`element_vertices`, `nv`, `locate_point`, plotting) work
+  through this just like a plain `HexMesh`.
+* `patch_info :: Vector{PatchInfo{T}}` of length `base.Ne` — per-element
+  parametric description used by `make_geometry` to evaluate the
+  analytic Jacobian on the curved patches.
+* `L, R1, R2 :: T` — inner-cube half-edge, inner-sphere radius, outer-
+  sphere radius. Required: `0 < L · √3 < R1 < R2`.
+
+The radial spacing is **exactly** constant on the spherical shells
+(uniform `(R2 - R1)/M_s` along every radial ray); on the inflation
+patches the radial spacing is constant on average (varies by a factor
+between cube-face center and cube-face corner).
+"""
+struct InflatedCubeMesh{T, MI, MI8}
+    base       :: HexMesh{T, MI, MI8}
+    patch_info :: Vector{PatchInfo{T}}
+    L          :: T
+    R1         :: T
+    R2         :: T
+end
+
+# Forward `HexMesh` accessors through the wrapper so existing host code
+# (`mesh.Ne`, `mesh.bdry`, `mesh.vertex_coords`, …) keeps working unchanged.
+@inline function Base.getproperty(m::InflatedCubeMesh, name::Symbol)
+    if name === :base || name === :patch_info ||
+       name === :L || name === :R1 || name === :R2
+        return getfield(m, name)
+    else
+        return getproperty(getfield(m, :base), name)
+    end
+end
+Base.propertynames(m::InflatedCubeMesh) =
+    (:base, :patch_info, :L, :R1, :R2,
+     :Ne, :conn, :vertex_coords, :vertex_idx,
+     :neighbour, :neighbour_face, :orientation, :bdry)
+
+nv(mesh::InflatedCubeMesh) = nv(mesh.base)
+
+# Direction-dependent unit vector `v(b, c)` for the six face directions.
+# For each direction `dir ∈ 1..6` (mapping `(+x, -x, +y, -y, +z, -z)`),
+# the parameterisation places the physical point `P = f(a, b, c) · v(b, c)`
+# (inflation) or `P = (r(a) / Q) · v(b, c)` (shell), where the local
+# `(ξ, η, ζ)` frame is right-handed in physical space — picking the
+# tangent-axis pair per direction so that `det J > 0`. The corresponding
+# tables:
+#
+#   +x:  v = ( 1,  b,  c)            -x:  v = (-1,  c,  b)
+#   +y:  v = ( c,  1,  b)            -y:  v = ( b, -1,  c)
+#   +z:  v = ( b,  c,  1)            -z:  v = ( c,  b, -1)
+@inline function _patch_direction_vec(dir::Int8, b::T, c::T) where {T}
+    if dir == Int8(1)
+        return (one(T), b, c)
+    elseif dir == Int8(2)
+        return (-one(T), c, b)
+    elseif dir == Int8(3)
+        return (c, one(T), b)
+    elseif dir == Int8(4)
+        return (b, -one(T), c)
+    elseif dir == Int8(5)
+        return (b, c, one(T))
+    else
+        return (c, b, -one(T))
+    end
+end
+
+# Same as `_patch_direction_vec`, plus the constant partials `∂v/∂b` and
+# `∂v/∂c` (each a 3-tuple; entries are `0` or `±1`). Used by the
+# analytic-Jacobian path in `make_geometry`.
+@inline function _patch_direction_vec_and_derivs(dir::Int8, b::T, c::T) where {T}
+    z = zero(T); o = one(T)
+    if dir == Int8(1)        # +x
+        return (o, b, c,    z, o, z,    z, z, o)
+    elseif dir == Int8(2)    # -x
+        return (-o, c, b,   z, z, o,    z, o, z)
+    elseif dir == Int8(3)    # +y
+        return (c, o, b,    z, z, o,    o, z, z)
+    elseif dir == Int8(4)    # -y
+        return (b, -o, c,   o, z, z,    z, z, o)
+    elseif dir == Int8(5)    # +z
+        return (b, c, o,    o, z, z,    z, o, z)
+    else                     # -z
+        return (c, b, -o,   z, o, z,    o, z, z)
+    end
+end
+
+"""
+    make_inflated_cube_mesh(::Type{T}, L, R1, R2, M; M_i, M_s) → InflatedCubeMesh{T}
+
+Build a 13-patch inflated cube mesh of the ball `|x| ≤ R2`:
+
+* an axis-aligned inner cube `[-L, L]³` with `M × M × M` elements,
+* six inflation patches that interpolate from each cube face to the
+  inner sphere `r = R1`, with `M_i × M × M` elements each,
+* six spherical-shell patches that interpolate from the inner sphere to
+  the outer sphere `r = R2`, with `M_s × M × M` elements each.
+
+`M_i` defaults to `round((R1 - (1 + √3)/2 · L) / h)` (average radial gap
+between the cube and the inner sphere, expressed in cube-edge cells
+`h = 2L/M`). `M_s` defaults to `round((R2 - R1) / h)`. Each defaults to
+at least 1.
+
+The shell patches use the parameterisation `r(ρ) = (1 - ρ)·R1 + ρ·R2`
+along every radial ray, so they have exactly constant radial spacing
+`(R2 - R1) / M_s` and exactly uniform angular sampling in
+`(η, ζ) ∈ [-1, 1]²`. The inflation patches use
+`r(s, η, ζ) = (1 - s)·L + s · R1 / √(1 + η² + ζ²)`, so their radial
+spacing is constant on average (varies between cube-face center and
+cube-face corner). The geometry matches conformally at every inter-
+patch interface (cube → inflation at `r = L`; inflation → shell at
+`r = R1`; adjacent inflation/shell patches along the shared cube
+edges and great circles on the inner / outer spheres).
+
+The outer boundary `r = R2` is tagged `bdry = 1` on every shell-patch
+outer face.
+
+`make_geometry(mesh, elem)` dispatches per element on `patch_info[e].kind`:
+trilinear for the inner cube; analytic Jacobian on the curved patches.
+"""
+function _inflated_cube_skeleton(::Type{T}, L::Real, R1::Real, R2::Real, M::Int;
+                                   M_i::Union{Nothing, Int}=nothing,
+                                   M_s::Union{Nothing, Int}=nothing) where {T}
+    @assert M ≥ 1
+    @assert L > 0
+    @assert L * sqrt(3) < R1 "inner sphere R1 must enclose the cube corner (L·√3)"
+    @assert R1 < R2
+
+    Lv  = T(L)
+    R1v = T(R1)
+    R2v = T(R2)
+    h   = 2L / M
+
+    Mi = M_i === nothing ?
+         max(1, round(Int, (R1 - (1 + sqrt(3))/2 * L) / h)) :
+         M_i
+    Ms = M_s === nothing ?
+         max(1, round(Int, (R2 - R1) / h)) :
+         M_s
+    @assert Mi ≥ 1
+    @assert Ms ≥ 1
+
+    z = zero(T)
+    o = one(T)
+
+    # Patch 1: inner cube `[-L, L]³`.
+    inner = PatchSpec{T}(M, M, M, :cubical,
+                          -Lv, Lv, -Lv, Lv, -Lv, Lv,
+                          z, z, z)
+
+    # Patches 2..7: inflation in directions (+x, -x, +y, -y, +z, -z),
+    # parameter range `(a, b, c) ∈ [0, 1] × [-1, 1]²`.
+    inflation_families = (:inflation_pos_x, :inflation_neg_x,
+                          :inflation_pos_y, :inflation_neg_y,
+                          :inflation_pos_z, :inflation_neg_z)
+    # Patches 8..13: shells in the same direction order.
+    shell_families     = (:shell_pos_x, :shell_neg_x,
+                          :shell_pos_y, :shell_neg_y,
+                          :shell_pos_z, :shell_neg_z)
+
+    patches = PatchSpec{T}[inner]
+    for fam in inflation_families
+        push!(patches, PatchSpec{T}(Mi, M, M, fam,
+                                     z, o, -o, o, -o, o,
+                                     Lv, R1v, R2v))
+    end
+    for fam in shell_families
+        push!(patches, PatchSpec{T}(Ms, M, M, fam,
+                                     z, o, -o, o, -o, o,
+                                     Lv, R1v, R2v))
+    end
+    @assert length(patches) == 13
+
+    faces = Matrix{FaceLink}(undef, 6, length(patches))
+
+    # ---- Cube ↔ inflation interfaces. ----
+    # Inner cube face `f` connects to the inflation patch whose
+    # direction matches that face, at the inflation's face 1 (inner-
+    # radial, `a = 0`). With the right-handed `_patch_direction_vec`,
+    # the conventions for `-x, +y, -z` swap the (b, c) → (η_phys, ζ_phys)
+    # axis mapping relative to the cube, giving a D₄ transpose
+    # (`o = 5`). The other three directions match directly (`o = 0`).
+    # Both sides of an `o = 5` link carry `o = 5` (transpose is its
+    # own inverse).
+    CUBE_FACE_TO_DIR         = (2, 1, 4, 3, 6, 5)
+    CUBE_FACE_ORIENTATION    = (Int8(5), Int8(0), Int8(0),
+                                Int8(5), Int8(5), Int8(0))
+    for f in 1:6
+        d  = CUBE_FACE_TO_DIR[f]
+        ip = d + 1                   # inflation patch id
+        oo = CUBE_FACE_ORIENTATION[f]
+        faces[f, 1]  = interior_link(ip, 1, oo)
+        faces[1, ip] = interior_link(1,  f, oo)
     end
 
+    # ---- Inflation tangential / radial-outer faces. ----
+    # Tangential faces 3..6 connect to adjacent inflation patches via
+    # `_INFLATION_NEIGHBOUR` (the cube-edge topology *for the right-handed
+    # `_patch_direction_vec` convention*; not the same as the cubed-cube
+    # `_WEDGE_NEIGHBOUR`). All twelve cube-edge orientations are still 0.
+    # Face 2 (outer-radial, `a = 1`) connects to the same-direction shell
+    # patch's face 1 with orientation 0.
+    for d in 1:6
+        ip = d + 1                   # inflation patch
+        sp = d + 7                   # shell patch (same direction)
+        faces[2, ip] = interior_link(sp, 1, 0)
+        for f in 3:6
+            neigh_dir, neigh_face = _INFLATION_NEIGHBOUR[d][f - 2]
+            faces[f, ip] = interior_link(neigh_dir + 1, neigh_face, 0)
+        end
+    end
+
+    # ---- Shell tangential / outer-sphere faces. ----
+    # Face 1: → inflation patch face 2 (inner-radial side).
+    # Face 2: outer sphere domain boundary, tag 1.
+    # Faces 3..6: adjacent shell patches via `_INFLATION_NEIGHBOUR` (same
+    # direction conventions, same connectivity).
+    for d in 1:6
+        sp = d + 7
+        ip = d + 1
+        faces[1, sp] = interior_link(ip, 2, 0)
+        faces[2, sp] = boundary_link(1)
+        for f in 3:6
+            neigh_dir, neigh_face = _INFLATION_NEIGHBOUR[d][f - 2]
+            faces[f, sp] = interior_link(neigh_dir + 7, neigh_face, 0)
+        end
+    end
+
+    return SkeletonMesh{T}(patches, faces)
+end
+
+# Build the per-element `PatchInfo` table that
+# `make_geometry(::InflatedCubeMesh)` reads to dispatch on patch kind
+# and recover the parameter-space extent of each element. Order matches
+# `_skeleton_to_mesh`'s element enumeration (column-major over `(a, b, c)`
+# inside each patch, patches walked in order).
+function _build_inflated_cube_patch_info(skel::SkeletonMesh{T}, Ne::Int) where {T}
+    patch_info = Vector{PatchInfo{T}}(undef, Ne)
     e = 0
-    for k in 1:M, j in 1:M, i in 1:M
-        e += 1; fill_corners!(e, cube_v, i, j, k)
-    end
-    for vg in patch_v
-        for k in 1:M, j in 1:M, i in 1:L
-            e += 1; fill_corners!(e, vg, i, j, k)
+    zT = zero(T)
+    for ps in skel.patches
+        kind = _family_to_kind(ps.family)
+        for c in 1:ps.Mc, b in 1:ps.Mb, a in 1:ps.Ma
+            e += 1
+            if kind == Int8(0)
+                # Inner cube: trilinear path; parameter-extent slots unused.
+                patch_info[e] = PatchInfo{T}(Int8(0), zT, zT, zT, zT, zT, zT)
+            else
+                a_lo = ps.a_lo + (ps.a_hi - ps.a_lo) * T(a - 1) / T(ps.Ma)
+                a_hi = ps.a_lo + (ps.a_hi - ps.a_lo) * T(a)     / T(ps.Ma)
+                b_lo = ps.b_lo + (ps.b_hi - ps.b_lo) * T(b - 1) / T(ps.Mb)
+                b_hi = ps.b_lo + (ps.b_hi - ps.b_lo) * T(b)     / T(ps.Mb)
+                c_lo = ps.c_lo + (ps.c_hi - ps.c_lo) * T(c - 1) / T(ps.Mc)
+                c_hi = ps.c_lo + (ps.c_hi - ps.c_lo) * T(c)     / T(ps.Mc)
+                patch_info[e] = PatchInfo{T}(kind, a_lo, a_hi, b_lo, b_hi, c_lo, c_hi)
+            end
         end
     end
     @assert e == Ne
+    return patch_info
+end
 
-    # --- Step 3c: derive neighbour, neighbour_face, orientation ---------
-    # Two faces match iff their *sets* of four global vertex IDs are equal;
-    # we sort each face's vertex tuple to get a canonical hashable
-    # signature. When a match is found, the order of the 4 vertices in
-    # the two elements' canonical face-vertex lists yields the D₄
-    # orientation that maps self's face-local (p, q) into the neighbour's.
-    neighbour      = zeros(Int32, 6, Ne)
-    neighbour_face = zeros(Int8, 6, Ne)
-    orientation    = zeros(Int8, 6, Ne)
-    face_sig       = Dict{NTuple{4, Int},
-                          Tuple{Int, Int, NTuple{4, Int}}}()
-    @inbounds for ee in 1:Ne, f in 1:6
-        flv  = FACE_LOCAL_VERTICES[f]
-        face = (vertex_idx[flv[1], ee], vertex_idx[flv[2], ee],
-                vertex_idx[flv[3], ee], vertex_idx[flv[4], ee])
-        sig  = NTuple{4, Int}(sort!(collect(face)))
-        prev = get(face_sig, sig, (0, 0, (0, 0, 0, 0)))
-        if prev[1] == 0
-            face_sig[sig] = (ee, f, face)
-        else
-            ee_o, f_o, face_o = prev
-            neighbour[f,   ee] = ee_o
-            neighbour[f_o, ee_o] = ee
-            neighbour_face[f,   ee] = f_o
-            neighbour_face[f_o, ee_o] = f
-            orientation[f,   ee]   = _compute_face_orientation(face,   face_o, f,   f_o)
-            orientation[f_o, ee_o] = _compute_face_orientation(face_o, face,   f_o, f  )
-        end
-    end
-
-    # --- Step 3d: tag outer-cube faces ----------------------------------
-    bdry = zeros(Int8, 6, Ne)
-    on(v, t) = abs(v - t) < T(1e-10)
-    @inbounds for ee in 1:Ne, f in 1:6
-        neighbour[f, ee] == 0 || continue
-        flv = FACE_LOCAL_VERTICES[f]
-        v1 = vertex_idx[flv[1], ee]; v2 = vertex_idx[flv[2], ee]
-        v3 = vertex_idx[flv[3], ee]; v4 = vertex_idx[flv[4], ee]
-        bdry[f, ee] =
-            all(on(vertex_coords[1, v], -1) for v in (v1, v2, v3, v4)) ? 1 :
-            all(on(vertex_coords[1, v], +1) for v in (v1, v2, v3, v4)) ? 2 :
-            all(on(vertex_coords[2, v], -1) for v in (v1, v2, v3, v4)) ? 3 :
-            all(on(vertex_coords[2, v], +1) for v in (v1, v2, v3, v4)) ? 4 :
-            all(on(vertex_coords[3, v], -1) for v in (v1, v2, v3, v4)) ? 5 :
-            all(on(vertex_coords[3, v], +1) for v in (v1, v2, v3, v4)) ? 6 :
-            Int8(0)
-    end
-
-    return HexMesh{T}(Ne, neighbour, neighbour_face, orientation,
-                      bdry, vertex_coords, vertex_idx)
+function make_inflated_cube_mesh(::Type{T}, L::Real, R1::Real, R2::Real, M::Int;
+                                  M_i::Union{Nothing, Int}=nothing,
+                                  M_s::Union{Nothing, Int}=nothing) where {T}
+    skel       = _inflated_cube_skeleton(T, L, R1, R2, M; M_i, M_s)
+    base       = _skeleton_to_mesh(skel)
+    patch_info = _build_inflated_cube_patch_info(skel, base.Ne)
+    return InflatedCubeMesh(base, patch_info, T(L), T(R1), T(R2))
 end
 
 # ----------------------------------------------------------------------
@@ -605,6 +1282,69 @@ column `a` is `∂x / ∂ξₐ` (with `ξ₁ = ξ`, `ξ₂ = η`, `ξ₃ = ζ`).
                             col3[1], col3[2], col3[3])
 end
 
+"""
+    _patch_point_and_jac(pi, ξ, η_ref, ζ_ref, L, R1, R2) → (P, J)
+
+Analytic element map for one node of an `InflatedCubeMesh` curved patch.
+Given a per-element `PatchInfo` and a reference-cube coordinate
+`(ξ, η_ref, ζ_ref) ∈ [0, 1]³`, returns the physical point `P` and the
+`SMatrix{3, 3}` Jacobian `J[i, a] = ∂P_i / ∂ξₐ_ref`. The reference-to-
+parameter affine map and the parameter-to-physical map are composed
+analytically; no finite differencing is involved.
+
+Used by `make_geometry(::InflatedCubeMesh)`. For `pi.kind == 0` (inner
+cube), use the trilinear path instead — this routine assumes a curved
+patch.
+"""
+@inline function _patch_point_and_jac(pi::PatchInfo{T},
+                                       ξ::T, η_ref::T, ζ_ref::T,
+                                       L::T, R1::T, R2::T) where {T}
+    # Reference-cube [0, 1]³ → parameter-space (a, b, c).
+    da = pi.a_hi - pi.a_lo
+    db = pi.b_hi - pi.b_lo
+    dc = pi.c_hi - pi.c_lo
+    a  = pi.a_lo + da * ξ
+    b  = pi.b_lo + db * η_ref
+    c  = pi.c_lo + dc * ζ_ref
+
+    Q  = sqrt(one(T) + (b*b + c*c))
+    Q3 = Q * Q * Q
+    is_shell = pi.kind ≥ Int8(7)
+    dir      = ((pi.kind - Int8(1)) % Int8(6)) + Int8(1)
+
+    # Scalar `f(a, b, c)` such that `P = f · v(b, c)`.
+    if is_shell
+        rval  = (one(T) - a) * R1 + a * R2
+        f     = rval / Q
+        df_da = (R2 - R1) / Q
+        df_db = -rval * b / Q3
+        df_dc = -rval * c / Q3
+    else
+        f     = (one(T) - a) * L + a * R1 / Q
+        df_da = -L + R1 / Q
+        df_db = -a * R1 * b / Q3
+        df_dc = -a * R1 * c / Q3
+    end
+
+    vx, vy, vz, dvxb, dvyb, dvzb, dvxc, dvyc, dvzc =
+        _patch_direction_vec_and_derivs(dir, b, c)
+
+    Px = f * vx; Py = f * vy; Pz = f * vz
+
+    dPa_x = df_da * vx;            dPa_y = df_da * vy;            dPa_z = df_da * vz
+    dPb_x = df_db * vx + f * dvxb; dPb_y = df_db * vy + f * dvyb; dPb_z = df_db * vz + f * dvzb
+    dPc_x = df_dc * vx + f * dvxc; dPc_y = df_dc * vy + f * dvyc; dPc_z = df_dc * vz + f * dvzc
+
+    # Reference-cube Jacobian: column `a` is `∂P/∂ξ_ref_a`, scaled by the
+    # affine ref→parameter derivative.
+    J = SMatrix{3, 3, T}(
+        dPa_x * da, dPa_y * da, dPa_z * da,
+        dPb_x * db, dPb_y * db, dPb_z * db,
+        dPc_x * dc, dPc_y * dc, dPc_z * dc)
+    P = SVector{3, T}(Px, Py, Pz)
+    return P, J
+end
+
 # Convenience: extract an element's eight corners from the shared
 # `vertex_coords` table as an 8-tuple of `SVector{3, T}`.
 @inline function element_vertices(mesh::HexMesh{T}, e::Integer) where {T}
@@ -614,6 +1354,14 @@ end
                       mesh.vertex_coords[2, vi],
                       mesh.vertex_coords[3, vi])
     end, Val(8))
+end
+
+# Forward element-corner queries through the `InflatedCubeMesh` wrapper.
+# The trilinear corners are only an approximation of the curved-patch
+# geometry, but match exactly on the inner cube and are good enough for
+# bounding-box reject (`locate_point`) and for plotting.
+@inline function element_vertices(mesh::InflatedCubeMesh{T}, e::Integer) where {T}
+    return element_vertices(mesh.base, e)
 end
 
 """
@@ -754,6 +1502,94 @@ function make_geometry(mesh::HexMesh{T}, elem) where {T}
                               coords, jac, invjac, detjac, Hphys, face_trace, handedness)
 end
 
+"""
+    make_geometry(mesh::InflatedCubeMesh, elem) → MeshGeometry{T, N}
+
+Evaluate the per-element geometric map of every patch in `mesh` at the
+GLL collocation points of the reference element `elem`. Dispatches per
+element on `mesh.patch_info[e].kind`:
+
+* `kind == 0` (inner cube): trilinear interpolation of the 8 corners —
+  identical to `make_geometry(::HexMesh, elem)`.
+* `kind == 1..6` (inflation patch): analytic Jacobian from
+  `r(s, η, ζ) = (1 - s)·L + s · R₁ / √(1 + η² + ζ²)` evaluated through
+  `_patch_point_and_jac`.
+* `kind == 7..12` (shell patch): analytic Jacobian from
+  `r(ρ) = (1 - ρ)·R₁ + ρ·R₂`, also through `_patch_point_and_jac`.
+
+The returned `MeshGeometry` is interchangeable with one built from a
+plain `HexMesh`; downstream kernels are agnostic to the underlying
+mesh's curvature.
+"""
+function make_geometry(mesh::InflatedCubeMesh{T}, elem) where {T}
+    N  = elem.N
+    ξs = elem.xs
+    Ne = mesh.Ne
+
+    ops_ref = make_operators(elem)
+    H_1d    = SVector{N, T}(ntuple(i -> ops_ref.H[i, i], Val(N)))
+
+    coords     = Array{T, 5}(undef, 3, N, N, N, Ne)
+    jac        = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
+    invjac     = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
+    detjac     = Array{T, 4}(undef, N, N, N, Ne)
+    Hphys      = Array{T, 4}(undef, N, N, N, Ne)
+    face_trace = Array{T, 5}(undef, 4, N, N, 6, Ne)
+    handedness = Vector{Int8}(undef, Ne)
+
+    Lv  = mesh.L
+    R1v = mesh.R1
+    R2v = mesh.R2
+
+    @inbounds for e in 1:Ne
+        pi = mesh.patch_info[e]
+        if pi.kind == Int8(0)
+            # Trilinear path — inner cube
+            verts = element_vertices(mesh.base, e)
+            J_c   = trilinear_jacobian(verts, zero(T), zero(T), zero(T))
+            handedness[e] = det(J_c) ≥ 0 ? Int8(1) : Int8(-1)
+            for k in 1:N, j in 1:N, i in 1:N
+                ξ, η, ζ = ξs[i], ξs[j], ξs[k]
+                p  = trilinear_map(verts, ξ, η, ζ)
+                J  = trilinear_jacobian(verts, ξ, η, ζ)
+                Ji = inv(J)
+                dJ = abs(det(J))
+                for a in 1:3
+                    coords[a, i, j, k, e] = p[a]
+                    for b in 1:3
+                        jac[a, b, i, j, k, e]    = J[a, b]
+                        invjac[a, b, i, j, k, e] = Ji[a, b]
+                    end
+                end
+                detjac[i, j, k, e] = dJ
+                Hphys[i, j, k, e]  = H_1d[i] * H_1d[j] * H_1d[k] * dJ
+            end
+        else
+            # Analytic curvilinear path — inflation / shell patch
+            _, J_c = _patch_point_and_jac(pi, T(0.5), T(0.5), T(0.5),
+                                          Lv, R1v, R2v)
+            handedness[e] = det(J_c) ≥ 0 ? Int8(1) : Int8(-1)
+            for k in 1:N, j in 1:N, i in 1:N
+                ξ, η, ζ = ξs[i], ξs[j], ξs[k]
+                p, J = _patch_point_and_jac(pi, ξ, η, ζ, Lv, R1v, R2v)
+                Ji = inv(J)
+                dJ = abs(det(J))
+                for a in 1:3
+                    coords[a, i, j, k, e] = p[a]
+                    for b in 1:3
+                        jac[a, b, i, j, k, e]    = J[a, b]
+                        invjac[a, b, i, j, k, e] = Ji[a, b]
+                    end
+                end
+                detjac[i, j, k, e] = dJ
+                Hphys[i, j, k, e]  = H_1d[i] * H_1d[j] * H_1d[k] * dJ
+            end
+        end
+    end
+    return MeshGeometry{T, N}(Ne, mesh.conn,
+                              coords, jac, invjac, detjac, Hphys, face_trace, handedness)
+end
+
 ################################################################################
 # Device migration
 
@@ -785,6 +1621,11 @@ function to_device(mesh::HexMesh{T}, backend) where {T}
     copyto!(bdr, mesh.bdry)
     new_conn = MeshConnectivity(nb, nbf, ori, bdr)
     return HexMesh{T}(mesh.Ne, new_conn, mesh.vertex_coords, mesh.vertex_idx)
+end
+
+function to_device(mesh::InflatedCubeMesh{T}, backend) where {T}
+    base_dev = to_device(mesh.base, backend)
+    return InflatedCubeMesh(base_dev, mesh.patch_info, mesh.L, mesh.R1, mesh.R2)
 end
 
 function to_device(geom::MeshGeometry{T, N}, backend) where {T, N}
@@ -856,6 +1697,7 @@ Thin wrapper that returns just the physical collocation coordinates from
 per-node Jacobian.
 """
 element_coords(mesh::HexMesh, elem) = make_geometry(mesh, elem).coords
+element_coords(mesh::InflatedCubeMesh, elem) = make_geometry(mesh, elem).coords
 
 # ----------------------------------------------------------------------
 # Interpolation from per-element data to arbitrary physical points
@@ -895,6 +1737,8 @@ its index plus the reference coordinate. Returns `(0, _)` if `p` is
 outside every element. Brute-force search with a bounding-box reject;
 intended only for visualisation.
 """
+locate_point(mesh::InflatedCubeMesh, p; kwargs...) = locate_point(mesh.base, p; kwargs...)
+
 function locate_point(mesh::HexMesh{T}, p::SVector{3, T};
                        tol = T(1e-8)) where {T}
     @inbounds for e in 1:mesh.Ne
@@ -969,6 +1813,9 @@ function interpolate_field(mesh::HexMesh{T}, elem,
     e == 0 && return default
     return tensor_interp(view(u, :, :, :, e), ξ[1], ξ[2], ξ[3], elem.xs)
 end
+
+interpolate_field(mesh::InflatedCubeMesh, elem, u, p; kwargs...) =
+    interpolate_field(mesh.base, elem, u, p; kwargs...)
 
 # Vectorised convenience: take any iterable of points and return an
 # array of values with the same shape.

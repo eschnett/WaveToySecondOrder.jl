@@ -1,7 +1,9 @@
 # Tests for `src/mesh.jl`: `HexMesh`, `make_cubical_mesh`.
 
 using WaveToySecondOrder
-using WaveToySecondOrder: HexMesh, make_cubical_mesh, make_cubed_cube_mesh, nv
+using WaveToySecondOrder: HexMesh, InflatedCubeMesh, make_cubical_mesh,
+                          make_cubed_cube_mesh, make_inflated_cube_mesh,
+                          make_element, make_geometry, nv
 using Test
 
 count_zero_neighbours(m::HexMesh) = count(==(0), m.neighbour)
@@ -143,6 +145,124 @@ count_zero_neighbours(m::HexMesh) = count(==(0), m.neighbour)
         outer_slots = 3*n3 + 2*n4 + 1*n5
         @test outer_slots == 6 * M^2
         @test outer_slots == count_zero_neighbours(m)
+    end
+
+    @testset "make_inflated_cube_mesh: element counts and boundary tagging" begin
+        # 13-patch inflated cube: inner cube + 6 inflation + 6 shell.
+        # M=4, L=1, R1=2.5, R2=5  ⇒  h = 0.5,
+        #   M_i = round((2.5 − (1+√3)/2 · 1) / 0.5) = round(2.268) = 2
+        #   M_s = round((5 − 2.5) / 0.5) = 5
+        #   Ne = M³ + 6·M²·(M_i + M_s) = 64 + 672 = 736
+        T = Float64
+        L = 1.0; R1 = 2.5; R2 = 5.0; M = 4
+        m = make_inflated_cube_mesh(T, L, R1, R2, M)
+        @test m isa InflatedCubeMesh{T}
+        @test m.L == L && m.R1 == R1 && m.R2 == R2
+        @test m.Ne == 736
+
+        n_inner = count(p -> p.kind == 0, m.patch_info)
+        n_infl  = count(p -> 1 ≤ p.kind ≤ 6,  m.patch_info)
+        n_shell = count(p -> 7 ≤ p.kind ≤ 12, m.patch_info)
+        @test n_inner == M^3
+        @test n_infl  == 6 * 16 * 2     # M_i = 2
+        @test n_shell == 6 * 16 * 5     # M_s = 5
+        @test n_inner + n_infl + n_shell == m.Ne
+
+        # Every outer-boundary face lies on the outer sphere |x| = R2,
+        # and every shell-outer face is tagged. The only outer faces of
+        # the topology are exactly the 6·M² shell-patch outer faces.
+        @test count(==(0), m.neighbour) == 6 * M^2
+        @test count(!=(0), m.bdry)       == 6 * M^2
+
+        # Boundary positions are within tolerance of |x| = R2.
+        for ee in 1:m.Ne, f in 1:6
+            m.bdry[f, ee] == 0 && continue
+            for ℓ in (1, 4, 5, 8)  # any face-corner vertex
+                # Crude: pick a vertex from the element; only need one
+                # per face to confirm tagging is on the sphere.
+                v = m.vertex_idx[ℓ, ee]
+                r = sqrt(sum(abs2, m.vertex_coords[:, v]))
+                # All eight vertices are on or below R2; for an outer-face
+                # element at least one vertex lies on the sphere.
+                @test r ≤ R2 + 1e-8
+            end
+        end
+    end
+
+    @testset "make_inflated_cube_mesh: cube↔inflation interfaces all dedup" begin
+        # Regression: the cube vertex positions and the inflation-patch
+        # parametric positions must round-trip through identical FP ops
+        # at the shared `r = L` face so the position-keyed dedup dict
+        # finds them equal. The earlier `−L + (2L)(i/M)` form rounded to
+        # a 1-ULP-different value (e.g. `0.05000000000000002` vs `0.05`
+        # for `L = 0.1, M = 4`), which broke connectivity at most cube
+        # face pairs and made the discrete operator non-symmetric.
+        # Test that with `L = 0.1, M = 4, R1 = 0.3, R2 = 1.0` every
+        # cube outer face has a curved-patch neighbour and none ends up
+        # tagged as an outer-domain boundary.
+        T = Float64
+        m = make_inflated_cube_mesh(T, 0.1, 0.3, 1.0, 4)
+        for e in 1:m.Ne
+            m.patch_info[e].kind == 0 || continue   # inner cube only
+            for f in 1:6
+                # An inner-cube element should never touch the outer-
+                # domain boundary: it always has a neighbour, whether a
+                # sibling cube element or an inflation patch.
+                @test m.neighbour[f, e] != 0
+                @test m.bdry[f, e] == 0
+            end
+        end
+    end
+
+    @testset "make_inflated_cube_mesh: neighbour symmetry and orientation D₄" begin
+        T = Float64
+        m = make_inflated_cube_mesh(T, 1.0, 2.0, 4.0, 3)
+        # Each non-zero neighbour link must round-trip.
+        for e in 1:m.Ne, f in 1:6
+            n = m.neighbour[f, e]
+            n == 0 && continue
+            fn = m.neighbour_face[f, e]
+            @test m.neighbour[fn, n] == e
+            @test m.neighbour_face[fn, n] == f
+        end
+        @test all(0 .≤ m.orientation .≤ 7)
+    end
+
+    @testset "make_inflated_cube_mesh: geometry is well-formed" begin
+        T = Float64
+        m = make_inflated_cube_mesh(T, 1.0, 2.0, 4.0, 3)
+        elem = make_element(T, 4)
+        g = make_geometry(m, elem)
+        @test size(g.coords) == (3, 4, 4, 4, m.Ne)
+        @test !any(isnan, g.coords)
+        @test !any(isnan, g.jac)
+        @test all(>(0), g.detjac)
+        # Right-handed local frames everywhere by construction.
+        @test all(==(1), g.handedness)
+
+        # Shell-patch nodes lie inside the ball |x| ≤ R2 (up to FP slack).
+        r_all = sqrt.(g.coords[1, :, :, :, :].^2 .+
+                      g.coords[2, :, :, :, :].^2 .+
+                      g.coords[3, :, :, :, :].^2)
+        @test maximum(r_all) ≤ m.R2 + 1e-8
+
+        # Shell-element outermost-radial face nodes lie on the outer sphere
+        # exactly (to GLL accuracy of the analytic map; we test FP tol).
+        shell_outer_max_err = 0.0
+        for e in 1:m.Ne
+            pi_e = m.patch_info[e]
+            pi_e.kind ≥ 7 || continue
+            pi_e.a_hi == 1.0 || continue
+            # Reference-cube ξ = 1 corresponds to a = a_hi = 1 ⇒ on R2.
+            # At GLL node i = 4 (ξ=1), every (j, k) sample has |P|=R2.
+            for k in 1:4, j in 1:4
+                r = sqrt(g.coords[1, 4, j, k, e]^2 +
+                         g.coords[2, 4, j, k, e]^2 +
+                         g.coords[3, 4, j, k, e]^2)
+                shell_outer_max_err = max(shell_outer_max_err, abs(r - m.R2))
+            end
+        end
+        @test shell_outer_max_err < 1e-12
     end
 
 end

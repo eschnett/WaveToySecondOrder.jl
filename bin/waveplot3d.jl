@@ -69,9 +69,17 @@ end
 function main(; T::Type = Float64,
                 backend = CPU(),
                 mesh_kind::Symbol = :cubical,
+                ic_kind::Symbol = :cartesian,
                 N::Int = 5,
                 M::Int = 8,
-                R::Real = 0.1)
+                R::Real  = 0.1,    # cubed_cube: inner-cube half-edge fraction
+                L::Real  = 0.1,    # inflated_cube: inner-cube half-edge
+                R1::Real = 0.3,    # inflated_cube: inflation→shell radius
+                R2::Real = 1.0,    # inflated_cube: outer-sphere radius
+                ic_wavenumber::Real = 3π,            # :cartesian IC: kx = ky = kz
+                ic_radial_mode::Int  = 1,            # :radial IC: radial node index n ≥ 1
+                ic_radius::Union{Nothing, Real} = nothing)  # :radial IC: sphere radius
+                                                            # (defaults to half the bounding-box side)
 
     # When the caller asks for a non-CPU backend the geometry and state
     # are migrated to the device; only host-side analysis bits (slice
@@ -91,6 +99,16 @@ function main(; T::Type = Float64,
     elseif mesh_kind === :cubed_cube
         x0, x1 = -one(T), one(T)
         mesh = W.make_cubed_cube_mesh(T, M, T(R))
+    elseif mesh_kind === :inflated_cube
+        # Bounding box is the smallest axis-aligned cube containing the
+        # outer sphere |x| = R2. The IC and L²-error formulae below use
+        # `(coords - x0) / L_ ∈ [0, 1]` as a normalised coordinate; the
+        # `sin·sin·sin` analytic eigenmode does *not* satisfy the
+        # outer-sphere Dirichlet BC, so the L²-error plot is informative
+        # only as a measure of wave activity, not as a convergence
+        # diagnostic.
+        x0, x1 = -T(R2), T(R2)
+        mesh = W.make_inflated_cube_mesh(T, T(L), T(R1), T(R2), M)
     else
         error("unknown mesh_kind: $mesh_kind")
     end
@@ -106,36 +124,79 @@ function main(; T::Type = Float64,
 
     dx = min_node_spacing(coords)
 
-    t0, t1 = zero(T), one(T)
+    t0, t1 = zero(T), one(T) / 10
     L_ = x1 - x0
 
-    # Bundle all mesh-independent system parameters into a `Params3d`.
-    # SIPG penalty rule of thumb: ~1.5·(N−1)² for axis-aligned cubical
-    # meshes, ~8·(N−1)² for curvilinear / multi-patch meshes (4·(N−1)²
-    # is right at the NSD threshold for the cubed cube; the extra
-    # margin prevents slow exponential growth from a few residual
-    # positive eigenvalues).
+    # Initial-condition family. The IC is *independent* of the mesh:
+    # any combination of `mesh_kind` × `ic_kind` is allowed. The
+    # L²-error plot below is a true convergence diagnostic only when
+    # the IC's natural boundary matches the mesh's outer boundary
+    # (cartesian on cube domains, radial on the inflated cube);
+    # otherwise it just tracks wave activity.
+    if ic_kind === :cartesian
+        # Standing-wave eigenmode on `[x0, x1]³`:
+        #   u = A · sin(kx·X) sin(ky·Y) sin(kz·Z) · cos(ω t)
+        # with `ω = √(3·k²) / (x1 − x0)`. Vanishes on cube faces.
+        ic_k = T(ic_wavenumber)
+        ic_ω = T(sqrt(3 * ic_wavenumber^2)) / L_
+    elseif ic_kind === :radial
+        # Spherically-symmetric Bessel eigenmode on a ball of radius
+        # `ic_R` centred at the bounding-box centre:
+        #   u = A · sinc(n · r / R) · cos(ω t),  ω = nπ / R.
+        # Vanishes at `r = R`. Default `R` is half the bounding-box
+        # side length — equals `R2` for the inflated cube and gives
+        # the inscribed sphere for cube domains.
+        ic_R = ic_radius === nothing ? L_ / 2 : T(ic_radius)
+        ic_ω = T(ic_radial_mode) * T(π) / ic_R
+        ic_k = ic_ω        # filler, only `k` for `Params3d` shape; unused by the radial IC
+    else
+        error("unknown ic_kind: $ic_kind (use :cartesian or :radial)")
+    end
+
+    # Bounding-box centre for the radial IC.
+    ic_center = ((x0 + x1) / 2, (x0 + x1) / 2, (x0 + x1) / 2)
+
+    # Bundle the system parameters. SIPG penalty rule of thumb scales
+    # with the worst element aspect ratio:
+    #
+    #   :cubical       (AR ≈ 1)  → ~1.5·(N−1)²
+    #   :cubed_cube    (AR ≲ 2)  → ~8·(N−1)²
+    #   :inflated_cube (AR ≲ 10 on the outermost shell layer at r = R2)
+    #                            → ~32·(N−1)²
+    #
+    # The inflated-cube value is empirical: a localised mode living on
+    # the outermost shell elements has eigenvalue λ ≈ +30 000 at
+    # τ = 8·(N−1)² with the default mesh constants and M = 8, growing
+    # at ~177/unit time and tripping the integrator's `unstable_check`
+    # before t = 0.15. Bumping to 32·(N−1)² drives that mode negative
+    # at the cost of `dt ≈ 1/√τ → ~2×` smaller. See the discussion of
+    # option (B) for a principled adaptive τ — TODO.
+    τ_mesh = mesh_kind === :cubical       ? T(3//2) * (N-1)^2 :
+             mesh_kind === :cubed_cube    ? T(8)    * (N-1)^2 :
+             mesh_kind === :inflated_cube ? T(32)   * (N-1)^2 :
+             error("unknown mesh_kind: $mesh_kind")
     params = W.Params3d(;
         A           = one(T),
-        k           = (T(3π), T(3π), T(3π)),
-        ω           = T(sqrt(3 * (3π)^2)) / L_,
-        τ           = mesh_kind === :cubical ? T(3//2) * (N-1)^2 : T(8) * (N-1)^2,
+        k           = (ic_k, ic_k, ic_k),
+        ω           = ic_ω,
+        τ           = τ_mesh,
         bdry_values = ntuple(_ -> zero(T), Val(6)),
     )
 
-    # Build the IC on host, then `copyto!` to the device if needed —
-    # the analytic formula is a host scalar loop that would be slow if
-    # we tried to scalar-index a `MtlArray`.
-    u_host  = Array{T, 4}(undef, N, N, N, mesh.Ne)
-    u̇_host  = similar(u_host)
-    A         = params.A
-    kx, ky, kz = params.k
-    @inbounds for e in 1:mesh.Ne, k in 1:N, j in 1:N, i in 1:N
-        X = (coords[1, i, j, k, e] - x0) / L_
-        Y = (coords[2, i, j, k, e] - x0) / L_
-        Z = (coords[3, i, j, k, e] - x0) / L_
-        u_host[i, j, k, e]  = A * sin(kx*X) * sin(ky*Y) * sin(kz*Z)
-        u̇_host[i, j, k, e] = zero(T)
+    # Build the IC into a host buffer, then `copyto!` to the device if
+    # needed. The eigenmode broadcasts are GPU-compatible too, but
+    # building on host keeps the seeding path uniform across backends.
+    u_host = Array{T, 4}(undef, N, N, N, mesh.Ne)
+    u̇_host = similar(u_host)
+    if ic_kind === :cartesian
+        W.eigenmode_cartesian!(u_host, u̇_host, coords, zero(T);
+                                A = params.A,
+                                kx = params.k[1], ky = params.k[2], kz = params.k[3],
+                                ω = params.ω, x0 = x0, x1 = x1)
+    else  # :radial
+        W.eigenmode_radial!(u_host, u̇_host, coords, zero(T);
+                             A = params.A, R = ic_R, n = ic_radial_mode,
+                             center = ic_center)
     end
     if on_cpu
         u, u̇ = u_host, u̇_host
@@ -153,10 +214,11 @@ function main(; T::Type = Float64,
     # estimate of `|λ_max|` can underestimate the true value by a small
     # factor when the spectrum is clustered.
     dt  = W.recommended_dt(geom, ops, params.τ; cfl_safety = T(1//2))
+    cfl = dt / dx
     alg = pick_integrator(N)
     println("integrator = $(typeof(alg).name.name)   backend = $(typeof(backend).name.name)   ",
             "τ = $(params.τ)   ",
-            "dt = $(round(dt, sigdigits=4))   dx_min = $(round(dx, sigdigits=4))")
+            "dt = $(round(dt, sigdigits=4))   dx_min = $(round(dx, sigdigits=4))   dt/dx_min = $(round(cfl, sigdigits=4))")
 
     f!(ü, u̇, u, p::W.Params3d, t) = W.rhs3d!(ü, u, u̇, p; geom, ops)
     prob = SecondOrderODEProblem(f!, u̇, u, (t0, t1), params)
@@ -185,22 +247,21 @@ function main(; T::Type = Float64,
     us      = Array{T}(undef, Ns, Nt)
     u̇s      = Array{T}(undef, Ns, Nt)
     l2_err  = Vector{T}(undef, Nt)
-    u_exact = similar(u)           # same backend as state
-    err_buf = similar(u)
-    # Slice/finiteness/scalar-index work happens on host. On CPU these
-    # alias `u` directly; on GPU they're per-sample copies via
-    # `copyto!`, which is cheap relative to `Nt` integrator steps.
-    u_arr_host  = on_cpu ? u_host  : Array{T, 4}(undef, N, N, N, mesh.Ne)
-    u̇_arr_host  = on_cpu ? u̇_host  : Array{T, 4}(undef, N, N, N, mesh.Ne)
-    # Normalised coordinate views for broadcasting the analytic field
-    # over the (possibly device-resident) `geom.coords`. Views work the
-    # same on CPU/GPU and avoid intermediate allocations in the broadcast.
-    Xv = @view geom.coords[1, :, :, :, :]
-    Yv = @view geom.coords[2, :, :, :, :]
-    Zv = @view geom.coords[3, :, :, :, :]
+    u_exact  = similar(u)              # same backend as state
+    u̇_exact = similar(u)              # filled by the eigenmode! call, otherwise unused
+    err_buf  = similar(u)
+    # Slice / finiteness / scalar-index work happens on host. We always
+    # `copyto!` from the integrator's current state into these buffers —
+    # even on CPU, because the symplectic-RK solver allocates its own
+    # `ArrayPartition` and the input `u`/`u̇` don't alias `integrator.u`.
+    # (Trying to alias `u_host` instead of copying here gives a slice that
+    # is stuck at `t = 0` while the L²-error norm of `integrator.u` evolves
+    # correctly — confusing visuals, no error message.)
+    u_arr_host  = Array{T, 4}(undef, N, N, N, mesh.Ne)
+    u̇_arr_host  = Array{T, 4}(undef, N, N, N, mesh.Ne)
 
     prog = Progress(length(ts);
-                    desc = "Evolving + sampling (mesh=$(mesh_kind), τ=$(params.τ)): ",
+                    desc = "Evolving + sampling (mesh=$(mesh_kind), ic=$(ic_kind), τ=$(params.τ)): ",
                     barlen = 30, showspeed = true)
     for (n, t) in enumerate(ts)
         # Step the integrator forward to the next sample time.
@@ -214,11 +275,12 @@ function main(; T::Type = Float64,
         u̇_arr = integrator.u.x[1]
         u_arr  = integrator.u.x[2]
 
-        # Bring slice / scalar-index work to host. On CPU these are
-        # identity copies (the source and destination alias the same
-        # buffer); on GPU they're a small device→host transfer.
-        on_cpu || copyto!(u_arr_host,  u_arr)
-        on_cpu || copyto!(u̇_arr_host, u̇_arr)
+        # Bring slice / scalar-index work to host. On CPU this is a
+        # host→host copy from the integrator's state; on GPU it's a
+        # small device→host transfer. Either way, cheap vs the per-step
+        # RHS evaluations.
+        copyto!(u_arr_host,  u_arr)
+        copyto!(u̇_arr_host, u̇_arr)
         @assert all(isfinite, u_arr_host) && all(isfinite, u̇_arr_host)
 
         # Spacetime slice along the x-axis at (y_target, z_target).
@@ -228,15 +290,21 @@ function main(; T::Type = Float64,
         end
 
         # Physical-mass-weighted L² norm of the error vs the analytic
-        # sin·sin·sin·cos(ωt) eigenmode (which satisfies the wave equation
-        # with homogeneous Dirichlet on either [0,1]³ or [-1,1]³). The error
-        # is fully truncation/dispersion error from the discretisation.
-        # Broadcast over device arrays — produces an MtlArray on Metal.
-        ct = T(cos(params.ω * t))
-        @. u_exact = A *
-                     sin(kx * (Xv - x0) / L_) *
-                     sin(ky * (Yv - x0) / L_) *
-                     sin(kz * (Zv - x0) / L_) * ct
+        # eigenmode at time `t`. When the IC family matches the mesh's
+        # outer boundary (Dirichlet exactly), this is a true
+        # truncation/dispersion error; otherwise it tracks wave activity.
+        # The eigenmode! call broadcasts over `geom.coords`, so it works
+        # on host and device backends without extra copies.
+        if ic_kind === :cartesian
+            W.eigenmode_cartesian!(u_exact, u̇_exact, geom.coords, t;
+                                    A = params.A,
+                                    kx = params.k[1], ky = params.k[2], kz = params.k[3],
+                                    ω = params.ω, x0 = x0, x1 = x1)
+        else  # :radial
+            W.eigenmode_radial!(u_exact, u̇_exact, geom.coords, t;
+                                 A = params.A, R = ic_R, n = ic_radial_mode,
+                                 center = ic_center)
+        end
         err_buf .= u_arr .- u_exact
         l2_err[n] = W.discrete_l2_norm(err_buf, geom, ops)
     end
@@ -284,20 +352,21 @@ function main(; T::Type = Float64,
     # Figure
     fig = Figure(; size = (800, 1000))
 
+    plot_tag = "mesh=$(mesh_kind), ic=$(ic_kind)"
     slice_label = "y=$(round(y_target; digits=3)), z=$(round(z_target; digits=3))"
     ax1 = Axis(fig[1, 1];
-               title  = "u(x, $slice_label, t)  [$(mesh_kind)]",
+               title  = "u(x, $slice_label, t)  [$plot_tag]",
                xlabel = "x", ylabel = "t",
                aspect = DataAspect())
     ax2 = Axis(fig[1, 3];
-               title  = "u̇(x, $slice_label, t)  [$(mesh_kind)]",
+               title  = "u̇(x, $slice_label, t)  [$plot_tag]",
                xlabel = "x", ylabel = "t",
                aspect = DataAspect())
     ax3 = Axis(fig[2, 1:4];
-               title  = "Physical L² error vs analytic eigenmode  [$(mesh_kind)]",
+               title  = "Physical L² error vs analytic eigenmode  [$plot_tag]",
                xlabel = "t", ylabel = "‖u_num − u_exact‖_{H_phys}")
     ax4 = Axis(fig[3, 1:3];
-               title  = "u(x, y, z=0, t = t1)  [$(mesh_kind)]",
+               title  = "u(x, y, z=0, t = t1)  [$plot_tag]",
                xlabel = "x", ylabel = "y",
                aspect = DataAspect())
 
@@ -321,21 +390,30 @@ function main(; T::Type = Float64,
     return fig
 end
 
-# Default run: cubed_cube mesh, N = 4 GLL nodes per element, M = 8
-# elements per axis, on CPU. To run on Apple Silicon's Metal GPU, add
-# `using Metal` and pass `T = Float32, backend = MetalBackend()`:
+# Default run: cubical mesh, Cartesian sin·sin·sin eigenmode IC, on CPU.
+# `mesh_kind` and `ic_kind` are independent — any pairing is allowed.
+#
+# Cubed cube + Cartesian IC (the cube outer boundary matches the IC's
+# Dirichlet zeros, so the L² error is a convergence diagnostic):
+#
+#     main(; mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
+#
+# Inflated cube + radial Bessel IC (the outer sphere matches the IC's
+# Dirichlet zero at `r = R2`, so the L² error is again convergence,
+# this time on the spherical domain):
+#
+#     main(; mesh_kind = :inflated_cube, ic_kind = :radial, N = 4, M = 8)
+#
+# Apple Silicon GPU run (Float32, MetalBackend):
 #
 #     using Metal
 #     main(; T = Float32, backend = MetalBackend(),
-#            mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
+#            mesh_kind = :inflated_cube, ic_kind = :radial, N = 4, M = 8)
 
+# main(; N = 4, M = 8)
 # main(; mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
+# main(; mesh_kind = :inflated_cube, ic_kind = :radial, N = 4, M = 8)
 
-# main(; T = Float32,
-#        mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
-
-using Metal
-main(; T = Float32, backend = MetalBackend(),
-       mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
+main(; mesh_kind = :inflated_cube, ic_kind = :radial, N = 4, M = 8, L = 0.1, R1 = 0.3, R2 = 1.0)
 
 nothing
