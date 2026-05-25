@@ -263,14 +263,19 @@ const FACE_LOCAL_PQ = (
 # the unit square. Used by `_compute_face_orientation` and by the
 # kernel `_add_face_sat!`.
 @inline function _neigh_pq(o::Integer, p::Integer, q::Integer, N::Integer)
-    if     o == 0;  return (p,         q        )
-    elseif o == 1;  return (q,         N + 1 - p)
-    elseif o == 2;  return (N + 1 - p, N + 1 - q)
-    elseif o == 3;  return (N + 1 - q, p        )
-    elseif o == 4;  return (N + 1 - p, q        )
-    elseif o == 5;  return (q,         p        )
-    elseif o == 6;  return (p,         N + 1 - q)
-    else            return (N + 1 - q, N + 1 - p)
+    # Mirror in whatever integer type `p, q, N` are passed as. Callers
+    # in the kernel pass `Int32` to keep the index chain off the
+    # 64-bit slow path on NVIDIA / Apple Silicon. The `one(N)` keeps
+    # the "+1" in the same type as `N`.
+    np1 = N + one(N)
+    if     o == 0;  return (p,        q       )
+    elseif o == 1;  return (q,        np1 - p)
+    elseif o == 2;  return (np1 - p,  np1 - q)
+    elseif o == 3;  return (np1 - q,  p       )
+    elseif o == 4;  return (np1 - p,  q       )
+    elseif o == 5;  return (q,        p       )
+    elseif o == 6;  return (p,        np1 - q)
+    else            return (np1 - q,  np1 - p)
     end
 end
 
@@ -643,6 +648,16 @@ reference to it for host-side queries (`element_vertices`, plotting,
   `discrete_l2_norm`, `spectral_radius_estimate`) can run as a single
   `mapreduce` over device arrays without re-deriving the mass per
   node from the 1D quadrature weights and the Jacobian on each call.
+* `face_trace :: Array{T, 5}` of shape `(4, N, N, 6, Ne)` — per-
+  element face-trace staging buffer used by the two-pass `rhs3d!`
+  implementation. Filled by pass 1 with `(u, ∂x u, ∂y u, ∂z u)` at
+  each face quadrature node (physical gradient — the local element's
+  `J⁻ᵀ` has already been applied), then read by pass 2 across the
+  neighbour relation `mesh.conn.neighbour` to compute the face SAT
+  contributions. This is workspace, not geometry: its values are
+  overwritten on every `rhs3d!` call. Hard-coded for V=1 fields
+  (the wave equation); supporting multi-component PDEs in the future
+  will replace the leading `4` with `4·V` or grow a sixth axis.
 * `handedness :: Vector{Int8}` of length `Ne` — `±1`, the sign of
   `det J` on element `e`. A non-degenerate hex has uniform-sign Jacobian
   throughout, so a single scalar per element captures the handedness;
@@ -667,13 +682,17 @@ struct MeshGeometry{T, N, MC, A5, A6, A4, V1}
     invjac     :: A6
     detjac     :: A4
     Hphys      :: A4
+    face_trace :: A5
     handedness :: V1
 
     function MeshGeometry{T, N}(Ne::Int, conn::MC,
                                 coords::A5, jac::A6, invjac::A6,
                                 detjac::A4, Hphys::A4,
+                                face_trace::A5,
                                 handedness::V1) where {T, N, MC, A5, A6, A4, V1}
-        new{T, N, MC, A5, A6, A4, V1}(Ne, conn, coords, jac, invjac, detjac, Hphys, handedness)
+        new{T, N, MC, A5, A6, A4, V1}(Ne, conn,
+                                       coords, jac, invjac,
+                                       detjac, Hphys, face_trace, handedness)
     end
 end
 
@@ -705,6 +724,7 @@ function make_geometry(mesh::HexMesh{T}, elem) where {T}
     invjac     = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
     detjac     = Array{T, 4}(undef, N, N, N, Ne)
     Hphys      = Array{T, 4}(undef, N, N, N, Ne)
+    face_trace = Array{T, 5}(undef, 4, N, N, 6, Ne)   # workspace, see struct doc
     handedness = Vector{Int8}(undef, Ne)
     @inbounds for e in 1:Ne
         verts = element_vertices(mesh, e)
@@ -731,7 +751,7 @@ function make_geometry(mesh::HexMesh{T}, elem) where {T}
         end
     end
     return MeshGeometry{T, N}(Ne, mesh.conn,
-                              coords, jac, invjac, detjac, Hphys, handedness)
+                              coords, jac, invjac, detjac, Hphys, face_trace, handedness)
 end
 
 ################################################################################
@@ -774,15 +794,19 @@ function to_device(geom::MeshGeometry{T, N}, backend) where {T, N}
     invjac  = KernelAbstractions.allocate(backend, T,    size(geom.invjac))
     detjac  = KernelAbstractions.allocate(backend, T,    size(geom.detjac))
     Hphys   = KernelAbstractions.allocate(backend, T,    size(geom.Hphys))
+    ft      = KernelAbstractions.allocate(backend, T,    size(geom.face_trace))
     hand    = KernelAbstractions.allocate(backend, Int8, size(geom.handedness))
     copyto!(coords, geom.coords)
     copyto!(jac,    geom.jac)
     copyto!(invjac, geom.invjac)
     copyto!(detjac, geom.detjac)
     copyto!(Hphys,  geom.Hphys)
+    # face_trace is workspace; no host data to copy. Its values are
+    # overwritten on every `rhs3d!` call. We still allocate it on the
+    # device so the kernels can write into it directly.
     copyto!(hand,   geom.handedness)
     return MeshGeometry{T, N}(geom.Ne, conn_dev,
-                              coords, jac, invjac, detjac, Hphys, hand)
+                              coords, jac, invjac, detjac, Hphys, ft, hand)
 end
 
 # `MeshConnectivity` device migration — used both directly (when a
@@ -821,6 +845,7 @@ Adapt.adapt_structure(to, geom::MeshGeometry{T, N}) where {T, N} =
         Adapt.adapt(to, geom.invjac),
         Adapt.adapt(to, geom.detjac),
         Adapt.adapt(to, geom.Hphys),
+        Adapt.adapt(to, geom.face_trace),
         Adapt.adapt(to, geom.handedness))
 
 """

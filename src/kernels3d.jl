@@ -1,4 +1,3 @@
-# 3D kernel: curvilinear-aware SBP-SAT Laplacian on a `MeshGeometry`.
 #
 # Element shape enters only through the per-node Jacobian carried by the
 # `MeshGeometry`. The kernel applies the same machinery to axis-aligned
@@ -152,15 +151,31 @@ end
 # `a = 2`; the kernel multiplies by `cross_sign · face_sign` so the
 # resulting vector points outward from the element.
 
+# Per-kernel small-integer indexes are `Int32` throughout. NVIDIA GPUs
+# emulate `Int64` arithmetic as pairs of 32-bit ops (≈4× slower per
+# multiply on register-bound code), and Apple Silicon GPUs are
+# similarly 32-bit-native. The element index `e` is the one
+# intentional exception — meshes might (eventually) exceed 2³¹
+# elements. Everything else (workitem indices, loop bounds, face
+# axis bookkeeping) stays in Int32. The `Int32(...)` casts here are
+# compile-time constants and get folded by the compiler.
+#
+# `_face_axis_idx` and `_face_row` return `Int` (not `Int32`) because
+# their results are immediately used as `Val{…}` type parameters and
+# `Val{1}::Type` doesn't match `Val{Int32(1)}::Type`. The values
+# themselves are tiny (1–6, 1 or N), so the Int64-arithmetic cost on
+# downstream comparisons is negligible.
 @inline _face_axis_idx(::Val{f}) where {f} = (f + 1) ÷ 2
 @inline _face_row(::Val{f}, ::Val{N}) where {f, N} = isodd(f) ? 1 : N
 @inline _face_sign(::Val{f}, ::Type{T}) where {f, T} = isodd(f) ? -one(T) : one(T)
 @inline _cross_sign(::Val{a}, ::Type{T}) where {a, T} = a == 2 ? -one(T) : one(T)
-@inline _tangent_axes(::Val{1}) = (2, 3)
-@inline _tangent_axes(::Val{2}) = (1, 3)
-@inline _tangent_axes(::Val{3}) = (1, 2)
+@inline _tangent_axes(::Val{1}) = (Int32(2), Int32(3))
+@inline _tangent_axes(::Val{2}) = (Int32(1), Int32(3))
+@inline _tangent_axes(::Val{3}) = (Int32(1), Int32(2))
 
 # Volume index of face node `(p, q)` for face axis `a` and `face_row`.
+# Inputs are typed Int32, outputs are Int32 — keep the index-arithmetic
+# chain narrow.
 @inline _face_volume_idx(::Val{1}, face_row, p, q) = (face_row, p, q)
 @inline _face_volume_idx(::Val{2}, face_row, p, q) = (p, face_row, q)
 @inline _face_volume_idx(::Val{3}, face_row, p, q) = (p, q, face_row)
@@ -179,151 +194,223 @@ end
 
 # `_neigh_pq` is defined in `mesh.jl` (alongside `_compute_face_orientation`).
 
-################################################################################
-# Per-face SAT contribution
+# Decode workitem-local `(i, j, k) ∈ Int32(1):Int32(N)` from KA's
+# `@index(Local, Linear)`. Backends return `Int` (CPU) or `Int32`
+# (Metal/CUDA) — we narrow to `Int32` via `li % Int32` (a non-overflowing
+# truncating cast for any `li ≤ 2³¹`, which is always true since the
+# workgroup is at most `N³` workitems with `N ≤ 17` or so).
+#
+# Called fresh at the top of every post-`@synchronize` phase, because
+# locals don't survive a barrier on the CPU backend. The compiler
+# inlines this away.
+@inline function _ijk_from_li(li, ::Val{N}) where {N}
+    li0 = (li % Int32) - Int32(1)
+    n   = Int32(N)
+    i   = (li0 % n) + Int32(1)
+    j   = ((li0 ÷ n) % n) + Int32(1)
+    k   = (li0 ÷ (n * n)) + Int32(1)
+    return i, j, k
+end
 
-# Adds, for one face `f` of element `e`, the four SBP-SAT terms
-# (boundary lift, adjoint consistency, penalty, symmetric SIPG lift)
-# to `üe = H_phys · L u`. `Du` holds this element's reference gradients
-# already populated by the volume pass. Neighbour reference gradients
-# at the shared face are recomputed on the fly.
-@inline function _add_face_sat!(::Val{f}, üe::AbstractArray{T,3},
-                                 ue::AbstractArray{T,3},
-                                 u_global::AbstractArray{T,4},
-                                 Du,
-                                 e::Int,
-                                 geom::MeshGeometry{T, N},
-                                 conn::MeshConnectivity,
-                                 bdry_values::NTuple{6, T},
-                                 ops::SBPOps{N, T}, τ,
-                                 H_1d::SVector{N, T}) where {f, N, T}
-    a_idx   = _face_axis_idx(Val(f))
-    face_r  = _face_row(Val(f), Val(N))
-    sgn_f   = _face_sign(Val(f), T)
-    sgn_c   = _cross_sign(Val(a_idx), T)
-    # Element-wise outward sign: `sgn_face · ε_perm · sign(det J)`. The
-    # cyclic-permutation factor `sgn_c` is compile-time; the handedness
-    # is one Int8 per element, looked up once before the face-node loop.
-    # Together they replace the per-face-node `cross · col_a` dot-product
-    # test that the kernel used to perform inside the loop.
-    # Unchecked reads — keeping them out of an escaping boundscheck
-    # path matters for GPU code-gen (see comment in `_rhs3d_element!`).
-    @inbounds sgn_out = sgn_f * sgn_c * T(geom.handedness[e])
+################################################################################
+# Face-trace gather (pass 1) + per-face SAT (pass 2)
+#
+# The kernel is split into two launches that share an element-indexed
+# global staging buffer `geom.face_trace`. This converts the face-SAT's
+# scattered neighbour reads (`u_global[..., nbr]` repeated for every
+# face quadrature node and every stencil component) into a single
+# coalesced load of `4·N²` floats per face per element. The two
+# passes are:
+#
+#   Pass 1 (volume + trace): compute reference gradients `Du`,
+#     weak stiffness flux `W`, and write the volume divergence to
+#     `ü` (before mass division). Additionally, for each of the
+#     element's six faces, gather the trace data — the scalar field
+#     `u` and the **physical** gradient `∇u = J⁻ᵀ · Du` — into
+#     `face_trace[1:4, p, q, f, e]`. We store the physical gradient
+#     rather than the reference one so that pass 2 doesn't need to
+#     read the neighbour's `geom.invjac` to reconstruct it.
+#
+#   Pass 2 (face SAT + mass div): add the four face SAT terms to
+#     `ü`, reading self's data from `face_trace[..., self_face, e]`
+#     and the neighbour's from `face_trace[..., nbr_face, nbr]`.
+#     The only indirected read is the neighbour index per face — six
+#     pointer fetches per element — and the actual face data is
+#     contiguous in `face_trace`. Finally divide by `Hphys` per node.
+#
+# KA's command queue is FIFO per backend, so launching pass 2 after
+# pass 1 guarantees pass 2 sees the trace data pass 1 wrote, without
+# an explicit `synchronize`.
+
+# Pass 2 face-SAT helpers.
+#
+# Pass 2 is workgroup-per-element: each workgroup has N³ workitems
+# (one per collocation node) and shares a small `face_buf` in
+# `@localmem` for one face at a time. For each of the six faces we
+# run two phases separated by `@synchronize`:
+#
+#   1. *Compute* (`_face_sat_compute!`): only the N² workitems
+#      whose `(i, j, k)` lies on the face are active. Each one
+#      computes its face-node's SAT contributions and packs them into
+#      `face_buf[1..4, p_local, q_local]`:
+#         slot 1 — `bcorr = wF · (Gn_self − ½ ΔGn − τ Δu/h_F)`,
+#                  the boundary lift + adjoint + penalty correction;
+#         slot 2 — `μ_a · ν`, the weight for the "interior" SIPG lift
+#                  along the face's orthogonal axis `a`;
+#         slot 3 — `μ_axis_p · ν`, for the in-face lift along axis_p;
+#         slot 4 — `μ_axis_q · ν`, for the in-face lift along axis_q.
+#      Off-face workitems return without writing anything.
+#
+#   2. *Apply* (`_face_sat_apply!`): every workitem reads its
+#      contribution from `face_buf` and updates its own
+#      `üe_loc[i, j, k]`. The "interior" lift hits every workitem;
+#      the two "in-face" lifts and the `bcorr` only hit workitems
+#      that are themselves on the face (`ia == face_r`).
+#
+# The gather formulation eliminates all the scatter writes the old
+# one-workitem-per-element pass 2 used to do — the SIPG lift's
+# `üe[l, j, k] += G[i, l]·μ·ν` was a write race waiting to happen on
+# any parallelization across face nodes. Here each workitem only
+# writes `üe_loc[i, j, k]` (its own slot), so no atomics are needed.
+
+@inline function _face_sat_compute!(::Val{f}, face_buf,
+                                       i, j, k, e,
+                                       geom::MeshGeometry{T, N},
+                                       conn::MeshConnectivity,
+                                       ops::SBPOps{N, T}, τ::T,
+                                       bdry_values::NTuple{6, T},
+                                       H_1d::SVector{N, T},
+                                       ::Val{N}) where {f, T, N}
+    a_idx          = _face_axis_idx(Val(f))
+    face_r         = _face_row(Val(f), Val(N))
+    sgn_f          = _face_sign(Val(f), T)
+    sgn_c          = _cross_sign(Val(a_idx), T)
     axis_p, axis_q = _tangent_axes(Val(a_idx))
 
-    G   = ops.G
-    @inbounds nbr      = conn.neighbour[f, e]
-    @inbounds tag      = conn.bdry[f, e]
-    α   = nbr == 0 ? one(T) : one(T) / 2
+    # Is the workitem on this face? (i.e., its axis-a component == face_r)
+    ia = a_idx == 1 ? i : a_idx == 2 ? j : k
+    ia == face_r || return nothing
 
-    # Neighbour-side face index, axis, row, and (p, q) orientation.
-    # Pulled at runtime — different shared faces can pair self's face with
-    # any of the neighbour's six faces and with any of the eight D₄
-    # orientations.
-    @inbounds nbr_face = Int(conn.neighbour_face[f, e])
-    nbr_a    = (nbr_face + 1) ÷ 2
-    nbr_row  = isodd(nbr_face) ? 1 : N
-    @inbounds nbr_o    = conn.orientation[f, e]
+    # Face-local 2D coordinates extracted from the workitem's volume
+    # coordinates. By construction the workitem's `(i, j, k)` IS the
+    # face node's volume position.
+    p_local, q_local = a_idx == 1 ? (j, k) :
+                       a_idx == 2 ? (i, k) :
+                                    (i, j)
 
-    @inbounds for q in 1:N, p in 1:N
-        i, j, k = _face_volume_idx(Val(a_idx), face_r, p, q)
+    # Self J at this workitem's position (= the face node).
+    @inbounds J11 = geom.jac[1,1,i,j,k,e]; @inbounds J12 = geom.jac[1,2,i,j,k,e]; @inbounds J13 = geom.jac[1,3,i,j,k,e]
+    @inbounds J21 = geom.jac[2,1,i,j,k,e]; @inbounds J22 = geom.jac[2,2,i,j,k,e]; @inbounds J23 = geom.jac[2,3,i,j,k,e]
+    @inbounds J31 = geom.jac[3,1,i,j,k,e]; @inbounds J32 = geom.jac[3,2,i,j,k,e]; @inbounds J33 = geom.jac[3,3,i,j,k,e]
 
-        # Self-side J at this face node.
-        J11 = geom.jac[1,1,i,j,k,e]; J12 = geom.jac[1,2,i,j,k,e]; J13 = geom.jac[1,3,i,j,k,e]
-        J21 = geom.jac[2,1,i,j,k,e]; J22 = geom.jac[2,2,i,j,k,e]; J23 = geom.jac[2,3,i,j,k,e]
-        J31 = geom.jac[3,1,i,j,k,e]; J32 = geom.jac[3,2,i,j,k,e]; J33 = geom.jac[3,3,i,j,k,e]
+    tp_x = axis_p == 1 ? J11 : axis_p == 2 ? J12 : J13
+    tp_y = axis_p == 1 ? J21 : axis_p == 2 ? J22 : J23
+    tp_z = axis_p == 1 ? J31 : axis_p == 2 ? J32 : J33
+    tq_x = axis_q == 1 ? J11 : axis_q == 2 ? J12 : J13
+    tq_y = axis_q == 1 ? J21 : axis_q == 2 ? J22 : J23
+    tq_z = axis_q == 1 ? J31 : axis_q == 2 ? J32 : J33
 
-        # Tangent vectors (columns axis_p and axis_q of J).
-        tp_x = axis_p == 1 ? J11 : axis_p == 2 ? J12 : J13
-        tp_y = axis_p == 1 ? J21 : axis_p == 2 ? J22 : J23
-        tp_z = axis_p == 1 ? J31 : axis_p == 2 ? J32 : J33
-        tq_x = axis_q == 1 ? J11 : axis_q == 2 ? J12 : J13
-        tq_y = axis_q == 1 ? J21 : axis_q == 2 ? J22 : J23
-        tq_z = axis_q == 1 ? J31 : axis_q == 2 ? J32 : J33
+    @inbounds sgn_out = sgn_f * sgn_c * T(geom.handedness[e])
 
-        # Outward (un-normalised) face normal. `sgn_out` was computed
-        # once before the loop from `sgn_face · sgn_cyclic · handedness[e]`
-        # — uniform across the face, no per-node branch.
-        nx_u = sgn_out * (tp_y * tq_z - tp_z * tq_y)
-        ny_u = sgn_out * (tp_z * tq_x - tp_x * tq_z)
-        nz_u = sgn_out * (tp_x * tq_y - tp_y * tq_x)
+    nx_u = sgn_out * (tp_y * tq_z - tp_z * tq_y)
+    ny_u = sgn_out * (tp_z * tq_x - tp_x * tq_z)
+    nz_u = sgn_out * (tp_x * tq_y - tp_y * tq_x)
+    JF = sqrt(nx_u*nx_u + ny_u*ny_u + nz_u*nz_u)
+    nx = nx_u / JF; ny = ny_u / JF; nz = nz_u / JF
+    hF = sqrt(JF)
 
-        JF = sqrt(nx_u*nx_u + ny_u*ny_u + nz_u*nz_u)
-        nx = nx_u / JF; ny = ny_u / JF; nz = nz_u / JF
-        # SIPG penalty needs an extra `1/h_F` (the local face mesh size).
-        # `sqrt(|J_F|)` reduces to the element edge length on axis-aligned
-        # cubes and is the natural per-face-node size on curvilinear elements.
-        hF = sqrt(JF)
+    @inbounds Ji11 = geom.invjac[1,1,i,j,k,e]; @inbounds Ji12 = geom.invjac[1,2,i,j,k,e]; @inbounds Ji13 = geom.invjac[1,3,i,j,k,e]
+    @inbounds Ji21 = geom.invjac[2,1,i,j,k,e]; @inbounds Ji22 = geom.invjac[2,2,i,j,k,e]; @inbounds Ji23 = geom.invjac[2,3,i,j,k,e]
+    @inbounds Ji31 = geom.invjac[3,1,i,j,k,e]; @inbounds Ji32 = geom.invjac[3,2,i,j,k,e]; @inbounds Ji33 = geom.invjac[3,3,i,j,k,e]
+    μ1 = Ji11*nx + Ji12*ny + Ji13*nz
+    μ2 = Ji21*nx + Ji22*ny + Ji23*nz
+    μ3 = Ji31*nx + Ji32*ny + Ji33*nz
 
-        # Self-side J⁻¹ and μ = J⁻¹ · n_phys.
-        Ji11 = geom.invjac[1,1,i,j,k,e]; Ji12 = geom.invjac[1,2,i,j,k,e]; Ji13 = geom.invjac[1,3,i,j,k,e]
-        Ji21 = geom.invjac[2,1,i,j,k,e]; Ji22 = geom.invjac[2,2,i,j,k,e]; Ji23 = geom.invjac[2,3,i,j,k,e]
-        Ji31 = geom.invjac[3,1,i,j,k,e]; Ji32 = geom.invjac[3,2,i,j,k,e]; Ji33 = geom.invjac[3,3,i,j,k,e]
-        μ1 = Ji11*nx + Ji12*ny + Ji13*nz
-        μ2 = Ji21*nx + Ji22*ny + Ji23*nz
-        μ3 = Ji31*nx + Ji32*ny + Ji33*nz
+    @inbounds wF = JF * H_1d[p_local] * H_1d[q_local]
 
-        wF = JF * H_1d[p] * H_1d[q]
+    @inbounds u_self  = geom.face_trace[1, p_local, q_local, f, e]
+    @inbounds gx_self = geom.face_trace[2, p_local, q_local, f, e]
+    @inbounds gy_self = geom.face_trace[3, p_local, q_local, f, e]
+    @inbounds gz_self = geom.face_trace[4, p_local, q_local, f, e]
+    Gn_self = nx * gx_self + ny * gy_self + nz * gz_self
 
-        # Self-side u and physical normal gradient.
-        u_self  = ue[i, j, k]
-        d1s = Du[1, i, j, k]; d2s = Du[2, i, j, k]; d3s = Du[3, i, j, k]
-        Gn_self = μ1*d1s + μ2*d2s + μ3*d3s
+    @inbounds nbr = conn.neighbour[f, e]
+    @inbounds tag = conn.bdry[f, e]
+    α = nbr == 0 ? one(T) : one(T) / 2
 
-        # Neighbour-side or boundary.
-        u_neigh::T  = zero(T)
-        Gn_neigh::T = zero(T)
-        if nbr == 0
-            u_neigh  = bdry_values[tag]
-            Gn_neigh = Gn_self                  # mirror gradient ⇒ ΔGn = 0
-        else
-            # Map self's face-local (p, q) → neighbour's, then index into
-            # the neighbour's volume using its own face axis & row.
-            pn, qn = _neigh_pq(nbr_o, p, q, N)
-            in_, jn_, kn_ = _face_volume_idx(nbr_a, nbr_row, pn, qn)
-            u_neigh = u_global[in_, jn_, kn_, nbr]
-
-            d1n = zero(T); d2n = zero(T); d3n = zero(T)
-            for l in 1:N
-                d1n += G[in_, l] * u_global[l,   jn_, kn_, nbr]
-                d2n += G[jn_, l] * u_global[in_, l,   kn_, nbr]
-                d3n += G[kn_, l] * u_global[in_, jn_, l,   nbr]
-            end
-
-            Jin11 = geom.invjac[1,1,in_,jn_,kn_,nbr]; Jin12 = geom.invjac[1,2,in_,jn_,kn_,nbr]; Jin13 = geom.invjac[1,3,in_,jn_,kn_,nbr]
-            Jin21 = geom.invjac[2,1,in_,jn_,kn_,nbr]; Jin22 = geom.invjac[2,2,in_,jn_,kn_,nbr]; Jin23 = geom.invjac[2,3,in_,jn_,kn_,nbr]
-            Jin31 = geom.invjac[3,1,in_,jn_,kn_,nbr]; Jin32 = geom.invjac[3,2,in_,jn_,kn_,nbr]; Jin33 = geom.invjac[3,3,in_,jn_,kn_,nbr]
-            μn1 = Jin11*nx + Jin12*ny + Jin13*nz
-            μn2 = Jin21*nx + Jin22*ny + Jin23*nz
-            μn3 = Jin31*nx + Jin32*ny + Jin33*nz
-            Gn_neigh = μn1*d1n + μn2*d2n + μn3*d3n
-        end
-
-        Δu  = u_self  - u_neigh
-        ΔGn = Gn_self - Gn_neigh
-
-        # Boundary lift (restores strong form at face node).
-        üe[i, j, k] += wF * Gn_self
-
-        # Adjoint consistency at face node.
-        üe[i, j, k] -= (T(1)/2) * wF * ΔGn
-
-        # Penalty at face node (σ/h_F · w_F · Δu).
-        üe[i, j, k] -= τ * wF * Δu / hF
-
-        # Symmetric SIPG lift via Gᵀ_c · μ_c (three reference-axis lifts).
-        ν = α * wF * Δu
-        for l in 1:N
-            üe[l, j, k] += G[i, l] * μ1 * ν
-        end
-        for l in 1:N
-            üe[i, l, k] += G[j, l] * μ2 * ν
-        end
-        for l in 1:N
-            üe[i, j, l] += G[k, l] * μ3 * ν
-        end
+    u_neigh::T  = zero(T)
+    Gn_neigh::T = zero(T)
+    if nbr == 0
+        @inbounds u_neigh = bdry_values[tag]        # NTuple index — needs @inbounds too
+        Gn_neigh = Gn_self                          # mirror, so ΔGn = 0
+    else
+        @inbounds nbr_face = Int32(conn.neighbour_face[f, e])
+        @inbounds nbr_o    = conn.orientation[f, e]
+        pn, qn = _neigh_pq(nbr_o, p_local, q_local, Int32(N))
+        @inbounds u_neigh = geom.face_trace[1, pn, qn, nbr_face, nbr]
+        @inbounds gx_n    = geom.face_trace[2, pn, qn, nbr_face, nbr]
+        @inbounds gy_n    = geom.face_trace[3, pn, qn, nbr_face, nbr]
+        @inbounds gz_n    = geom.face_trace[4, pn, qn, nbr_face, nbr]
+        Gn_neigh = nx * gx_n + ny * gy_n + nz * gz_n
     end
-    return üe
+
+    Δu  = u_self  - u_neigh
+    ΔGn = Gn_self - Gn_neigh
+    ν   = α * wF * Δu
+
+    # Pick the right μ component for each lift axis.
+    μa = a_idx  == 1 ? μ1 : a_idx  == 2 ? μ2 : μ3
+    μp = axis_p == 1 ? μ1 : axis_p == 2 ? μ2 : μ3
+    μq = axis_q == 1 ? μ1 : axis_q == 2 ? μ2 : μ3
+
+    bcorr = wF * (Gn_self - (T(1)/2) * ΔGn - τ * Δu / hF)
+
+    @inbounds face_buf[1, p_local, q_local] = bcorr
+    @inbounds face_buf[2, p_local, q_local] = μa * ν
+    @inbounds face_buf[3, p_local, q_local] = μp * ν
+    @inbounds face_buf[4, p_local, q_local] = μq * ν
+    return nothing
+end
+
+@inline function _face_sat_apply!(::Val{f}, üe_loc, face_buf,
+                                     i, j, k,
+                                     ops::SBPOps{N, T},
+                                     ::Val{N}) where {f, T, N}
+    a_idx  = _face_axis_idx(Val(f))
+    face_r = _face_row(Val(f), Val(N))
+
+    # The destination's projection onto the face axes. `ia` is the
+    # workitem's axis-a coordinate (matched against `face_r` for the
+    # "in-face" lifts and bcorr). `p_local`, `q_local` extract the
+    # workitem's face-plane coordinates (which feed the interior-
+    # lift's gather of `face_buf[2, p_local, q_local]`).
+    ia = a_idx == 1 ? i : a_idx == 2 ? j : k
+    p_local, q_local = a_idx == 1 ? (j, k) :
+                       a_idx == 2 ? (i, k) :
+                                    (i, j)
+
+    # Interior lift along axis `a`: spreads `μ_a · ν` of each face
+    # node out to a 1-D line through the volume in the axis-a
+    # direction. Every workitem receives a contribution; the weight
+    # `G[face_r, ia]` selects the workitem's position on that line.
+    @inbounds üe_loc[i, j, k] += ops.G[face_r, ia] * face_buf[2, p_local, q_local]
+
+    # In-face lifts + boundary correction — only fire for workitems
+    # actually on the face. The two gather sums replace the original
+    # scatter writes `üe[i, l, k] += G[j, l]·μ·ν` (which would race
+    # across face workitems on a workgroup-per-element layout).
+    if ia == face_r
+        s_p = zero(T)
+        s_q = zero(T)
+        @inbounds for p in Int32(1):Int32(N)
+            s_p += ops.G[p, p_local] * face_buf[3, p, q_local]
+        end
+        @inbounds for q in Int32(1):Int32(N)
+            s_q += ops.G[q, q_local] * face_buf[4, p_local, q]
+        end
+        @inbounds üe_loc[i, j, k] += s_p + s_q + face_buf[1, p_local, q_local]
+    end
+    return nothing
 end
 
 ################################################################################
@@ -374,121 +461,275 @@ function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArra
                   geom, ops, τ = params.τ)
 end
 
-# Per-element compute: the five-step SBP-SAT body for a single element
-# `e`. Called from the `_rhs3d_kernel!` KA kernel — one source of truth
-# for the kernel math, dispatched once per element. The scratch arrays
-# `Du` and `W` are workitem-local `MArray`s, sized `(3, N, N, N)` ≈ 192
-# floats each at N=4. On both CPU and GPU the compiler escape-promotes
-# them to stack/registers as long as every array access inside the body
-# is `@inbounds`-guarded — `Base.view` and any non-`@inbounds` scalar
-# index would otherwise drag the MArray onto the boundscheck slow path
-# and prevent promotion. See JuliaLang/julia#39308 and the `aview`
-# comment in KA's `src/cpu.jl`.
+# ---------- Kernel 1: face-trace gather ------------------------------
 #
-# We allocate the MArrays directly rather than via `KA.@private` because
-# the CPU `@private` lowering builds one workgroup-wide MArray of shape
-# `(Dims..., workgroupsize)` (so 192·64 = 12 288 floats at our settings)
-# — too large to stack-promote, which forces a per-call heap allocation
-# we don't need. Allocating a per-workitem MArray here is equivalent on
-# GPU and substantially cheaper on CPU.
-@inline function _rhs3d_element!(ü::AbstractArray{T, 4}, u::AbstractArray{T, 4},
-                                  e::Int,
-                                  geom::MeshGeometry{T, N},
-                                  ops::SBPOps{N, T}, τ::T,
-                                  bdry_values::NTuple{6, T},
-                                  H_1d::SVector{N, T},
-                                  ::Val{N}) where {T, N}
-    G  = ops.G
+# Reads `u` and writes `geom.face_trace[1..4, p, q, f, e]`, the four
+# scalars `(u, ∂x u, ∂y u, ∂z u)` at each face quadrature node of
+# every element. This is the only data each element needs to ship to
+# its neighbours.
+#
+# Workgroup-per-element, N³ workitems/workgroup, one per node. The
+# workgroup loads `u` into `@localmem u_loc` so the SBP stencils that
+# compute `∇_ref u` at the face nodes can read across workitems.
+# Each workitem then checks the six boundary conditions on its
+# `(i, j, k)`; for every face it lies on, it computes
+# `∇u_phys = J⁻ᵀ · ∇_ref u` and writes one entry of `face_trace`. A
+# corner workitem (on three faces) writes three entries; interior
+# workitems (off every face) compute nothing — at N=4 that's the
+# central 2×2×2 = 8 of the 64 workitems.
+#
+# We deliberately *do not* compute the volume divergence here: kernel
+# 2 below recomputes the gradient from the same `u`. The redundancy
+# (one extra global-memory `u` load + one extra stencil per element)
+# is small relative to the work saved by not having to round-trip
+# `Du_loc` or `ü_pre` through global memory between kernels.
+#
+# `ndrange = N³·Ne`, `workgroupsize = N³`.
+@kernel function _rhs3d_face_trace_kernel!(@Const(u::AbstractArray{T}),
+                                            geom, ops, ::Val{N}) where {T, N}
+    e        = @index(Group, Linear)
+    li       = @index(Local, Linear)
+    i, j, k  = _ijk_from_li(li, Val(N))
 
-    Du = MArray{Tuple{3, N, N, N}, T}(undef)
-    W  = MArray{Tuple{3, N, N, N}, T}(undef)
+    u_loc = @localmem T (N, N, N)
 
-    @inbounds ue = @view u[:, :, :, e]
-    @inbounds üe = @view ü[:, :, :, e]
+    # Load u into shared.
+    @inbounds u_loc[i, j, k] = u[i, j, k, e]
+    @synchronize
 
-    @inbounds begin
-        # 1. Reference-axis gradients.
-        for k in 1:N, j in 1:N, i in 1:N
+    # Re-derive indices after the barrier (KA CPU semantics).
+    e        = @index(Group, Linear)
+    li       = @index(Local, Linear)
+    i, j, k  = _ijk_from_li(li, Val(N))
+
+    # Skip workitems not on any face — saves the gradient compute for
+    # interior nodes (at N=4 that's 8 of the 64 workitems; at N=8 it
+    # would be ~75% — more meaningful savings).
+    on_face = (i == 1) | (i == N) | (j == 1) | (j == N) | (k == 1) | (k == N)
+    if on_face
+        @inbounds begin
+            # Reference gradient at this workitem's own collocation
+            # point. The same value will be written to each face_trace
+            # slot the workitem is responsible for.
             s1 = zero(T); s2 = zero(T); s3 = zero(T)
-            for l in 1:N
-                s1 += G[i, l] * ue[l, j, k]
-                s2 += G[j, l] * ue[i, l, k]
-                s3 += G[k, l] * ue[i, j, l]
+            for l in Int32(1):Int32(N)
+                s1 += ops.G[i, l] * u_loc[l, j, k]
+                s2 += ops.G[j, l] * u_loc[i, l, k]
+                s3 += ops.G[k, l] * u_loc[i, j, l]
             end
-            Du[1, i, j, k] = s1
-            Du[2, i, j, k] = s2
-            Du[3, i, j, k] = s3
-        end
 
-        # 2. Weak stiffness flux.
-        for k in 1:N, j in 1:N, i in 1:N
+            # Physical gradient `∇u_phys = J⁻ᵀ · ∇_ref u`.
             Ji11 = geom.invjac[1,1,i,j,k,e]; Ji12 = geom.invjac[1,2,i,j,k,e]; Ji13 = geom.invjac[1,3,i,j,k,e]
             Ji21 = geom.invjac[2,1,i,j,k,e]; Ji22 = geom.invjac[2,2,i,j,k,e]; Ji23 = geom.invjac[2,3,i,j,k,e]
             Ji31 = geom.invjac[3,1,i,j,k,e]; Ji32 = geom.invjac[3,2,i,j,k,e]; Ji33 = geom.invjac[3,3,i,j,k,e]
-            dJ = geom.detjac[i, j, k, e]
-            wt = H_1d[i] * H_1d[j] * H_1d[k] * dJ
+            gx = Ji11*s1 + Ji21*s2 + Ji31*s3
+            gy = Ji12*s1 + Ji22*s2 + Ji32*s3
+            gz = Ji13*s1 + Ji23*s2 + Ji33*s3
+            u_val = u_loc[i, j, k]
 
-            g11 = Ji11*Ji11 + Ji12*Ji12 + Ji13*Ji13
-            g12 = Ji11*Ji21 + Ji12*Ji22 + Ji13*Ji23
-            g13 = Ji11*Ji31 + Ji12*Ji32 + Ji13*Ji33
-            g22 = Ji21*Ji21 + Ji22*Ji22 + Ji23*Ji23
-            g23 = Ji21*Ji31 + Ji22*Ji32 + Ji23*Ji33
-            g33 = Ji31*Ji31 + Ji32*Ji32 + Ji33*Ji33
-
-            d1 = Du[1, i, j, k]; d2 = Du[2, i, j, k]; d3 = Du[3, i, j, k]
-            W[1, i, j, k] = wt * (g11*d1 + g12*d2 + g13*d3)
-            W[2, i, j, k] = wt * (g12*d1 + g22*d2 + g23*d3)
-            W[3, i, j, k] = wt * (g13*d1 + g23*d2 + g33*d3)
-        end
-
-        # 3. Volume divergence: H_phys · L u = -Σ_a Gᵀ_a W_a.
-        for k in 1:N, j in 1:N, i in 1:N
-            s = zero(T)
-            for l in 1:N
-                s += G[l, i] * W[1, l, j, k]
-                s += G[l, j] * W[2, i, l, k]
-                s += G[l, k] * W[3, i, j, l]
+            # Write trace entry for every face this workitem is on.
+            # `(p_local, q_local)` follows the per-face axis convention
+            # documented in the "Face axis bookkeeping" block above.
+            if i == 1
+                geom.face_trace[1, j, k, 1, e] = u_val
+                geom.face_trace[2, j, k, 1, e] = gx
+                geom.face_trace[3, j, k, 1, e] = gy
+                geom.face_trace[4, j, k, 1, e] = gz
             end
-            üe[i, j, k] = -s
-        end
-
-        # 4. Per-face SBP-SAT contributions.
-        conn = geom.conn
-        _add_face_sat!(Val(1), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
-        _add_face_sat!(Val(2), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
-        _add_face_sat!(Val(3), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
-        _add_face_sat!(Val(4), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
-        _add_face_sat!(Val(5), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
-        _add_face_sat!(Val(6), üe, ue, u, Du, e, geom, conn, bdry_values, ops, τ, H_1d)
-
-        # 5. Divide by H_phys per node.
-        for k in 1:N, j in 1:N, i in 1:N
-            Hp = H_1d[i] * H_1d[j] * H_1d[k] * geom.detjac[i, j, k, e]
-            üe[i, j, k] /= Hp
+            if i == N
+                geom.face_trace[1, j, k, 2, e] = u_val
+                geom.face_trace[2, j, k, 2, e] = gx
+                geom.face_trace[3, j, k, 2, e] = gy
+                geom.face_trace[4, j, k, 2, e] = gz
+            end
+            if j == 1
+                geom.face_trace[1, i, k, 3, e] = u_val
+                geom.face_trace[2, i, k, 3, e] = gx
+                geom.face_trace[3, i, k, 3, e] = gy
+                geom.face_trace[4, i, k, 3, e] = gz
+            end
+            if j == N
+                geom.face_trace[1, i, k, 4, e] = u_val
+                geom.face_trace[2, i, k, 4, e] = gx
+                geom.face_trace[3, i, k, 4, e] = gy
+                geom.face_trace[4, i, k, 4, e] = gz
+            end
+            if k == 1
+                geom.face_trace[1, i, j, 5, e] = u_val
+                geom.face_trace[2, i, j, 5, e] = gx
+                geom.face_trace[3, i, j, 5, e] = gy
+                geom.face_trace[4, i, j, 5, e] = gz
+            end
+            if k == N
+                geom.face_trace[1, i, j, 6, e] = u_val
+                geom.face_trace[2, i, j, 6, e] = gx
+                geom.face_trace[3, i, j, 6, e] = gy
+                geom.face_trace[4, i, j, 6, e] = gz
+            end
         end
     end
-    return nothing
 end
 
-# KernelAbstractions wrapper: each workitem processes one element.
-# One code path for every backend (CPU, CUDA, AMDGPU, Metal). The
-# kernel is intentionally trivial — `_rhs3d_element!` holds the math
-# and allocates its own per-workitem `MArray` scratch.
-@kernel function _rhs3d_kernel!(ü::AbstractArray{T},
-                                 @Const(u::AbstractArray{T}),
-                                 geom, ops, τ::T,
-                                 bdry_values, H_1d,
-                                 ::Val{N}) where {T, N}
-    e = @index(Global, Linear)
-    _rhs3d_element!(ü, u, e, geom, ops, τ, bdry_values, H_1d, Val(N))
-end
+# ---------- Kernel 2: volume work + face SAT + mass division --------
+#
+# Reads `u` (again) and `geom.face_trace` (written by kernel 1) and
+# computes the full right-hand side `ü`. The phases inside the
+# workgroup are:
+#
+#   1. Load u → u_loc. @synchronize.
+#   2. Compute reference gradients (registers) + weak stiffness flux
+#      W_loc (shared) at each node. @synchronize.
+#   3. Volume divergence `−Σ_a Gᵀ_a W_a` → üe_loc (shared, pre-mass-
+#      div). No barrier needed before face SAT because the divergence
+#      writes only `üe_loc[i, j, k]` (the workitem's own slot) and
+#      face SAT only reads it from the same slot.
+#   4. Six face SAT phases. For each face:
+#        a. `_face_sat_compute!` — on-face workitems pack the four
+#           SAT scalars (`bcorr`, `μ_a·ν`, `μ_axis_p·ν`,
+#           `μ_axis_q·ν`) into `face_buf`. Off-face workitems return.
+#        @synchronize so all workitems see the freshly-written
+#        `face_buf`.
+#        b. `_face_sat_apply!` — every workitem adds its share to
+#           `üe_loc[i, j, k]`. The "interior" lift hits everyone; the
+#           in-face lifts + boundary correction only fire when the
+#           workitem itself is on the face.
+#        @synchronize so `face_buf` is safe to overwrite for the
+#        next face.
+#   5. Mass division + writeback. Each workitem divides its own
+#      `üe_loc[i, j, k]` by `Hphys` and writes the result to `ü`.
+#
+# 12 barriers total inside the face SAT (2 per face), plus the 2
+# inside the volume phase. Each barrier is ~ns on CUDA/Metal so the
+# absolute cost is negligible at production scale.
+@kernel function _rhs3d_volume_kernel!(ü::AbstractArray{T},
+                                        @Const(u::AbstractArray{T}),
+                                        geom, ops, τ::T,
+                                        bdry_values, H_1d,
+                                        ::Val{N}) where {T, N}
+    e        = @index(Group, Linear)
+    li       = @index(Local, Linear)
+    i, j, k  = _ijk_from_li(li, Val(N))
 
-# Workgroup size for the per-element kernel. Small enough that on the
-# CPU backend the per-launch `Threads.@threads :static` chunking gets
-# multiple workgroups (so all threads see work even on small meshes);
-# large enough that on GPU backends it matches a warp/wavefront. 64 is
-# the sweet spot we measured on CPU and is conventional on CUDA/Metal.
-const _RHS3D_WORKGROUPSIZE = 64
+    # Workgroup-local scratch.
+    u_loc    = @localmem T (N, N, N)         # field values
+    W_loc    = @localmem T (3, N, N, N)      # weak stiffness flux
+    üe_loc   = @localmem T (N, N, N)         # accumulating L·u (pre-mass-div)
+    face_buf = @localmem T (4, N, N)         # per-face SAT scratch, reused
+
+    # Load u into shared.
+    @inbounds u_loc[i, j, k] = u[i, j, k, e]
+    @synchronize
+
+    # ---- Volume work: gradient → flux → divergence into üe_loc ----
+    e       = @index(Group, Linear)
+    li      = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+
+    s1 = zero(T); s2 = zero(T); s3 = zero(T)
+    @inbounds for l in Int32(1):Int32(N)
+        s1 += ops.G[i, l] * u_loc[l, j, k]
+        s2 += ops.G[j, l] * u_loc[i, l, k]
+        s3 += ops.G[k, l] * u_loc[i, j, l]
+    end
+
+    # Step 2: weak stiffness flux (per-node, no cross-workitem reads).
+    @inbounds begin
+        Ji11 = geom.invjac[1,1,i,j,k,e]; Ji12 = geom.invjac[1,2,i,j,k,e]; Ji13 = geom.invjac[1,3,i,j,k,e]
+        Ji21 = geom.invjac[2,1,i,j,k,e]; Ji22 = geom.invjac[2,2,i,j,k,e]; Ji23 = geom.invjac[2,3,i,j,k,e]
+        Ji31 = geom.invjac[3,1,i,j,k,e]; Ji32 = geom.invjac[3,2,i,j,k,e]; Ji33 = geom.invjac[3,3,i,j,k,e]
+        wt   = geom.Hphys[i, j, k, e]
+
+        g11 = Ji11*Ji11 + Ji12*Ji12 + Ji13*Ji13
+        g12 = Ji11*Ji21 + Ji12*Ji22 + Ji13*Ji23
+        g13 = Ji11*Ji31 + Ji12*Ji32 + Ji13*Ji33
+        g22 = Ji21*Ji21 + Ji22*Ji22 + Ji23*Ji23
+        g23 = Ji21*Ji31 + Ji22*Ji32 + Ji23*Ji33
+        g33 = Ji31*Ji31 + Ji32*Ji32 + Ji33*Ji33
+
+        W_loc[1, i, j, k] = wt * (g11*s1 + g12*s2 + g13*s3)
+        W_loc[2, i, j, k] = wt * (g12*s1 + g22*s2 + g23*s3)
+        W_loc[3, i, j, k] = wt * (g13*s1 + g23*s2 + g33*s3)
+    end
+    @synchronize
+
+    # Step 3: volume divergence → üe_loc (kept in shared throughout).
+    e       = @index(Group, Linear)
+    li      = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    s = zero(T)
+    @inbounds for l in Int32(1):Int32(N)
+        s += ops.G[l, i] * W_loc[1, l, j, k]
+        s += ops.G[l, j] * W_loc[2, i, l, k]
+        s += ops.G[l, k] * W_loc[3, i, j, l]
+    end
+    @inbounds üe_loc[i, j, k] = -s
+
+    # ---- Face SAT: 6 faces, each compute + apply, with barriers ----
+
+    # Face 1: compute, sync, apply, sync.
+    _face_sat_compute!(Val(1), face_buf, i, j, k, e, geom, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    @synchronize
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_apply!(Val(1), üe_loc, face_buf, i, j, k, ops, Val(N))
+    @synchronize
+
+    # Face 2.
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_compute!(Val(2), face_buf, i, j, k, e, geom, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    @synchronize
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_apply!(Val(2), üe_loc, face_buf, i, j, k, ops, Val(N))
+    @synchronize
+
+    # Face 3.
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_compute!(Val(3), face_buf, i, j, k, e, geom, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    @synchronize
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_apply!(Val(3), üe_loc, face_buf, i, j, k, ops, Val(N))
+    @synchronize
+
+    # Face 4.
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_compute!(Val(4), face_buf, i, j, k, e, geom, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    @synchronize
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_apply!(Val(4), üe_loc, face_buf, i, j, k, ops, Val(N))
+    @synchronize
+
+    # Face 5.
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_compute!(Val(5), face_buf, i, j, k, e, geom, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    @synchronize
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_apply!(Val(5), üe_loc, face_buf, i, j, k, ops, Val(N))
+    @synchronize
+
+    # Face 6.
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_compute!(Val(6), face_buf, i, j, k, e, geom, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    @synchronize
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    _face_sat_apply!(Val(6), üe_loc, face_buf, i, j, k, ops, Val(N))
+    @synchronize
+
+    # ---- Mass division + global writeback ----
+    e       = @index(Group, Linear); li = @index(Local, Linear)
+    i, j, k = _ijk_from_li(li, Val(N))
+    @inbounds üe_loc[i, j, k] /= geom.Hphys[i, j, k, e]
+    @inbounds ü[i, j, k, e] = üe_loc[i, j, k]
+end
 
 function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
                 bdry_values::NTuple{6, T};
@@ -500,21 +741,18 @@ function rhs3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArra
     H_1d = SVector{N, T}(ntuple(i -> ops.H[i, i], Val(N)))
     backend = get_backend(u)
 
-    _rhs3d_kernel!(backend, _RHS3D_WORKGROUPSIZE)(
-        ü, u,
-        geom, ops, T(τ), bdry_values, H_1d, Val(N);
-        ndrange = geom.Ne)
-    # Intentionally not `synchronize(backend)`. KA's queues are async-
-    # by-default and successive operations on the same array honour
-    # ordering automatically — the integrator's per-stage broadcasts
-    # all chain correctly behind this kernel without a host-side
-    # wait. A forced sync here would commit the Metal command buffer
-    # after every RHS call and turn an O(launches-per-sample) cost
-    # into an O(launches-per-stage) cost, which dominates wall time
-    # for small problems where each kernel invocation is short. The
-    # host-visible sync points (`copyto!` to a host array, `Array(…)`,
-    # reductions like `discrete_l2_norm`) each drain the queue at
-    # their natural call site.
+    # Two-launch design. Kernel 1 only reads `u` and writes
+    # `geom.face_trace`. Kernel 2 reads `u` again *and*
+    # `geom.face_trace`, then writes `ü`. KA's per-backend command
+    # queue is FIFO, so kernel 2 sees kernel 1's writes without an
+    # explicit `synchronize`. Both kernels use the same workgroup-
+    # per-element layout (N³ workitems/workgroup, one per node).
+    _rhs3d_face_trace_kernel!(backend, N^3)(
+        u, geom, ops, Val(N);
+        ndrange = N^3 * geom.Ne)
+    _rhs3d_volume_kernel!(backend, N^3)(
+        ü, u, geom, ops, T(τ), bdry_values, H_1d, Val(N);
+        ndrange = N^3 * geom.Ne)
 
     return ü
 end
