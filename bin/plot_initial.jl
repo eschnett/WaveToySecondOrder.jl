@@ -1,9 +1,11 @@
 using CairoMakie
+using HexMeshes
 using SixelTerm
 using StaticArrays
 using WaveToySecondOrder
 
 const W = WaveToySecondOrder
+const H = HexMeshes
 
 # Mesh choice mirrors `waveplot3d.jl`.
 mesh_kind = :cubed_cube      # :cubical | :cubed_cube
@@ -16,10 +18,10 @@ elem = W.make_element(Float64, N)
 
 if mesh_kind === :cubical
     x0, x1 = 0.0, 1.0
-    mesh = W.make_cubical_mesh(Float64, M, x0, x1)
+    mesh = H.make_cubical_mesh(Float64, M, x0, x1)
 elseif mesh_kind === :cubed_cube
     x0, x1 = -1.0, 1.0
-    mesh = W.make_cubed_cube_mesh(Float64, M, R)
+    mesh = H.make_cubed_cube_mesh(Float64, M, R)
 else
     error("unknown mesh_kind: $mesh_kind")
 end
@@ -51,12 +53,12 @@ Ng = 120
 xs = range(x0, x1; length = Ng)
 ys = range(x0, x1; length = Ng)
 pts_xy = [SVector(x, y, xmid) for x in xs, y in ys]
-u_xy = W.interpolate_field(mesh, elem, u, pts_xy)
+u_xy = H.interpolate_field(mesh, elem.xs, u, pts_xy)
 
 # (x, z) plane at y = xmid -------------------------------------------------
 zs = range(x0, x1; length = Ng)
 pts_xz = [SVector(x, xmid, z) for x in xs, z in zs]
-u_xz = W.interpolate_field(mesh, elem, u, pts_xz)
+u_xz = H.interpolate_field(mesh, elem.xs, u, pts_xz)
 
 # Figure -------------------------------------------------------------------
 fig = Figure(; size = (1000, 500))

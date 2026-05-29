@@ -78,8 +78,13 @@ function main(; T::Type = Float64,
                 R2::Real = 1.0,    # inflated_cube: outer-sphere radius
                 ic_wavenumber::Real = 3π,            # :cartesian IC: kx = ky = kz
                 ic_radial_mode::Int  = 1,            # :radial IC: radial node index n ≥ 1
-                ic_radius::Union{Nothing, Real} = nothing)  # :radial IC: sphere radius
+                ic_radius::Union{Nothing, Real} = nothing,  # :radial IC: sphere radius
                                                             # (defaults to half the bounding-box side)
+                ic_pulse_offset::Union{Nothing, Real} = nothing,  # :outgoing IC: initial peak radius
+                                                                  # (default: ¼ of the bounding-box side)
+                ic_pulse_width::Union{Nothing, Real} = nothing,   # :outgoing IC: Gaussian width
+                                                                  # (default: ic_pulse_offset / 5)
+                outer_bc::Symbol = :dirichlet)       # :dirichlet | :sommerfeld — :inflated_cube only
 
     # When the caller asks for a non-CPU backend the geometry and state
     # are migrated to the device; only host-side analysis bits (slice
@@ -92,6 +97,13 @@ function main(; T::Type = Float64,
 
     elem = W.make_element(T, N)
     ops  = W.make_operators(elem)
+
+    # `outer_bc` only makes sense on `:inflated_cube` (the only mesh
+    # whose outer surface admits a non-Dirichlet tag). On the other
+    # mesh families the kwarg is silently ignored.
+    if outer_bc !== :dirichlet && mesh_kind !== :inflated_cube
+        error("outer_bc = :$outer_bc is only supported on mesh_kind = :inflated_cube")
+    end
 
     if mesh_kind === :cubical
         x0, x1 = zero(T), one(T)
@@ -107,8 +119,13 @@ function main(; T::Type = Float64,
         # outer-sphere Dirichlet BC, so the L²-error plot is informative
         # only as a measure of wave activity, not as a convergence
         # diagnostic.
+        #
+        # `outer_bc = :sommerfeld` tags the outer-sphere faces with `7`,
+        # which `rhs_wave3d!` treats as a radiative boundary (dissipative
+        # SAT pass on top of `apply_laplacian3d!`).
         x0, x1 = -T(R2), T(R2)
-        mesh = W.make_inflated_cube_mesh(T, T(L), T(R1), T(R2), M)
+        mesh = W.make_inflated_cube_mesh(T, T(L), T(R1), T(R2), M;
+                                         outer_bc = outer_bc)
     else
         error("unknown mesh_kind: $mesh_kind")
     end
@@ -149,8 +166,18 @@ function main(; T::Type = Float64,
         ic_R = ic_radius === nothing ? L_ / 2 : T(ic_radius)
         ic_ω = T(ic_radial_mode) * T(π) / ic_R
         ic_k = ic_ω        # filler, only `k` for `Params3d` shape; unused by the radial IC
+    elseif ic_kind === :outgoing
+        # Spherically-symmetric outgoing Gaussian pulse, peaked at radius
+        # `ic_s0` with width `ic_σ` at t = 0; propagates outward at unit
+        # speed. Use this with `outer_bc = :sommerfeld` on the inflated
+        # cube to see the pulse bleed out cleanly through the outer
+        # sphere; with Dirichlet it reflects.
+        ic_s0 = ic_pulse_offset === nothing ? L_ / 4 : T(ic_pulse_offset)
+        ic_σ  = ic_pulse_width  === nothing ? ic_s0 / 5 : T(ic_pulse_width)
+        ic_k  = zero(T)
+        ic_ω  = zero(T)         # filler — no oscillation frequency
     else
-        error("unknown ic_kind: $ic_kind (use :cartesian or :radial)")
+        error("unknown ic_kind: $ic_kind (use :cartesian, :radial, or :outgoing)")
     end
 
     # Bounding-box centre for the radial IC.
@@ -163,12 +190,28 @@ function main(; T::Type = Float64,
     # `_face_sat_compute!` automatically. `τ ≈ 1.5·(N−1)²` is the
     # reference-cube constant that keeps the discrete operator NSD on
     # any of the supported meshes.
+    # `sommerfeld_R`: radius of curvature for the Sommerfeld absorbing
+    # surface. Selects BGT-1 (spherical, exact for `u = f(r-t)/r`) when
+    # finite; falls back to BGT-0 (plane-wave) when `Inf`. The inflated
+    # cube's outer surface is exactly the sphere `|x| = R2`, so the
+    # spherical BGT-1 correction is exact there modulo discretisation.
+    sommerfeld_R = (mesh_kind === :inflated_cube && outer_bc === :sommerfeld) ?
+                       T(R2) : T(Inf)
+
+    # SIPG penalty threshold rises significantly on curvilinear /
+    # multi-patch meshes (cubed cube, inflated cube): the shell-patch
+    # elements are anisotropic and skewed, and `τ = 1.5·(N−1)²` —
+    # which is fine on the axis-aligned cubical mesh — leaves growing
+    # modes on the curvilinear meshes at N ≥ 4 M ≥ 6. Use the
+    # robust-stability value `τ = 8·(N−1)²` for those mesh families.
+    τ_mult = mesh_kind === :cubical ? T(3//2) : T(8)
     params = W.Params3d(;
-        A           = one(T),
-        k           = (ic_k, ic_k, ic_k),
-        ω           = ic_ω,
-        τ           = T(3//2) * (N-1)^2,
-        bdry_values = ntuple(_ -> zero(T), Val(6)),
+        A            = one(T),
+        k            = (ic_k, ic_k, ic_k),
+        ω            = ic_ω,
+        τ            = τ_mult * (N-1)^2,
+        bdry_values  = ntuple(_ -> zero(T), Val(6)),
+        sommerfeld_R = sommerfeld_R,
     )
 
     # Build the IC into a host buffer, then `copyto!` to the device if
@@ -181,10 +224,14 @@ function main(; T::Type = Float64,
                                 A = params.A,
                                 kx = params.k[1], ky = params.k[2], kz = params.k[3],
                                 ω = params.ω, x0 = x0, x1 = x1)
-    else  # :radial
+    elseif ic_kind === :radial
         W.eigenmode_radial!(u_host, u̇_host, coords, zero(T);
                              A = params.A, R = ic_R, n = ic_radial_mode,
                              center = ic_center)
+    else  # :outgoing
+        W.outgoing_pulse!(u_host, u̇_host, coords, zero(T);
+                           A = params.A, s0 = ic_s0, σ = ic_σ,
+                           center = ic_center)
     end
     if on_cpu
         u, u̇ = u_host, u̇_host
@@ -208,7 +255,7 @@ function main(; T::Type = Float64,
             "τ = $(params.τ)   ",
             "dt = $(round(dt, sigdigits=4))   dx_min = $(round(dx, sigdigits=4))   dt/dx_min = $(round(cfl, sigdigits=4))")
 
-    f!(ü, u̇, u, p::W.Params3d, t) = W.rhs3d!(ü, u, u̇, p; geom, ops)
+    f!(ü, u̇, u, p::W.Params3d, t) = W.rhs_wave3d!(ü, u, u̇, p; geom, ops)
     prob = SecondOrderODEProblem(f!, u̇, u, (t0, t1), params)
 
     # Initialise the integrator. We turn off all in-solver state storage —
@@ -249,7 +296,7 @@ function main(; T::Type = Float64,
     u̇_arr_host  = Array{T, 4}(undef, N, N, N, mesh.Ne)
 
     prog = Progress(length(ts);
-                    desc = "Evolving + sampling (mesh=$(mesh_kind), ic=$(ic_kind), τ=$(params.τ)): ",
+                    desc = "Evolving + sampling (mesh=$(mesh_kind), ic=$(ic_kind), bc=$(outer_bc), τ=$(params.τ)): ",
                     barlen = 30, showspeed = true)
     for (n, t) in enumerate(ts)
         # Step the integrator forward to the next sample time.
@@ -288,10 +335,21 @@ function main(; T::Type = Float64,
                                     A = params.A,
                                     kx = params.k[1], ky = params.k[2], kz = params.k[3],
                                     ω = params.ω, x0 = x0, x1 = x1)
-        else  # :radial
+        elseif ic_kind === :radial
             W.eigenmode_radial!(u_exact, u̇_exact, geom.coords, t;
                                  A = params.A, R = ic_R, n = ic_radial_mode,
                                  center = ic_center)
+        else  # :outgoing
+            # Analytic free-space outgoing wave at time `t`. Note this
+            # is the unbounded-domain solution; the L²-error trace below
+            # only tracks the truncation/dispersion error *before* the
+            # pulse interacts with the outer boundary. After the pulse
+            # reaches `r = R_outer`, the error trace mostly reflects the
+            # BC mismatch (Dirichlet reflection vs Sommerfeld absorption)
+            # against this free-space reference.
+            W.outgoing_pulse!(u_exact, u̇_exact, geom.coords, t;
+                               A = params.A, s0 = ic_s0, σ = ic_σ,
+                               center = ic_center)
         end
         err_buf .= u_arr .- u_exact
         l2_err[n] = W.discrete_l2_norm(err_buf, geom, ops)
@@ -310,7 +368,7 @@ function main(; T::Type = Float64,
     # force vertex search). Materialise `u_final` on host first if it
     # lives on a device.
     u_final = on_cpu ? integrator.u.x[2] : Array(integrator.u.x[2])
-    u_xy    = W.interpolate_field(mesh, elem, u_final, pts_xy)
+    u_xy    = W.interpolate_field(mesh, elem.xs, u_final, pts_xy)
 
     # Element-boundary segments lying on z = 0: collect the 12 edges per
     # element and keep only those whose endpoint vertices both sit on the
@@ -400,8 +458,7 @@ end
 
 # main(; N = 4, M = 8)
 # main(; mesh_kind = :cubed_cube, N = 4, M = 8, R = 0.1)
-# main(; mesh_kind = :inflated_cube, ic_kind = :radial, N = 4, M = 8)
-
-main(; mesh_kind = :inflated_cube, ic_kind = :radial, N = 4, M = 8, L = 0.1, R1 = 0.3, R2 = 1.0)
+# main(; mesh_kind = :inflated_cube, ic_kind = :radial, N = 4, M = 8, L = 0.1, R1 = 0.3, R2 = 1.0)
+# main(; mesh_kind = :inflated_cube, outer_bc = :sommerfeld, ic_kind = :radial, N = 4, M = 8, L = 0.1, R1 = 0.3, R2 = 1.0)
 
 nothing

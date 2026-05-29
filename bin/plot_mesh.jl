@@ -1,8 +1,10 @@
 using CairoMakie
+using HexMeshes
 using SixelTerm
 using WaveToySecondOrder
 
 const W = WaveToySecondOrder
+const H = HexMeshes
 
 # Mesh choice: same switch as `waveplot3d.jl`. Visualises the topology
 # (large dots = the eight corner vertices of each hex) and the geometric
@@ -17,9 +19,9 @@ R = 0.1                         # cubed_cube: inner-patch radius
 elem = W.make_element(Float64, N)
 
 if mesh_kind === :cubical
-    mesh = W.make_cubical_mesh(Float64, M, 0.0, 1.0)
+    mesh = H.make_cubical_mesh(Float64, M, 0.0, 1.0)
 elseif mesh_kind === :cubed_cube
-    mesh = W.make_cubed_cube_mesh(Float64, M, R)
+    mesh = H.make_cubed_cube_mesh(Float64, M, R)
 else
     error("unknown mesh_kind: $mesh_kind")
 end
@@ -53,7 +55,7 @@ cz = vec(geom.coords[3, :, :, :, :])
 
 fig = Figure(; size = (800, 800))
 ax  = Axis3(fig[1, 1];
-            title  = "mesh = $mesh_kind   (Ne=$(mesh.Ne), Nv=$(W.nv(mesh)))",
+            title  = "mesh = $mesh_kind   (Ne=$(mesh.Ne), Nv=$(H.nv(mesh)))",
             xlabel = "x", ylabel = "y", zlabel = "z",
             aspect = (1, 1, 1))
 
