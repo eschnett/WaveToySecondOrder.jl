@@ -1,4 +1,4 @@
-# Tests for `src/kernels3d.jl`: curvilinear-aware `rhs3d!`. The full
+# Tests for `src/kernels3d.jl`: curvilinear-aware `rhs_wave3d!`. The full
 # wave-evolution check against the analytic separable eigenmode is the
 # end-to-end correctness gate. Each wave-evolution / stability test runs
 # in both `Float64` and `Float32` to keep the GPU-friendly (Float32-only)
@@ -6,10 +6,10 @@
 
 using WaveToySecondOrder
 using WaveToySecondOrder: make_element, make_operators,
-    make_cubical_mesh, make_cubed_cube_mesh, make_inflated_cube_mesh,
     make_geometry,
-    initialize3d!, rhs3d!, recommended_dt,
-    discrete_inner_product, Params3d, to_device
+    initialize3d!, rhs_wave3d!, recommended_dt,
+    discrete_inner_product, eigenmode_radial!, Params3d, to_device
+using HexMeshes: make_uniform_hex, make_cubed_cube_mesh, make_inflated_cube_mesh
 using KernelAbstractions: CPU
 using OrdinaryDiffEqSymplecticRK
 using Random
@@ -37,17 +37,16 @@ function discrete_energy(u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
                           geom, ops, τ) where {T}
     bdry = ntuple(_ -> zero(T), Val(6))
     Lu   = similar(u)
-    rhs3d!(Lu, u, u̇, bdry; geom, ops, τ)
+    rhs_wave3d!(Lu, u, u̇, bdry; geom, ops, τ)
     K = discrete_inner_product(u̇, u̇, geom, ops) / 2
     V = -discrete_inner_product(u, Lu, geom, ops) / 2
     return K + V
 end
 
-# `_progress` writes one cyan line to stderr so the user sees what's
-# running during compile-heavy stretches. Defined per-file so each test
-# file remains runnable standalone.
-_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
-                  flush(stderr))
+# `_progress` is defined in `runtests.jl`; fallback for stand-alone runs.
+@isdefined(_progress) ||
+    (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
+                       flush(stderr)))
 
 @testset "kernels3d (T=$T)" for T in (Float64, Float32)
 
@@ -68,7 +67,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
         M    = 4
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
         coords = geom.coords
 
@@ -90,7 +89,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
         t1 = T(1//2)   # ≈ 0.87 periods of the eigenmode — enough to
                        # catch dispersion error without doubling runtime.
 
-        f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t1), params)
         sol  = solve(prob, KahanLi8(); dt)
 
@@ -140,7 +139,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
         u0_max = maximum(abs, u)
 
         dt = recommended_dt(geom, ops, params.τ)
-        f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), T(0.1)), params)
         sol  = solve(prob, KahanLi8(); dt,
                      save_everystep = false, save_start = false,
@@ -164,7 +163,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
         M    = 3
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
 
         Random.seed!(20250522)
@@ -184,7 +183,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
 
         E0 = discrete_energy(u, u̇, geom, ops, params.τ)
 
-        f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
         sol  = solve(prob, KahanLi8(); dt,
                      save_everystep = false, save_start = false,
@@ -234,7 +233,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
 
         E0 = discrete_energy(u, u̇, geom, ops, params.τ)
 
-        f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
         sol  = solve(prob, KahanLi8(); dt,
                      save_everystep = false, save_start = false,
@@ -281,7 +280,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
         E0 = discrete_energy(u, u̇, geom, ops, params.τ)
         @test isfinite(E0) && E0 > 0       # NSD `L_h` ⇒ `V ≥ 0`, `K ≥ 0`
 
-        f!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
         sol  = solve(prob, KahanLi8(); dt,
                      save_everystep = false, save_start = false,
@@ -293,6 +292,63 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
         @test all(isfinite, u_end) && all(isfinite, u̇_end)
         E_end = discrete_energy(u_end, u̇_end, geom, ops, params.τ)
         @test abs(E_end - E0) < energy_tol * abs(E0)
+    end
+
+    _progress("Sommerfeld outer BC bleeds energy (T=$T)")
+    @testset "Sommerfeld outer BC: energy decreases (T=$T)" begin
+        # Inflated cube with `outer_bc=:sommerfeld` should bleed energy
+        # through the outer sphere. A radial Bessel pulse evolved with
+        # Dirichlet conserves energy (symplectic conservation, ratified
+        # by the cubical robust-stability test); with Sommerfeld the
+        # discrete operator becomes dissipative and the energy must
+        # decrease. Coarse mesh + short integration so the test stays
+        # cheap.
+        N    = 3
+        M    = 2
+        elem = make_element(T, N)
+        ops  = make_operators(elem)
+        mesh = make_inflated_cube_mesh(T, T(0.1), T(0.3), T(1.0), M;
+                                        outer_bc = :sommerfeld)
+        geom = make_geometry(mesh, elem)
+
+        # Sanity: every outer face carries the new `bdry == 7` tag, and
+        # no Dirichlet tag (1..6) leaked through.
+        @test count(==(Int8(7)), mesh.conn.bdry) == 6 * M^2
+        @test count(t -> 1 ≤ t ≤ 6, mesh.conn.bdry) == 0
+
+        u  = Array{T, 4}(undef, N, N, N, mesh.Ne)
+        u̇  = similar(u)
+        eigenmode_radial!(u, u̇, geom.coords, zero(T);
+                          A = one(T), R = one(T), n = 1)
+
+        params = Params3d(;
+            A           = one(T),
+            k           = (T(π), T(π), T(π)),
+            ω           = T(π),
+            τ           = T(3//2) * (N - 1)^2,
+            bdry_values = ntuple(_ -> zero(T), Val(6)),
+        )
+        dt    = recommended_dt(geom, ops, params.τ; cfl_safety = T(0.5))
+        t_end = T(0.5)
+        E0    = discrete_energy(u, u̇, geom, ops, params.τ)
+
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
+        prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
+        sol  = solve(prob, Ruth3(); dt,
+                     save_everystep = false, save_start = false,
+                     dense = false, save_end = true)
+        final = sol.u[end]
+        u̇_end = final.x[1]
+        u_end = final.x[2]
+        @test all(isfinite, u_end) && all(isfinite, u̇_end)
+
+        E_end = discrete_energy(u_end, u̇_end, geom, ops, params.τ)
+        # By `t = 0.5` (half a wave-crossing time at R = 1) the pulse
+        # has started bleeding out through the sphere — at least a
+        # noticeable fraction of E₀ should be gone. Generous margin so
+        # the test stays robust against small parameter shifts.
+        @test E_end < T(0.9) * E0
+        @test E_end > zero(T)        # not negative — dissipative, not blowing up
     end
 
     _progress("device migration round-trip (T=$T)")
@@ -307,7 +363,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
         M    = 2
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
 
         u  = randn(T, N, N, N, mesh.Ne)
@@ -327,8 +383,8 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
         @test geom_dev !== geom               # …in a new container
         @test geom_dev.conn.neighbour == geom.conn.neighbour
 
-        rhs3d!(ü_host, u, u̇, params; geom,     ops)
-        rhs3d!(ü_dev,  u, u̇, params; geom = geom_dev, ops)
+        rhs_wave3d!(ü_host, u, u̇, params; geom,     ops)
+        rhs_wave3d!(ü_dev,  u, u̇, params; geom = geom_dev, ops)
         @test ü_host == ü_dev
     end
 end
@@ -338,7 +394,7 @@ end
 # Verifies that the full chain works end-to-end on the GPU:
 #   • `to_device(geom, MetalBackend())` migrates geometry
 #   • state allocated as `MtlArray{Float32}`
-#   • `rhs3d!` runs on Metal
+#   • `rhs_wave3d!` runs on Metal
 #   • `recommended_dt` runs on Metal (exercises the new device-aware
 #     `spectral_radius_estimate`)
 #   • `discrete_inner_product` runs on Metal (exercises the new
@@ -353,7 +409,7 @@ if HAS_METAL
         M    = 2
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
 
         params = Params3d(;
@@ -394,8 +450,8 @@ if HAS_METAL
         # Short evolution. Use `dt_host` for both so the integrator does
         # exactly the same arithmetic on both backends → bit-identity.
         t_end = T(20) * dt_host
-        f_host!(ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom,     ops)
-        f_dev!( ü, u̇, u, p::Params3d, t) = rhs3d!(ü, u, u̇, p; geom = geom_dev, ops)
+        f_host!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom,     ops)
+        f_dev!( ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom = geom_dev, ops)
 
         prob_host = SecondOrderODEProblem(f_host!, u̇_host, u_host, (T(0), t_end), params)
         prob_dev  = SecondOrderODEProblem(f_dev!,  u̇_dev,  u_dev,  (T(0), t_end), params)
