@@ -1,7 +1,7 @@
 # Tests for the Sommerfeld radiative boundary condition.
 #
 # These tests probe the wave-equation post-pass `_sommerfeld_pass_kernel!`
-# layered on top of `apply_laplacian3d!`'s natural boundary lift.
+# layered on top of `apply_laplacian!`'s natural boundary lift.
 # Mesh choice: inflated cube with `outer_bc = :sommerfeld`, the only
 # combination that produces tag-7 outer faces on a spherical surface
 # (where the BGT-1 correction `+ u/R` is exact for a radial source).
@@ -30,7 +30,7 @@ using Test
 #   (max |B₁u|, rms |B₁u|, num_face_nodes, max |n − r̂|)
 # where B₁u = u̇ + ∂_n u + u/R is the BGT-1 residual and r̂ is the unit
 # radial direction (which equals the outward normal on the outer sphere).
-function _bc_residual_on_sommerfeld_faces(mesh, geom, u, u̇, R, ::Val{N}) where {N}
+function _bc_residual_on_sommerfeld_faces(mesh, geom, work, u, u̇, R, ::Val{N}) where {N}
     T = eltype(u)
     inv_R = one(T) / R
     B1_max = zero(T)
@@ -63,10 +63,10 @@ function _bc_residual_on_sommerfeld_faces(mesh, geom, u, u̇, R, ::Val{N}) where
                         geom.coords[2, i, j, k, e],
                         geom.coords[3, i, j, k, e])
             norm_err = max(norm_err, norm(n - x / norm(x)))
-            u_val = geom.face_trace[1, p_local, q_local, f, e]
-            gx = geom.face_trace[2, p_local, q_local, f, e]
-            gy = geom.face_trace[3, p_local, q_local, f, e]
-            gz = geom.face_trace[4, p_local, q_local, f, e]
+            u_val = work.face_trace[1, p_local, q_local, f, e]
+            gx = work.face_trace[2, p_local, q_local, f, e]
+            gy = work.face_trace[3, p_local, q_local, f, e]
+            gz = work.face_trace[4, p_local, q_local, f, e]
             Gn = n[1] * gx + n[2] * gy + n[3] * gz
             res = u̇[i, j, k, e] + Gn + inv_R * u_val
             B1_max = max(B1_max, abs(res))
@@ -77,11 +77,11 @@ function _bc_residual_on_sommerfeld_faces(mesh, geom, u, u̇, R, ::Val{N}) where
     return B1_max, sqrt(B1_sum_sq / max(fc, 1)), fc, norm_err
 end
 
-function _discrete_energy(u, u̇, geom, ops, τ)
+function _discrete_energy(u, u̇, geom, ops, work, τ)
     T = eltype(u)
     bdry = ntuple(_ -> zero(T), Val(6))
     Lu = similar(u)
-    apply_laplacian3d!(Lu, u, bdry; geom, ops, τ)
+    apply_laplacian!(Lu, u, bdry; geom, ops, work, τ)
     K = discrete_inner_product(u̇, u̇, geom, ops) / 2
     V = -discrete_inner_product(u, Lu, geom, ops) / 2
     return K + V
@@ -103,21 +103,22 @@ end
     mesh = make_inflated_cube_mesh(T, T(0.1), T(0.3), T(R2), M;
                                     outer_bc = :sommerfeld)
     geom = make_geometry(mesh, elem)
+    work = make_workspace(geom)
 
     # IC: outgoing pulse, peak at r = s0, width σ.
     u  = Array{T, 4}(undef, N, N, N, mesh.Ne)
     u̇ = similar(u)
     outgoing_pulse!(u, u̇, geom.coords, zero(T); A = one(T), s0 = s0, σ = σ)
 
-    # Populate geom.face_trace by running the operator once. This is what
+    # Populate work.face_trace by running the operator once. This is what
     # the Sommerfeld post-pass reads inside `rhs_wave3d!`.
     ü_tmp = similar(u)
-    apply_laplacian3d!(ü_tmp, u, ntuple(_ -> zero(T), Val(6)); geom, ops, τ)
+    apply_laplacian!(ü_tmp, u, ntuple(_ -> zero(T), Val(6)); geom, ops, work, τ)
 
     _progress("T1: BC residual small for analytic outgoing pulse")
     @testset "T1: BC residual on Sommerfeld faces (analytic pulse, t=0)" begin
         B1_max, _, fc, n_err = _bc_residual_on_sommerfeld_faces(
-            mesh, geom, u, u̇, T(R2), Val(N))
+            mesh, geom, work, u, u̇, T(R2), Val(N))
         # 6·M² faces on the outer sphere with N² nodes each.
         @test fc == 6 * M^2 * N^2
         # Outward normal must be exactly radial on the outer sphere.
@@ -130,20 +131,20 @@ end
 
     _progress("T2: BGT-1 absorbs outgoing pulse")
     @testset "T2: outgoing pulse is absorbed by BGT-1 by t=$t_end" begin
-        E0 = _discrete_energy(u, u̇, geom, ops, τ)
+        E0 = _discrete_energy(u, u̇, geom, ops, work, τ)
         params = Params3d(; A = one(T), k = (zero(T), zero(T), zero(T)),
                             ω = zero(T), τ = τ,
                             bdry_values = ntuple(_ -> zero(T), Val(6)),
                             sommerfeld_R = T(R2))
         dt = recommended_dt(geom, ops, τ; cfl_safety = T(1//2))
-        f!(ü, u̇, u, p, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops, work)
         prob = SecondOrderODEProblem(f!, copy(u̇), copy(u), (zero(T), T(t_end)), params)
         sol = solve(prob, VelocityVerlet(); dt,
                     save_everystep = false, save_start = false,
                     dense = false, save_end = true)
         u_end  = reshape(sol.u[end].x[2], N, N, N, mesh.Ne)
         u̇_end = reshape(sol.u[end].x[1], N, N, N, mesh.Ne)
-        E_end  = _discrete_energy(u_end, u̇_end, geom, ops, τ)
+        E_end  = _discrete_energy(u_end, u̇_end, geom, ops, work, τ)
         @test all(isfinite, u_end) && all(isfinite, u̇_end)
         # Field is bounded (no blowup) — initial peak was ~2.10, residual
         # should be well below 1.0 for this resolution.
@@ -160,7 +161,7 @@ end
                                 bdry_values = ntuple(_ -> zero(T), Val(6)),
                                 sommerfeld_R = R)
             dt = recommended_dt(geom, ops, τ; cfl_safety = T(1//2))
-            f!(ü, u̇, u, p, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
+            f!(ü, u̇, u, p, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops, work)
             prob = SecondOrderODEProblem(f!, copy(u̇), copy(u), (zero(T), T(t_end)), params)
             sol = solve(prob, VelocityVerlet(); dt,
                         save_everystep = false, save_start = false,

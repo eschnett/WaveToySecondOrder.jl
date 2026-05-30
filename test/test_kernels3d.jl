@@ -6,7 +6,7 @@
 
 using WaveToySecondOrder
 using WaveToySecondOrder: make_element, make_operators,
-    make_geometry,
+    make_geometry, make_workspace,
     initialize3d!, rhs_wave3d!, recommended_dt,
     discrete_inner_product, eigenmode_radial!, Params3d, to_device
 using HexMeshes: make_uniform_hex, make_cubed_cube_mesh, make_inflated_cube_mesh
@@ -34,10 +34,10 @@ end
 # negative-semi-definite `L_h` this should oscillate around a constant
 # within an O(dt^p) modified-Hamiltonian envelope.
 function discrete_energy(u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
-                          geom, ops, τ) where {T}
+                          geom, ops, work, τ) where {T}
     bdry = ntuple(_ -> zero(T), Val(6))
     Lu   = similar(u)
-    rhs_wave3d!(Lu, u, u̇, bdry; geom, ops, τ)
+    rhs_wave3d!(Lu, u, u̇, bdry; geom, ops, work, τ)
     K = discrete_inner_product(u̇, u̇, geom, ops) / 2
     V = -discrete_inner_product(u, Lu, geom, ops) / 2
     return K + V
@@ -69,6 +69,7 @@ end
         ops  = make_operators(elem)
         mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
         coords = geom.coords
 
         dx = elem.h * (one(T) / M)
@@ -89,7 +90,7 @@ end
         t1 = T(1//2)   # ≈ 0.87 periods of the eigenmode — enough to
                        # catch dispersion error without doubling runtime.
 
-        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops, work)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t1), params)
         sol  = solve(prob, KahanLi8(); dt)
 
@@ -115,6 +116,7 @@ end
         ops  = make_operators(elem)
         mesh = make_cubed_cube_mesh(T, M, R)
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
         coords = geom.coords
 
         # Domain-normalised sine IC on [-1, +1]³ (vanishes on outer faces).
@@ -139,7 +141,7 @@ end
         u0_max = maximum(abs, u)
 
         dt = recommended_dt(geom, ops, params.τ)
-        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops, work)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), T(0.1)), params)
         sol  = solve(prob, KahanLi8(); dt,
                      save_everystep = false, save_start = false,
@@ -165,6 +167,7 @@ end
         ops  = make_operators(elem)
         mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
 
         Random.seed!(20250522)
         u  = randn(T, N, N, N, mesh.Ne)
@@ -181,9 +184,9 @@ end
         n_steps = 50
         t_end   = n_steps * dt
 
-        E0 = discrete_energy(u, u̇, geom, ops, params.τ)
+        E0 = discrete_energy(u, u̇, geom, ops, work, params.τ)
 
-        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops, work)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
         sol  = solve(prob, KahanLi8(); dt,
                      save_everystep = false, save_start = false,
@@ -201,7 +204,7 @@ end
         # energy can redistribute from `u` into the fastest modes
         # whose `u̇` magnitude is `ω_max·‖u‖`, i.e. easily
         # 10²–10³× initial, without any instability.)
-        E_end = discrete_energy(u_end, u̇_end, geom, ops, params.τ)
+        E_end = discrete_energy(u_end, u̇_end, geom, ops, work, params.τ)
         @test abs(E_end - E0) < energy_tol * abs(E0)
     end
 
@@ -215,6 +218,7 @@ end
         ops  = make_operators(elem)
         mesh = make_cubed_cube_mesh(T, M, R)
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
 
         Random.seed!(20250522)
         u  = randn(T, N, N, N, mesh.Ne)
@@ -231,9 +235,9 @@ end
         n_steps = 50
         t_end   = n_steps * dt
 
-        E0 = discrete_energy(u, u̇, geom, ops, params.τ)
+        E0 = discrete_energy(u, u̇, geom, ops, work, params.τ)
 
-        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops, work)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
         sol  = solve(prob, KahanLi8(); dt,
                      save_everystep = false, save_start = false,
@@ -243,7 +247,7 @@ end
         u_end = final.x[2]
 
         @test all(isfinite, u_end) && all(isfinite, u̇_end)
-        E_end = discrete_energy(u_end, u̇_end, geom, ops, params.τ)
+        E_end = discrete_energy(u_end, u̇_end, geom, ops, work, params.τ)
         @test abs(E_end - E0) < energy_tol * abs(E0)
     end
 
@@ -261,6 +265,7 @@ end
         ops  = make_operators(elem)
         mesh = make_inflated_cube_mesh(T, 1.0, 2.0, 3.0, M)
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
 
         Random.seed!(20250524)
         u  = randn(T, N, N, N, mesh.Ne)
@@ -277,10 +282,10 @@ end
         n_steps = 50
         t_end   = n_steps * dt
 
-        E0 = discrete_energy(u, u̇, geom, ops, params.τ)
+        E0 = discrete_energy(u, u̇, geom, ops, work, params.τ)
         @test isfinite(E0) && E0 > 0       # NSD `L_h` ⇒ `V ≥ 0`, `K ≥ 0`
 
-        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops, work)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
         sol  = solve(prob, KahanLi8(); dt,
                      save_everystep = false, save_start = false,
@@ -290,7 +295,7 @@ end
         u_end = final.x[2]
 
         @test all(isfinite, u_end) && all(isfinite, u̇_end)
-        E_end = discrete_energy(u_end, u̇_end, geom, ops, params.τ)
+        E_end = discrete_energy(u_end, u̇_end, geom, ops, work, params.τ)
         @test abs(E_end - E0) < energy_tol * abs(E0)
     end
 
@@ -310,6 +315,7 @@ end
         mesh = make_inflated_cube_mesh(T, T(0.1), T(0.3), T(1.0), M;
                                         outer_bc = :sommerfeld)
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
 
         # Sanity: every outer face carries the new `bdry == 7` tag, and
         # no Dirichlet tag (1..6) leaked through.
@@ -330,9 +336,9 @@ end
         )
         dt    = recommended_dt(geom, ops, params.τ; cfl_safety = T(0.5))
         t_end = T(0.5)
-        E0    = discrete_energy(u, u̇, geom, ops, params.τ)
+        E0    = discrete_energy(u, u̇, geom, ops, work, params.τ)
 
-        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops)
+        f!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom, ops, work)
         prob = SecondOrderODEProblem(f!, u̇, u, (zero(T), t_end), params)
         sol  = solve(prob, Ruth3(); dt,
                      save_everystep = false, save_start = false,
@@ -342,7 +348,7 @@ end
         u_end = final.x[2]
         @test all(isfinite, u_end) && all(isfinite, u̇_end)
 
-        E_end = discrete_energy(u_end, u̇_end, geom, ops, params.τ)
+        E_end = discrete_energy(u_end, u̇_end, geom, ops, work, params.τ)
         # By `t = 0.5` (half a wave-crossing time at R = 1) the pulse
         # has started bleeding out through the sphere — at least a
         # noticeable fraction of E₀ should be gone. Generous margin so
@@ -365,6 +371,7 @@ end
         ops  = make_operators(elem)
         mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
 
         u  = randn(T, N, N, N, mesh.Ne)
         u̇  = randn(T, N, N, N, mesh.Ne)
@@ -379,12 +386,13 @@ end
         )
 
         geom_dev = to_device(geom, CPU())
+        work_dev = to_device(work, CPU())
         @test geom_dev.coords ≈ geom.coords   # round-trip preserves data
         @test geom_dev !== geom               # …in a new container
         @test geom_dev.conn.neighbour == geom.conn.neighbour
 
-        rhs_wave3d!(ü_host, u, u̇, params; geom,     ops)
-        rhs_wave3d!(ü_dev,  u, u̇, params; geom = geom_dev, ops)
+        rhs_wave3d!(ü_host, u, u̇, params; geom,            ops, work)
+        rhs_wave3d!(ü_dev,  u, u̇, params; geom = geom_dev, ops, work = work_dev)
         @test ü_host == ü_dev
     end
 end
@@ -411,6 +419,7 @@ if HAS_METAL
         ops  = make_operators(elem)
         mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
 
         params = Params3d(;
             A           = one(T),
@@ -432,6 +441,7 @@ if HAS_METAL
         # Migrate geometry + state to Metal.
         backend  = MetalBackend()
         geom_dev = to_device(geom, backend)
+        work_dev = to_device(work, backend)
         u_dev    = MtlArray(u_host)
         u̇_dev    = MtlArray(u̇_host)
 
@@ -450,8 +460,8 @@ if HAS_METAL
         # Short evolution. Use `dt_host` for both so the integrator does
         # exactly the same arithmetic on both backends → bit-identity.
         t_end = T(20) * dt_host
-        f_host!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom,     ops)
-        f_dev!( ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom = geom_dev, ops)
+        f_host!(ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom,     ops, work)
+        f_dev!( ü, u̇, u, p::Params3d, t) = rhs_wave3d!(ü, u, u̇, p; geom = geom_dev, ops, work = work_dev)
 
         prob_host = SecondOrderODEProblem(f_host!, u̇_host, u_host, (T(0), t_end), params)
         prob_dev  = SecondOrderODEProblem(f_dev!,  u̇_dev,  u_dev,  (T(0), t_end), params)

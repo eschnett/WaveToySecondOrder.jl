@@ -1,5 +1,5 @@
 # Wave-equation-specific layer on top of HexSBPSAT's generic 3D Laplacian
-# `apply_laplacian3d!`. What lives here:
+# `apply_laplacian!`. What lives here:
 #
 #   * `Params3d{T}` — the wave-equation parameter bundle (`A, k, ω, τ,
 #     bdry_values`) used as the `p` argument of an
@@ -15,7 +15,7 @@
 #   * `_SPHERICAL_BESSEL_J2_ZEROS`, `_j2_over_x2`, `_sinhc` — helpers
 #     backing the quadrupole eigenmode and the outgoing pulse.
 #   * `rhs_wave3d!` — the wave-equation RHS. Calls the equation-agnostic
-#     `apply_laplacian3d!` for the bulk spatial operator, then adds a
+#     `apply_laplacian!` for the bulk spatial operator, then adds a
 #     dissipative SAT pass over outer faces tagged `7` to enforce
 #     Sommerfeld radiative BCs.
 #   * `recommended_dt` — Störmer–Verlet timestep limit
@@ -24,8 +24,17 @@
 const SOMMERFELD_BDRY_TAG = Int8(7)
 
 ################################################################################
-# 1D wave-equation IC (used by the 1D test driver in `test/test_kernels1d.jl`).
+# 1D wave-equation layer.
+#
+# Mirror of the 3D layer at lower dimension. The 1D operator backing
+# `rhs_wave1d!` is the global SBP-SAT Laplacian from `kernels1d.jl`
+# (matrix layout `(N, M)`: row = local GLL node, column = element).
+# There's no `MeshGeometry{1}` — the 1D path uses the lightweight
+# `dom = make_domain(T, M, x0, x1)` NamedTuple instead.
 
+# Cartesian eigenmode IC. Same family as `eigenmode_cartesian_2d!` /
+# `eigenmode_cartesian!` (3D): a standing wave `sin(kx)·cos(ωt)`. The
+# 1D dispersion relation is `ω = k` (wave speed 1).
 function initialize!(u::AbstractVector, u̇::AbstractVector, x::AbstractVector, t;
                      A, k, ω)
     u .=  A   * sin.(k*x) * cos(ω*t)
@@ -35,12 +44,92 @@ end
 
 function initialize!(u::AbstractMatrix, u̇::AbstractMatrix, x::AbstractMatrix, t;
                      A, k, ω)
-    M = size(u, 2)
-    @assert size(u̇, 2) == size(x, 2) == M
-    for m in 1:M
-        initialize!(view(u, :, m), view(u̇, :, m), view(x, :, m), t; A, k, ω)
-    end
+    @assert size(u̇) == size(x) == size(u)
+    # Single broadcast over the whole `(N, M)` matrix — works on plain
+    # `Array`, `MtlArray`, `CuArray`, … without per-column loops.
+    @. u  =  A   * sin(k * x) * cos(ω * t)
+    @. u̇ = -A*ω * sin(k * x) * sin(ω * t)
     return u, u̇
+end
+
+"""
+    Params1d{T}
+
+1D wave-equation parameter bundle:
+
+* `A` — IC amplitude.
+* `k`, `ω` — IC wavenumber and angular frequency. For the standard
+  wave equation `u_tt = u_xx` on `[x0, x1]` with Dirichlet ends,
+  `k = nπ/(x1 - x0)` and `ω = k`.
+* `τ` — SIPG penalty constant for the 1D `apply_laplacian!`.
+* `bL`, `bR` — Dirichlet values at the left / right ends.
+
+The 1D wave layer has no `geom` (no `MeshGeometry{1}` exists); the
+caller passes `dom = make_domain(T, M, x0, x1)` and `ops` instead.
+"""
+struct Params1d{T}
+    A  :: T
+    k  :: T
+    ω  :: T
+    τ  :: T
+    bL :: T
+    bR :: T
+end
+
+"""
+    Params1d(; A, k, ω, τ, bL, bR) → Params1d{T}
+
+Keyword constructor — promotes all inputs to a common floating-point
+type.
+"""
+function Params1d(; A, k, ω, τ, bL, bR)
+    T = promote_type(typeof(A), typeof(k), typeof(ω),
+                     typeof(τ), typeof(bL), typeof(bR))
+    return Params1d{T}(T(A), T(k), T(ω), T(τ), T(bL), T(bR))
+end
+
+"""
+    rhs_wave1d!(ü, u, u̇, params; dom, ops)
+    rhs_wave1d!(ü, u, u̇; dom, ops, τ, bL = 0, bR = 0)
+
+1D wave-equation RHS: `ü = L_h u` via the global 1D SBP-SAT operator
+from `kernels1d.jl`. State arrays `ü`, `u`, `u̇` are matrices of
+shape `(N, M)` — one column per element.
+"""
+function rhs_wave1d!(ü::AbstractMatrix{T}, u::AbstractMatrix{T}, u̇::AbstractMatrix{T},
+                     params::Params1d{T};
+                     dom, ops::SBPOps{N, T}) where {N, T}
+    return rhs_wave1d!(ü, u, u̇; dom, ops, τ = params.τ,
+                       bL = params.bL, bR = params.bR)
+end
+
+function rhs_wave1d!(ü::AbstractMatrix{T}, u::AbstractMatrix{T}, u̇::AbstractMatrix{T};
+                     dom, ops::SBPOps{N, T}, τ,
+                     bL::T = zero(T), bR::T = zero(T)) where {N, T}
+    @assert size(ü) == size(u̇) == size(u)
+    apply_laplacian!(ü, u, bL, bR; dom, ops, τ)
+    return ü
+end
+
+"""
+    recommended_dt(dom, ops::SBPOps{N, T}, τ; cfl_safety = 0.9) → T
+
+1D Störmer–Verlet timestep limit `cfl_safety · 2 / sqrt(|λ_max|)`. The
+spectral radius `|λ_max|` is read off the assembled global 1D
+Laplacian (cheap on the meshes the 1D driver typically uses — M ≤ a
+few hundred elements).
+
+Dispatches on the 1D `dom` returned by `HexSBPSAT.make_domain` (a
+NamedTuple), so this method coexists with the 2D / 3D
+`recommended_dt(::MeshGeometry{D}, …)` methods without ambiguity.
+"""
+function recommended_dt(dom::NamedTuple, ops::SBPOps{N, T}, τ;
+                         cfl_safety = T(0.9)) where {N, T}
+    L = build_global_laplacian(dom.N; ops, τ)
+    Lh = Matrix(L) ./ dom.h^2
+    λ_max = maximum(abs, eigvals(Lh))
+    λ_max == 0 && return T(Inf)
+    return cfl_safety * T(2) / sqrt(λ_max)
 end
 
 ################################################################################
@@ -54,7 +143,7 @@ Bundle of system-level scalar parameters for the 3D wave equation:
 * `A` — IC amplitude.
 * `k :: NTuple{3, T}` — IC wavenumber vector `(kx, ky, kz)`.
 * `ω` — IC angular frequency.
-* `τ` — SIPG penalty constant for `apply_laplacian3d!`.
+* `τ` — SIPG penalty constant for `apply_laplacian!`.
 * `bdry_values :: NTuple{6, T}` — per-face Dirichlet values, indexed
   by the boundary-condition tag stored on each outer face
   (`mesh.conn.bdry[f, e]`).
@@ -243,11 +332,21 @@ end
 # small `|x|` use a Taylor expansion to keep the broadcast finite at
 # the r = 0 GLL node of the inflated-cube inner cube. Threshold chosen
 # so the Taylor truncation error is below ~eps(Float32) for x² < 1e-3.
+#
+# Constants are built via `inv(T(n))` — pure `T`-arithmetic, no
+# Float64 / Rational intermediates. This matters for Metal-Float32:
+#   * `T(0.5)` lowers to a kernel `Float32(::Float64)` call which the
+#     Metal compiler rejects with "unsupported use of double value";
+#   * `T(1//2)` lowers to `Float32(::Rational{Int})` which trips a
+#     kernel call to `__throw_rational_argerror_zero` ("unsupported
+#     dynamic function invocation");
+#   * `inv(T(2))` lowers to plain `Float32(1) / Float32(2)` that the
+#     compiler folds to a Float32 constant.
 @inline function _sinhc(x::T) where {T<:AbstractFloat}
     x² = x * x
-    if x² < T(1e-3)
+    if x² < inv(T(1000))
         # sinh(x)/x = 1 + x²/6 + x⁴/120 + x⁶/5040 + …
-        return one(T) + x² * (T(1/6) + x² * (T(1/120) + x² * T(1/5040)))
+        return one(T) + x² * (inv(T(6)) + x² * (inv(T(120)) + x² * inv(T(5040))))
     else
         return sinh(x) / x
     end
@@ -316,10 +415,10 @@ function outgoing_pulse!(u::AbstractArray{T},
     # auxiliary buffers and lowers cleanly onto GPU backends.
     @. u  = T(2) * A_ * β * iσ² *
             _sinhc(β * sqrt((Xv-cx)^2 + (Yv-cy)^2 + (Zv-cz)^2) * iσ²) *
-            exp(-T(0.5) * (β² + (Xv-cx)^2 + (Yv-cy)^2 + (Zv-cz)^2) * iσ²)
+            exp(-inv(T(2)) * (β² + (Xv-cx)^2 + (Yv-cy)^2 + (Zv-cz)^2) * iσ²)
 
     @. u̇ = -T(2) * A_ * iσ² *
-            exp(-T(0.5) * (β² + (Xv-cx)^2 + (Yv-cy)^2 + (Zv-cz)^2) * iσ²) *
+            exp(-inv(T(2)) * (β² + (Xv-cx)^2 + (Yv-cy)^2 + (Zv-cz)^2) * iσ²) *
             (β² * iσ² *
               _sinhc(β * sqrt((Xv-cx)^2 + (Yv-cy)^2 + (Zv-cz)^2) * iσ²) -
               cosh(β * sqrt((Xv-cx)^2 + (Yv-cy)^2 + (Zv-cz)^2) * iσ²))
@@ -347,9 +446,9 @@ const _SPHERICAL_BESSEL_J2_ZEROS = (
 # can't compile).
 @inline function _j2_over_x2(x::T) where {T<:AbstractFloat}
     x² = x * x
-    if x² < T(0.01)
+    if x² < inv(T(100))
         # g(x) = 1/15 - x²/210 + x⁴/7560 - x⁶/498960 + …
-        return T(1/15) - x² * (T(1/210) - x² * (T(1/7560) - x² * T(1/498960)))
+        return inv(T(15)) - x² * (inv(T(210)) - x² * (inv(T(7560)) - x² * inv(T(498960))))
     else
         return T(sphericalbesselj(2, x)) / x²
     end
@@ -445,9 +544,9 @@ function eigenmode_quadrupole!(u::AbstractArray{T},
 end
 
 ################################################################################
-# Wave-equation RHS: apply_laplacian3d! + Sommerfeld dissipative pass
+# Wave-equation RHS: apply_laplacian! + Sommerfeld dissipative pass
 #
-# `apply_laplacian3d!` treats outer faces with `bdry == SOMMERFELD_BDRY_TAG`
+# `apply_laplacian!` treats outer faces with `bdry == SOMMERFELD_BDRY_TAG`
 # as "free" (zero SAT contribution), so we can layer a dedicated Sommerfeld
 # face SAT on top without double-counting. The Sommerfeld term drives the
 # outgoing characteristic `w_out = u̇ + ∂_n u` to zero by adding the
@@ -457,7 +556,8 @@ end
 @inline function _sommerfeld_face!(::Val{f}, i, j, k, e,
                                     ü::AbstractArray{T, 4},
                                     u̇::AbstractArray{T, 4},
-                                    geom::MeshGeometry{T, N},
+                                    geom::MeshGeometry{3, T, N},
+                                    work::MeshWorkspace{3, T, N},
                                     H_1d::SVector{N, T},
                                     sommerfeld_tag::Int8,
                                     inv_R::T,
@@ -501,14 +601,14 @@ end
     @inbounds wF = JF * H_1d[p_local] * H_1d[q_local]
 
     # Physical normal gradient at this face node — pre-computed by
-    # apply_laplacian3d!'s pass-1 face-trace gather. Slot 1 already holds
+    # apply_laplacian!'s pass-1 face-trace gather. Slot 1 already holds
     # `u` at the same face node, so the BGT-1 spherical correction
     # `+ u/R` reads from `face_trace[1, …]` rather than `u[…]` for
     # memory coalescence.
-    @inbounds u_self = geom.face_trace[1, p_local, q_local, f, e]
-    @inbounds gx = geom.face_trace[2, p_local, q_local, f, e]
-    @inbounds gy = geom.face_trace[3, p_local, q_local, f, e]
-    @inbounds gz = geom.face_trace[4, p_local, q_local, f, e]
+    @inbounds u_self = work.face_trace[1, p_local, q_local, f, e]
+    @inbounds gx = work.face_trace[2, p_local, q_local, f, e]
+    @inbounds gy = work.face_trace[3, p_local, q_local, f, e]
+    @inbounds gz = work.face_trace[4, p_local, q_local, f, e]
     Gn = nx * gx + ny * gy + nz * gz
 
     @inbounds u̇_self = u̇[i, j, k, e]
@@ -525,7 +625,7 @@ end
 
 @kernel function _sommerfeld_pass_kernel!(ü::AbstractArray{T},
                                           @Const(u̇::AbstractArray{T}),
-                                          geom, H_1d,
+                                          geom, work, H_1d,
                                           sommerfeld_tag::Int8,
                                           inv_R::T,
                                           ::Val{N}) where {T, N}
@@ -536,24 +636,25 @@ end
     # Each face contributes to its own outgoing-flux drag. Workitems on
     # multiple faces (edges/corners) accumulate one drag per face they
     # lie on — matching the continuum surface integral.
-    _sommerfeld_face!(Val(1), i, j, k, e, ü, u̇, geom, H_1d, sommerfeld_tag, inv_R, Val(N))
-    _sommerfeld_face!(Val(2), i, j, k, e, ü, u̇, geom, H_1d, sommerfeld_tag, inv_R, Val(N))
-    _sommerfeld_face!(Val(3), i, j, k, e, ü, u̇, geom, H_1d, sommerfeld_tag, inv_R, Val(N))
-    _sommerfeld_face!(Val(4), i, j, k, e, ü, u̇, geom, H_1d, sommerfeld_tag, inv_R, Val(N))
-    _sommerfeld_face!(Val(5), i, j, k, e, ü, u̇, geom, H_1d, sommerfeld_tag, inv_R, Val(N))
-    _sommerfeld_face!(Val(6), i, j, k, e, ü, u̇, geom, H_1d, sommerfeld_tag, inv_R, Val(N))
+    _sommerfeld_face!(Val(1), i, j, k, e, ü, u̇, geom, work, H_1d, sommerfeld_tag, inv_R, Val(N))
+    _sommerfeld_face!(Val(2), i, j, k, e, ü, u̇, geom, work, H_1d, sommerfeld_tag, inv_R, Val(N))
+    _sommerfeld_face!(Val(3), i, j, k, e, ü, u̇, geom, work, H_1d, sommerfeld_tag, inv_R, Val(N))
+    _sommerfeld_face!(Val(4), i, j, k, e, ü, u̇, geom, work, H_1d, sommerfeld_tag, inv_R, Val(N))
+    _sommerfeld_face!(Val(5), i, j, k, e, ü, u̇, geom, work, H_1d, sommerfeld_tag, inv_R, Val(N))
+    _sommerfeld_face!(Val(6), i, j, k, e, ü, u̇, geom, work, H_1d, sommerfeld_tag, inv_R, Val(N))
 end
 
 """
-    rhs_wave3d!(ü, u, u̇, params; geom, ops)
-    rhs_wave3d!(ü, u, u̇, bdry_values; geom, ops, τ, sommerfeld_R = T(Inf))
+    rhs_wave3d!(ü, u, u̇, params;        geom, ops, work)
+    rhs_wave3d!(ü, u, u̇, bdry_values;   geom, ops, work, τ, sommerfeld_R = T(Inf))
 
 3D wave-equation RHS: `ü = L_h u` plus a Sommerfeld dissipative SAT at
 outer faces tagged `7`. Internally calls
-`HexSBPSAT.apply_laplacian3d!(ü, u, bdry_values; geom, ops, τ)` (which
-sees Sommerfeld faces as "free" and contributes nothing on them), then a
-second kernel iterates over outer faces tagged `7` and adds the
-Bayliss–Turkel dissipative drag
+`HexSBPSAT.apply_laplacian!(ü, u, bdry_values; geom, ops, work, τ)`
+(which sees Sommerfeld faces as "free" and contributes nothing on
+them), then a second kernel iterates over outer faces tagged `7` and
+reads the per-face physical gradient out of `work.face_trace` to add
+the Bayliss–Turkel dissipative drag
 
 ```
 Δü = −wF · (u̇ + ∂_n u + u/R) / H_phys
@@ -574,25 +675,29 @@ leaves behind.
 """
 function rhs_wave3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
                      params::Params3d{T};
-                     geom::MeshGeometry{T, N}, ops::SBPOps{N, T}) where {N, T}
+                     geom::MeshGeometry{3, T, N},
+                     ops::SBPOps{N, T},
+                     work::MeshWorkspace{3, T, N}) where {N, T}
     return rhs_wave3d!(ü, u, u̇, params.bdry_values;
-                       geom, ops, τ = params.τ,
+                       geom, ops, work, τ = params.τ,
                        sommerfeld_R = params.sommerfeld_R)
 end
 
 function rhs_wave3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
                      bdry_values::NTuple{6, T};
-                     geom::MeshGeometry{T, N}, ops::SBPOps{N, T}, τ,
+                     geom::MeshGeometry{3, T, N},
+                     ops::SBPOps{N, T},
+                     work::MeshWorkspace{3, T, N}, τ,
                      sommerfeld_R = T(Inf)) where {N, T}
     @assert size(ü) == size(u̇) == size(u)
     @assert size(u, 1) == size(u, 2) == size(u, 3) == N
     @assert size(u, 4) == geom.Ne
 
     # Pass 1: spatial Laplacian + interior SIPG + outer Dirichlet SAT.
-    # Sommerfeld-tagged outer faces are skipped by `apply_laplacian3d!`.
-    # As a side effect, `geom.face_trace` is populated with `(u, ∇u)` at
+    # Sommerfeld-tagged outer faces are skipped by `apply_laplacian!`.
+    # As a side effect, `work.face_trace` is populated with `(u, ∇u)` at
     # every face quadrature node, which the Sommerfeld pass below reads.
-    apply_laplacian3d!(ü, u, bdry_values; geom, ops, τ)
+    apply_laplacian!(ü, u, bdry_values; geom, ops, work, τ)
 
     # Pass 2: Sommerfeld dissipative drag. Only fires on outer faces
     # tagged `SOMMERFELD_BDRY_TAG`; on all other faces each workitem's
@@ -602,7 +707,7 @@ function rhs_wave3d!(ü::AbstractArray{T,4}, u::AbstractArray{T,4}, u̇::Abstrac
     inv_R = one(T) / T(sommerfeld_R)
     backend = get_backend(u)
     _sommerfeld_pass_kernel!(backend, N^3)(
-        ü, u̇, geom, H_1d, SOMMERFELD_BDRY_TAG, inv_R, Val(N);
+        ü, u̇, geom, work, H_1d, SOMMERFELD_BDRY_TAG, inv_R, Val(N);
         ndrange = N^3 * geom.Ne)
 
     return ü
@@ -633,7 +738,7 @@ ops  = make_operators(elem)
 dt   = recommended_dt(geom, ops, τ)
 ```
 """
-function recommended_dt(geom::MeshGeometry{T, N}, ops::SBPOps{N, T}, τ;
+function recommended_dt(geom::MeshGeometry{3, T, N}, ops::SBPOps{N, T}, τ;
                          cfl_safety = T(0.9)) where {N, T}
     λ = spectral_radius_estimate(geom, ops, τ)
     λ == 0 && return T(Inf)

@@ -35,7 +35,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
     _section("test_sommerfeld.jl");  include("test_sommerfeld.jl")
     # The mesh-topology tests live in `HexMeshes/test/test_mesh.jl`.
     # The operator-level tests (SBP identities, MeshGeometry shape,
-    # apply_laplacian3d! symmetry / spectrum, to_device round-trip)
+    # apply_laplacian! symmetry / spectrum, to_device round-trip)
     # live in `HexSBPSAT/test/`. Run them with
     #   cd HexMeshes  && julia --project=. -e 'using Pkg; Pkg.test()'
     #   cd HexSBPSAT  && julia --project=. -e 'using Pkg; Pkg.test()'

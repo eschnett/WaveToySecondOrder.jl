@@ -15,6 +15,7 @@ elem = W.make_element(T, N)
 ops  = W.make_operators(elem)
 mesh = W.make_cubical_mesh(T, M, T(0), T(1))
 geom = W.make_geometry(mesh, elem)
+work = W.make_workspace(geom)
 params = W.Params3d(;
     A           = one(T),
     k           = (T(2π), T(2π), T(2π)),
@@ -27,12 +28,13 @@ println("  Ne = ", mesh.Ne, "  T = ", T)
 u_host  = randn(T, N, N, N, mesh.Ne)
 u̇_host  = randn(T, N, N, N, mesh.Ne)
 ü_host  = similar(u_host)
-W.rhs_wave3d!(ü_host, u_host, u̇_host, params; geom, ops)
+W.rhs_wave3d!(ü_host, u_host, u̇_host, params; geom, ops, work)
 println("  CPU rhs_wave3d! ok, max|ü| = ", maximum(abs, ü_host))
 
 println("\n=== Stage 2: migrate geometry to Metal ===")
 backend = MetalBackend()
 geom_dev = W.to_device(geom, backend)
+work_dev = W.to_device(work, backend)
 println("  geom_dev.coords type:        ", typeof(geom_dev.coords))
 println("  geom_dev.conn.neighbour type: ", typeof(geom_dev.conn.neighbour))
 
@@ -44,7 +46,7 @@ u̇_dev  = MtlArray(u̇_host)
 println("  u_dev type:  ", typeof(u_dev))
 
 println("\n=== Stage 4: rhs_wave3d! single call on Metal ===")
-W.rhs_wave3d!(ü_dev, u_dev, u̇_dev, params; geom = geom_dev, ops)
+W.rhs_wave3d!(ü_dev, u_dev, u̇_dev, params; geom = geom_dev, ops, work = work_dev)
 KernelAbstractions.synchronize(backend)
 ü_back = Array(ü_dev)
 println("  device max|ü| = ", maximum(abs, ü_back))
@@ -74,8 +76,8 @@ dx = elem.h * (one(T) / M)
 dt = (T(1//2) * dx) / sqrt(T(3))
 t1 = T(0.1f0)
 
-f_host!(ü, u̇, u, p::W.Params3d, t) = W.rhs_wave3d!(ü, u, u̇, p; geom = geom,     ops)
-f_dev!(ü,  u̇, u, p::W.Params3d, t) = W.rhs_wave3d!(ü, u, u̇, p; geom = geom_dev, ops)
+f_host!(ü, u̇, u, p::W.Params3d, t) = W.rhs_wave3d!(ü, u, u̇, p; geom = geom,     ops, work)
+f_dev!(ü,  u̇, u, p::W.Params3d, t) = W.rhs_wave3d!(ü, u, u̇, p; geom = geom_dev, ops, work = work_dev)
 
 prob_host = SecondOrderODEProblem(f_host!, u̇_host, u_host, (T(0), t1), params)
 prob_dev  = SecondOrderODEProblem(f_dev!,  u̇_dev,  u_dev,  (T(0), t1), params)
