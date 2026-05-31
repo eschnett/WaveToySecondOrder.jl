@@ -1,7 +1,7 @@
 name = "WaveToySecondOrder"
 uuid = "f1991996-c646-45c7-ab9a-2d4391aa9bc8"
-authors = ["Erik Schnetter <schnetter@gmail.com>"]
 version = "1.0.0"
+authors = ["Erik Schnetter <schnetter@gmail.com>"]
 
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
@@ -15,6 +15,7 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 OrdinaryDiffEqSymplecticRK = "fa646aed-7ef9-47eb-84c4-9443fc8cbfa8"
 ProgressMeter = "92933f4c-e287-5a05-a399-4b506db050ca"
 SixelTerm = "65edfddc-f399-4499-8369-a1bd38eee2ea"
+SpacetimeMetrics = "77e61b41-605e-43a6-b70f-04b7dcd1f572"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 

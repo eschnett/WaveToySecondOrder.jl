@@ -10,3 +10,5 @@ Adhere to these preferences if possible:
   also shell comments. Use another mechanism for comments, e.g. output
   them via `println`, or keep them as triple-quited string in the
   source code, or similar.
+- Do not add "co-authored by claude" or similar text to commit
+  messages.

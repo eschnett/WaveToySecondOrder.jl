@@ -18,6 +18,11 @@
 - why no wave1d?
 - test with Float32x2, Float64x2
 - avoid constant 1/100 in _j2_over_x2; look at eps(T) instead
+- change `main2d(; mesh_kind = :inflated_square, ic_kind = :outgoing, outer_bc = :sommerfeld, t1 = 1.5, N = 4, M = 8)` id so that t1=1 suffices
+- periodic boundaries for cubed-* meshes
+- GH: codegen for gauge and physical constraints
+- helper function for walking grid, inter-element boundaries?
+- helper function for reductions
 
 # Long-term ideas
 
@@ -65,4 +70,4 @@ main3d(; N = 4, M = 8)
 main3d(; mesh_kind = :cubed_cube, N = 4, M = 8)
 main3d(; mesh_kind = :inflated_cube, ic_kind = :radial, N = 4, M = 8)
 main3d(; mesh_kind = :inflated_cube, ic_kind = :outgoing, outer_bc = :sommerfeld, N = 4, M = 8)
-main3d(; T = Float32, backend = MetalBackend(), mesh_kind = :inflated_cube, ic_kind = :outgoing, outer_bc = :sommerfeld, t1 = 1.5, N = 4, M = 8)
+main3d(; T = Float32, backend = MetalBackend(), mesh_kind = :inflated_cube, ic_kind = :outgoing, outer_bc = :sommerfeld, N = 4, M = 8)

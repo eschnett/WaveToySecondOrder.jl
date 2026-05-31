@@ -41,6 +41,7 @@ using HexSBPSAT: _face_axis_idx, _face_row, _face_sign, _cross_sign,
 using HexSBPSAT: _face_axis_idx_2d, _face_row_2d, _face_sign_2d,
                  _cross_sign_2d, _tangent_axis_2d, _ij_from_li
 
+import SpacetimeMetrics
 using FastGaussQuadrature: gausslegendre
 using KernelAbstractions
 using KernelAbstractions: @kernel, @index, @Const, get_backend, CPU
@@ -61,6 +62,17 @@ include("wave.jl")
 # `eigenmode_cartesian_2d!`, `eigenmode_radial_2d!`, `rhs_wave2d!`,
 # and the 2D `recommended_dt`).
 include("wave2d.jl")
+
+# `wave_lap_strong.jl`: alternative single-element scalar Laplacian
+# in strong form (SBP G applied twice with centred-flux SAT). Lives
+# next to `apply_laplacian!` (SIPG) for direct comparison; not used
+# by the evolution drivers yet.
+include("wave_lap_strong.jl")
+
+# `wave_curved_rhs.jl`: scalar wave equation on a prescribed 4-metric
+# in fully second-order form, mirroring `gh_rhs_element!`. Scalar
+# testbed for the GH spatial discretisation.
+include("wave_curved_rhs.jl")
 
 # `evolve.jl`: high-level drivers `evolve1d`, `evolve2d`, `evolve3d`.
 # Each builds the geometry, runs a symplectic integration, samples a
@@ -103,6 +115,20 @@ export
     eigenmode_cartesian!, eigenmode_radial!, eigenmode_quadrupole!,
     outgoing_pulse!,
     rhs_wave3d!,
+    # Strong-form single-element scalar Laplacian (alternative to SIPG
+    # `apply_laplacian!`). Two variants — `_element!` is the centred-flux
+    # form (stable but not H-symmetric); `_conservative_element!` adds
+    # Mattsson–Nordström SAT pair so `H · L` is symmetric and energy is
+    # conserved by the semidiscrete equations.
+    wave_lap_strong_element!,
+    wave_lap_strong_conservative_element!,
+    wave_lap_strong_conservative_mesh!,
+    # Scalar wave on a prescribed 4-metric (`wave_curved_rhs.jl`).
+    wave_curved_rhs_element!,
+    wave_curved_rhs_mesh!,
+    wave_curved_rhs_conservative_element!,
+    wave_curved_rhs_conservative_mesh!,
+    eval_curved_background!,
     # Dimension-generic timestep limit (dispatches on dom / MeshGeometry)
     recommended_dt,
     # High-level drivers (move out of `bin/waveplot{1,2,3}d.jl`)
