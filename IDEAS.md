@@ -23,6 +23,14 @@
 - GH: codegen for gauge and physical constraints
 - helper function for walking grid, inter-element boundaries?
 - helper function for reductions
+- test shift > 1
+- GH: test with GPU
+- ensure there are wavetoy tests with the curvilinear mesh
+- add figure with the curvilinear mesh to readme
+- check docs for HexMeshes
+- new release for HexMeshes
+- enums for boundary tags
+- rename "inflated cube" to "cubed sphere"?
 
 # Long-term ideas
 
@@ -41,6 +49,7 @@
 - implement GH
 - add proper I/O. which package? ADIOS2? HDF5? what metadata? conduit? XDMF/HDF5? VTKHDF?
 - run large test, check convergence
+- implement electrodynamics
 
 # Bad ideas
 

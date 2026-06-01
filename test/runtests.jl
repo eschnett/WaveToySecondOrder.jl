@@ -37,6 +37,12 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
     _section("test_wave_lap_strong_conservative.jl"); include("test_wave_lap_strong_conservative.jl")
     _section("test_wave_lap_strong_mesh.jl"); include("test_wave_lap_strong_mesh.jl")
     _section("test_wave_curved.jl"); include("test_wave_curved.jl")
+    _section("test_wave_strong_rhs.jl"); include("test_wave_strong_rhs.jl")
+    _section("test_periodic_warped.jl"); include("test_periodic_warped.jl")
+    _section("test_dirichlet_cube.jl"); include("test_dirichlet_cube.jl")
+    _section("test_dirichlet_warped.jl"); include("test_dirichlet_warped.jl")
+    _section("test_dirichlet_cubed_cube.jl"); include("test_dirichlet_cubed_cube.jl")
+    _section("test_dirichlet_cubed_sphere.jl"); include("test_dirichlet_cubed_sphere.jl")
     # The mesh-topology tests live in `HexMeshes/test/test_mesh.jl`.
     # The operator-level tests (SBP identities, MeshGeometry shape,
     # apply_laplacian! symmetry / spectrum, to_device round-trip)

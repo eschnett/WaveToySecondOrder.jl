@@ -74,6 +74,11 @@ include("wave_lap_strong.jl")
 # testbed for the GH spatial discretisation.
 include("wave_curved_rhs.jl")
 
+# `wave_strong_rhs.jl`: curvilinear strong-form scalar wave RHS on a
+# `MeshGeometry`. Supports cubed-cube / inflated-cube meshes with
+# Bayliss–Turkel Sommerfeld at outer faces (tag 7).
+include("wave_strong_rhs.jl")
+
 # `evolve.jl`: high-level drivers `evolve1d`, `evolve2d`, `evolve3d`.
 # Each builds the geometry, runs a symplectic integration, samples a
 # spacetime slice + L² error, and returns a NamedTuple consumed by
@@ -129,6 +134,10 @@ export
     wave_curved_rhs_conservative_element!,
     wave_curved_rhs_conservative_mesh!,
     eval_curved_background!,
+    # Curvilinear strong-form RHS on MeshGeometry with Sommerfeld
+    # outer BC (`wave_strong_rhs.jl`).
+    wave_strong_rhs_element!,
+    wave_strong_rhs_mesh!,
     # Dimension-generic timestep limit (dispatches on dom / MeshGeometry)
     recommended_dt,
     # High-level drivers (move out of `bin/waveplot{1,2,3}d.jl`)
