@@ -554,13 +554,16 @@ function evolve3d(; T::Type = Float64,
                     Nt::Int = 200,
                     cfl_safety::Real = 1//2,
                     slice_y::Union{Nothing, Real} = nothing,
-                    slice_z::Union{Nothing, Real} = nothing)
+                    slice_z::Union{Nothing, Real} = nothing,
+                    inner_bc::Symbol = :excision)
 
     on_cpu = backend isa CPU
     on_cpu || T <: AbstractFloat ||
         error("non-CPU backend requires a floating-point T; got $T")
-    if outer_bc !== :dirichlet && mesh_kind !== :inflated_cube
-        error("evolve3d: outer_bc = :$outer_bc only supported on mesh_kind = :inflated_cube")
+    if outer_bc !== :dirichlet &&
+       !(mesh_kind === :inflated_cube || mesh_kind === :radial_shell)
+        error("evolve3d: outer_bc = :$outer_bc only supported on " *
+              "mesh_kind ∈ (:inflated_cube, :radial_shell)")
     end
 
     elem = make_element(T, N)
@@ -575,8 +578,17 @@ function evolve3d(; T::Type = Float64,
     elseif mesh_kind === :inflated_cube
         x0, x1 = -T(R2), T(R2)
         mesh = make_inflated_cube_mesh(T, T(L), T(R1), T(R2), M; outer_bc)
+    elseif mesh_kind === :radial_shell
+        # Pure 6-patch spherical shell R1 ≤ |x| ≤ R2 — for BH excision
+        # (inner sphere R1 is the excision surface). Default
+        # `inner_bc = :excision` triggers the no-SAT branch in
+        # `wave_strong_rhs_element!`.
+        x0, x1 = -T(R2), T(R2)
+        mesh = make_radial_shell_mesh(T, T(R1), T(R2), M;
+                                        outer_bc, inner_bc)
     else
-        error("evolve3d: unknown mesh_kind: $mesh_kind (use :cubical, :cubed_cube, :inflated_cube)")
+        error("evolve3d: unknown mesh_kind: $mesh_kind " *
+              "(use :cubical, :cubed_cube, :inflated_cube, :radial_shell)")
     end
 
     geom_host = make_geometry(mesh, elem)
@@ -605,7 +617,8 @@ function evolve3d(; T::Type = Float64,
     end
     ic_center = ((x0 + x1) / 2, (x0 + x1) / 2, (x0 + x1) / 2)
 
-    sommerfeld_R = (mesh_kind === :inflated_cube && outer_bc === :sommerfeld) ?
+    sommerfeld_R = (mesh_kind in (:inflated_cube, :radial_shell) &&
+                     outer_bc === :sommerfeld) ?
                        T(R2) : T(Inf)
     τ_mult = mesh_kind === :cubical ? T(3//2) : T(8)
     params = Params3d(; A = one(T),

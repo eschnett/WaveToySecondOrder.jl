@@ -50,6 +50,8 @@
 - add proper I/O. which package? ADIOS2? HDF5? what metadata? conduit? XDMF/HDF5? VTKHDF?
 - run large test, check convergence
 - implement electrodynamics
+- mesh for two black holes
+- initial conditions, superposed kerr-schild, effective Tμν, i⁰
 
 # Bad ideas
 

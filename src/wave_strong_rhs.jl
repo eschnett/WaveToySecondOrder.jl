@@ -190,11 +190,21 @@ function wave_strong_rhs_element!(ü::AbstractArray{T, 3},
     #   tag 1..6    → Dirichlet outer face, Mattsson–Nordström vs u_face[f]
     #                  (homogeneous when u_face[f] is pre-filled with zeros)
     #   tag == 7    → Sommerfeld outer face, Bayliss–Turkel BGT-0 / BGT-1
+    #   tag == 8    → Excision / pure-outflow face: NO SAT correction.
+    #                  Used at BH excision surfaces where all
+    #                  characteristics inside the apparent horizon are
+    #                  ingoing to the BH (= leaving the computational
+    #                  domain), so no boundary information is needed.
+    #                  The natural SBP one-sided stencil at the boundary
+    #                  node is the discrete realisation of "no incoming
+    #                  characteristic".
     @inbounds for f in 1:6
         α        = (f + 1) >> 1
         f_sign   = T(isodd(f) ? -1 : +1)
         face_row = isodd(f) ? 1 : N
         tag      = bdry[f]
+        is_excision   = (tag == Int8(8))
+        is_excision && continue   # no SAT for excision / outflow
         is_sommerfeld = (tag == Int8(7))
         is_dirichlet  = (Int8(1) ≤ tag ≤ Int8(6))
         # Interior and Dirichlet share the same SAT branch — the only
