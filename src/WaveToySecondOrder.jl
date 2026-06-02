@@ -85,6 +85,9 @@ include("wave_strong_rhs.jl")
 # the matching `bin/waveplot{1,2,3}d.jl` plot script.
 include("evolve.jl")
 
+include("wave1d_shift.jl")
+include("wave1d_admshift.jl")
+
 # Re-export the operator-layer symbols that downstream `bin/` scripts
 # and tests are used to seeing at the WaveToy level. Keeps the existing
 # `using WaveToySecondOrder` call sites working unchanged for both the
@@ -110,6 +113,12 @@ export
     physical_mass_diagonal,
     # Wave-equation layer — 1D
     Params1d, initialize!, rhs_wave1d!,
+    # 1D scalar wave on a 1+1 metric with constant shift β.
+    make_periodic_domain_1d, wave1d_shift_rhs!,
+    # ADM form (first-order-in-time) with consistent D + Kreiss-Oliger.
+    # Stable for arbitrary β (sub- and superluminal); see file header
+    # of `wave1d_admshift.jl` for the energy identity.
+    wave1d_admshift_rhs!,
     # Wave-equation layer — 2D
     Params2d, initialize2d!,
     eigenmode_cartesian_2d!, eigenmode_radial_2d!,

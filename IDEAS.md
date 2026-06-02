@@ -31,6 +31,13 @@
 - new release for HexMeshes
 - enums for boundary tags
 - rename "inflated cube" to "cubed sphere"?
+- proper sommerfeld boundary conditions for cubed sphere
+- inhomogenous dirichlet boundary conditions for cubed sphere
+- use these in ks example
+- set up all apples-with-apples tests
+- visualization helper functions in HexMeshes for distorted meshes (curved mesh lines)
+- what second-order integrators are suitable?
+- test converting the scripts to julia apps
 
 # Long-term ideas
 
