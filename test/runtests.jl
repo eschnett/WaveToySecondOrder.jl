@@ -30,7 +30,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
                   flush(stderr))
 
 @testset verbose = true "WaveToySecondOrder" begin
-    _section("test_kernels1d.jl");   include("test_kernels1d.jl")
+    _section("test_wave1d.jl");      include("test_wave1d.jl")
     _section("test_kernels3d.jl");   include("test_kernels3d.jl")
     _section("test_sommerfeld.jl");  include("test_sommerfeld.jl")
     _section("test_wave_lap_strong.jl"); include("test_wave_lap_strong.jl")
@@ -44,7 +44,10 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
     _section("test_dirichlet_cubed_cube.jl"); include("test_dirichlet_cubed_cube.jl")
     _section("test_dirichlet_cubed_sphere.jl"); include("test_dirichlet_cubed_sphere.jl")
     _section("test_radial_shell.jl"); include("test_radial_shell.jl")
-    _section("test_curved1d_wave.jl"); include("test_curved1d_wave.jl")
+    # `test_evolve1d.jl` exercises the DiffEq-based `evolve1d` driver
+    # end-to-end (the 1D kernel itself is covered by `test_wave1d.jl`
+    # at the top).
+    _section("test_evolve1d.jl");    include("test_evolve1d.jl")
     # The mesh-topology tests live in `HexMeshes/test/test_mesh.jl`.
     # The operator-level tests (SBP identities, MeshGeometry shape,
     # apply_laplacian! symmetry / spectrum, to_device round-trip)

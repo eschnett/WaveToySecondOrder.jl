@@ -4,7 +4,6 @@
 #   * `Params3d{T}` — the wave-equation parameter bundle (`A, k, ω, τ,
 #     bdry_values`) used as the `p` argument of an
 #     `OrdinaryDiffEq.SecondOrderODEProblem`.
-#   * `initialize!` — 1D sin·cos IC used by the 1D test driver.
 #   * `initialize3d!` — sin·sin·sin·cos Cartesian IC.
 #   * `eigenmode_cartesian!`, `eigenmode_radial!`, `eigenmode_quadrupole!`
 #     — three families of exact eigenmodes of `ü = ∇² u` (Dirichlet cube,
@@ -23,114 +22,12 @@
 
 const SOMMERFELD_BDRY_TAG = Int8(7)
 
-################################################################################
-# 1D wave-equation layer.
-#
-# Mirror of the 3D layer at lower dimension. The 1D operator backing
-# `rhs_wave1d!` is the global SBP-SAT Laplacian from `kernels1d.jl`
-# (matrix layout `(N, M)`: row = local GLL node, column = element).
-# There's no `MeshGeometry{1}` — the 1D path uses the lightweight
-# `dom = make_domain(T, M, x0, x1)` NamedTuple instead.
-
-# Cartesian eigenmode IC. Same family as `eigenmode_cartesian_2d!` /
-# `eigenmode_cartesian!` (3D): a standing wave `sin(kx)·cos(ωt)`. The
-# 1D dispersion relation is `ω = k` (wave speed 1).
-function initialize!(u::AbstractVector, u̇::AbstractVector, x::AbstractVector, t;
-                     A, k, ω)
-    u .=  A   * sin.(k*x) * cos(ω*t)
-    u̇ .= -A*ω * sin.(k*x) * sin(ω*t)
-    return u, u̇
-end
-
-function initialize!(u::AbstractMatrix, u̇::AbstractMatrix, x::AbstractMatrix, t;
-                     A, k, ω)
-    @assert size(u̇) == size(x) == size(u)
-    # Single broadcast over the whole `(N, M)` matrix — works on plain
-    # `Array`, `MtlArray`, `CuArray`, … without per-column loops.
-    @. u  =  A   * sin(k * x) * cos(ω * t)
-    @. u̇ = -A*ω * sin(k * x) * sin(ω * t)
-    return u, u̇
-end
-
-"""
-    Params1d{T}
-
-1D wave-equation parameter bundle:
-
-* `A` — IC amplitude.
-* `k`, `ω` — IC wavenumber and angular frequency. For the standard
-  wave equation `u_tt = u_xx` on `[x0, x1]` with Dirichlet ends,
-  `k = nπ/(x1 - x0)` and `ω = k`.
-* `τ` — SIPG penalty constant for the 1D `apply_laplacian!`.
-* `bL`, `bR` — Dirichlet values at the left / right ends.
-
-The 1D wave layer has no `geom` (no `MeshGeometry{1}` exists); the
-caller passes `dom = make_domain(T, M, x0, x1)` and `ops` instead.
-"""
-struct Params1d{T}
-    A  :: T
-    k  :: T
-    ω  :: T
-    τ  :: T
-    bL :: T
-    bR :: T
-end
-
-"""
-    Params1d(; A, k, ω, τ, bL, bR) → Params1d{T}
-
-Keyword constructor — promotes all inputs to a common floating-point
-type.
-"""
-function Params1d(; A, k, ω, τ, bL, bR)
-    T = promote_type(typeof(A), typeof(k), typeof(ω),
-                     typeof(τ), typeof(bL), typeof(bR))
-    return Params1d{T}(T(A), T(k), T(ω), T(τ), T(bL), T(bR))
-end
-
-"""
-    rhs_wave1d!(ü, u, u̇, params; dom, ops)
-    rhs_wave1d!(ü, u, u̇; dom, ops, τ, bL = 0, bR = 0)
-
-1D wave-equation RHS: `ü = L_h u` via the global 1D SBP-SAT operator
-from `kernels1d.jl`. State arrays `ü`, `u`, `u̇` are matrices of
-shape `(N, M)` — one column per element.
-"""
-function rhs_wave1d!(ü::AbstractMatrix{T}, u::AbstractMatrix{T}, u̇::AbstractMatrix{T},
-                     params::Params1d{T};
-                     dom, ops::SBPOps{N, T}) where {N, T}
-    return rhs_wave1d!(ü, u, u̇; dom, ops, τ = params.τ,
-                       bL = params.bL, bR = params.bR)
-end
-
-function rhs_wave1d!(ü::AbstractMatrix{T}, u::AbstractMatrix{T}, u̇::AbstractMatrix{T};
-                     dom, ops::SBPOps{N, T}, τ,
-                     bL::T = zero(T), bR::T = zero(T)) where {N, T}
-    @assert size(ü) == size(u̇) == size(u)
-    apply_laplacian!(ü, u, bL, bR; dom, ops, τ)
-    return ü
-end
-
-"""
-    recommended_dt(dom, ops::SBPOps{N, T}, τ; cfl_safety = 0.9) → T
-
-1D Störmer–Verlet timestep limit `cfl_safety · 2 / sqrt(|λ_max|)`. The
-spectral radius `|λ_max|` is read off the assembled global 1D
-Laplacian (cheap on the meshes the 1D driver typically uses — M ≤ a
-few hundred elements).
-
-Dispatches on the 1D `dom` returned by `HexSBPSAT.make_domain` (a
-NamedTuple), so this method coexists with the 2D / 3D
-`recommended_dt(::MeshGeometry{D}, …)` methods without ambiguity.
-"""
-function recommended_dt(dom::NamedTuple, ops::SBPOps{N, T}, τ;
-                         cfl_safety = T(0.9)) where {N, T}
-    L = build_global_laplacian(dom.N; ops, τ)
-    Lh = Matrix(L) ./ dom.h^2
-    λ_max = maximum(abs, eigvals(Lh))
-    λ_max == 0 && return T(Inf)
-    return cfl_safety * T(2) / sqrt(λ_max)
-end
+# The 1D wave-equation layer lives in `wave1d.jl`: conservative-form
+# scalar wave on a 1+1 ADM background (α, β, γ_xx) discretised with
+# `HexMeshes.Mesh{1}` + `HexSBPSAT.apply_D!`. The former flat
+# second-order-in-time 1D path (`Params1d`, `rhs_wave1d!`, 1D
+# `initialize!`, 1D `recommended_dt`) was removed — the ADM kernel with
+# α = γ = 1, β = 0 covers the flat case.
 
 ################################################################################
 # System parameters

@@ -71,12 +71,12 @@
 
 using Revise
 using Metal
-include("bin/waveplot1d.jl")
+include("bin/wave1d.jl")
 include("bin/waveplot2d.jl")
 include("bin/waveplot3d.jl")
 
 main1d(; N = 4, M = 32)
-main1d(; T = Float32, backend = MetalBackend(), N = 4, M = 32)
+main1d(; T = Float32, backend = MetalBackend(), N = 4, M = 32, background = :constant_shift)
 
 main2d(; N = 4, M = 8)
 main2d(; mesh_kind = :cubed_square, N = 4, M = 8)

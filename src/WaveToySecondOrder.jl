@@ -46,16 +46,22 @@ using FastGaussQuadrature: gausslegendre
 using KernelAbstractions
 using KernelAbstractions: @kernel, @index, @Const, get_backend, CPU
 using LinearAlgebra: eigvals
+# Symplectic partitioned RK for the 2D/3D `SecondOrderODEProblem`
+# drivers; explicit RK (RK4 / Tsit5 / Vern7) for the first-order 1D
+# ADM system, which is not Hamiltonian for variable shift.
 using OrdinaryDiffEqSymplecticRK
+using OrdinaryDiffEqLowOrderRK   # RK4; reexports ODEProblem etc.
+using OrdinaryDiffEqTsit5        # Tsit5
+using OrdinaryDiffEqVerner       # Vern7
+using RecursiveArrayTools: ArrayPartition
 using ProgressMeter
 using SpecialFunctions: besselj, sphericalbesselj
 using StaticArrays
 
-# `wave.jl`: 1D + 3D wave-equation layer. 1D side: `Params1d`,
-# `initialize!`, `rhs_wave1d!`, `recommended_dt(::NamedTuple)`. 3D
-# side: `Params3d`, `initialize3d!`, eigenmodes, `rhs_wave3d!`
-# (apply_laplacian! + Sommerfeld dissipative pass), and the 3D
-# `recommended_dt`.
+# `wave.jl`: 3D wave-equation layer — `Params3d`, `initialize3d!`,
+# eigenmodes, `rhs_wave3d!` (apply_laplacian! + Sommerfeld dissipative
+# pass), and the 3D `recommended_dt`. (The 1D layer lives in
+# `wave1d.jl`.)
 include("wave.jl")
 
 # `wave2d.jl`: 2D wave-equation layer (`Params2d`, `initialize2d!`,
@@ -85,7 +91,11 @@ include("wave_strong_rhs.jl")
 # the matching `bin/waveplot{1,2,3}d.jl` plot script.
 include("evolve.jl")
 
-include("wave1d_curved.jl")
+# `wave1d.jl`: conservative-form 1D scalar wave on a 1+1 ADM
+# background with arbitrary lapse α(t,x), shift β(t,x), and spatial
+# metric γ_xx(t,x), discretised with `HexMeshes.Mesh{1}` +
+# `HexSBPSAT.apply_D!`, plus the `Background1D` sampling layer.
+include("wave1d.jl")
 
 # Re-export the operator-layer symbols that downstream `bin/` scripts
 # and tests are used to seeing at the WaveToy level. Keeps the existing
@@ -110,13 +120,17 @@ export
     spectral_radius_estimate,
     discrete_inner_product, discrete_l2_norm,
     physical_mass_diagonal,
-    # Wave-equation layer — 1D
-    Params1d, initialize!, rhs_wave1d!,
-    # Conservative-form 1D scalar wave on a 1+1 metric with α=1,
-    # space- and time-varying β(t,x) and γ_xx(t,x); densitised Π.
-    # See `wave1d_curved.jl` for the equations and discretisation.
-    make_periodic_domain_1d,
-    wave1d_curved1d_rhs!,
+    # Wave-equation layer — 1D: conservative-form scalar wave on a
+    # 1+1 ADM background with arbitrary α(t,x), β(t,x), γ_xx(t,x) on
+    # HexMeshes/HexSBPSAT (`wave1d.jl`); densitised
+    # Π := (√γ/α)(∂_t Φ − β ∂_x Φ).
+    Wave1DWorkspace, make_wave1d_workspace,
+    wave1d_curved_rhs!, wave1d_energy,
+    # ADM background sampling (analytic closures or SpacetimeMetrics).
+    Background1D, AnalyticBackground1D, MetricBackground1D,
+    sample_background!,
+    # Re-export the connectivity-driven 1D derivative from HexSBPSAT.
+    apply_D!,
     # Wave-equation layer — 2D
     Params2d, initialize2d!,
     eigenmode_cartesian_2d!, eigenmode_radial_2d!,
@@ -147,9 +161,10 @@ export
     wave_strong_rhs_mesh!,
     # Dimension-generic timestep limit (dispatches on dom / MeshGeometry)
     recommended_dt,
-    # High-level drivers (move out of `bin/waveplot{1,2,3}d.jl`)
+    # High-level drivers (consumed by `bin/wave1d.jl`,
+    # `bin/waveplot{2,3}d.jl`)
     evolve1d, evolve2d, evolve3d,
-    pick_integrator,
+    pick_integrator, pick_integrator_first_order,
     # Tags
     SOMMERFELD_BDRY_TAG
 

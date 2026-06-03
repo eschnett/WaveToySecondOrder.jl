@@ -52,7 +52,7 @@ complexity): a single element, a cubical mesh, a cubed-cube mesh, then
 the cubed-sphere mesh.
 
 Start with periodic boundaries, then Dirichlet boundaries, then
-Sommerfeld boundaries.
+excision boundaries, then Sommerfeld boundaries.
 
 ## Tests
 

@@ -22,7 +22,8 @@
 # Pick a symplectic partitioned RK whose order matches the spatial
 # polynomial order `N − 1` of the GLL element. Higher order = more
 # stages = more RHS evaluations per step, so we want the time scheme
-# only as accurate as the space scheme.
+# only as accurate as the space scheme. Used by the 2D/3D
+# `SecondOrderODEProblem` drivers.
 function pick_integrator(N::Integer)
     if     N ≤ 2;  return VelocityVerlet()  # 2nd-order (1 stage)
     elseif N == 3; return VelocityVerlet()  # 2nd-order
@@ -31,6 +32,18 @@ function pick_integrator(N::Integer)
     elseif N == 6; return McAte5()          # 5th-order  (6 stages)
     elseif N == 7; return KahanLi6()        # 6th-order  (9 stages)
     else           return KahanLi8()        # 8th-order  (17 stages)
+    end
+end
+
+# Explicit-RK pick for the first-order ADM system (1D driver). The
+# variable-β system is not Hamiltonian, so symplectic integrators are
+# not appropriate; the spatial operator is (nearly) skew, so we need
+# explicit RK schemes whose stability region covers a stretch of the
+# imaginary axis. Order again matches the spatial order `N − 1`.
+function pick_integrator_first_order(N::Integer)
+    if     N ≤ 4;  return RK4()     # classic 4th-order
+    elseif N ≤ 6;  return Tsit5()   # 5th-order
+    else           return Vern7()   # 7th-order
     end
 end
 
@@ -107,66 +120,121 @@ end
 ################################################################################
 # evolve1d
 
+# Built-in 1D backgrounds with their exact scalar-wave solutions
+# (used as IC and as the L²-error reference). Each entry returns
+# `(bg :: Background1D, Φ_exact(t, x), Π_exact(t, x), max_speed)`.
+# `Π = (√γ/α)(∂_t Φ − β ∂_x Φ)`; `max_speed = max |β| + α/√γ` bounds
+# the coordinate characteristic speeds `−β ± α/√γ`.
+function _background1d(kind::Symbol, ::Type{T};
+                       A::Real, d::Real, shift::Real,
+                       k_w::Real) where {T}
+    k₀ = T(k_w)
+    if kind === :minkowski || kind === :constant_shift
+        β₀ = kind === :minkowski ? zero(T) : T(shift)
+        bg = AnalyticBackground1D((t, x) -> one(typeof(x)),
+                                  _ConstFn(β₀),
+                                  (t, x) -> one(typeof(x)))
+        # Right-mover Φ = sin(k(x − c₊ t)), c₊ = 1 − β. With α = γ = 1:
+        # Π = ∂_t Φ − β ∂_x Φ = −k cos(k(x − c₊ t)).
+        c₊ = one(T) - β₀
+        Φe = (t, x) -> sin(k₀ * (x - c₊ * t))
+        Πe = (t, x) -> -k₀ * cos(k₀ * (x - c₊ * t))
+        return bg, Φe, Πe, abs(β₀) + one(T)
+    elseif kind === :gaugewave
+        # AwA gauge wave: α = √H, β = 0, γ_xx = H. Exact solution
+        # Φ = sin(k₀(x̂ − t̂)) with x̂ − t̂ = x − t + 2C cos(2π(x−t)/d).
+        Aᵥ, dᵥ = T(A), T(d)
+        kᵥ = 2 * T(π) / dᵥ
+        C = Aᵥ * dᵥ / (4 * T(π))
+        bg = MetricBackground1D(SpacetimeMetrics.GaugeWave(Aᵥ, dᵥ))
+        ψ = (t, x) -> x - t + 2C * cos(kᵥ * (x - t))
+        Φe = (t, x) -> sin(k₀ * ψ(t, x))
+        Πe = (t, x) -> -k₀ * (1 - Aᵥ * sin(kᵥ * (x - t))) * cos(k₀ * ψ(t, x))
+        return bg, Φe, Πe, one(T)            # α/√γ = 1, β = 0
+    elseif kind === :sineshift
+        # Sine shift: α = 1, β = −Ac/(1+Ac), γ_xx = (1+Ac)²,
+        # c = cos(2π(x−t)/d). Exact Φ = sin(k₀ ψ), ψ = x + C sin(…) − t.
+        Aᵥ, dᵥ = T(A), T(d)
+        kᵥ = 2 * T(π) / dᵥ
+        C = Aᵥ * dᵥ / (2 * T(π))
+        bg = MetricBackground1D(SpacetimeMetrics.SineShift(Aᵥ, dᵥ))
+        ψ = (t, x) -> x + C * sin(kᵥ * (x - t)) - t
+        Φe = (t, x) -> sin(k₀ * ψ(t, x))
+        Πe = (t, x) -> -k₀ * (1 + Aᵥ * cos(kᵥ * (x - t))) * cos(k₀ * ψ(t, x))
+        # max |β| + α/√γ = A/(1−A) + 1/(1−A).
+        return bg, Φe, Πe, (Aᵥ + 1) / (1 - Aᵥ)
+    else
+        error("evolve1d: unknown background $kind " *
+              "(expected :minkowski, :constant_shift, :gaugewave, :sineshift)")
+    end
+end
+
+# Constant-value closure as a callable struct so the background stays
+# isbits when captured into GPU kernels (a `let`-captured `T(shift)`
+# closure would be fine too, but this is explicit).
+struct _ConstFn{T}
+    v :: T
+end
+(f::_ConstFn)(t, x) = f.v
+
 """
-    evolve1d(; T = Float64, N = 5, M = 32, x0 = 0, x1 = 1,
-                ic_wavenumber = 2π, τ_mult = 3//2,
-                t0 = 0, t1 = 1, Nt = 200, cfl_safety = 1//2) → NamedTuple
+    evolve1d(; T = Float64, backend = CPU(), N = 4, M = 32,
+               x0 = 0, x1 = 1,
+               background = :sineshift, A = 0.3, d = 1, shift = 0.5,
+               ic = :exact, ic_wavenumber = 2π, noise_amp = √eps,
+               ε_KO = 0, t0 = 0, t1 = 1, Nt = 200,
+               cfl = 1//10) → NamedTuple
 
-Run the 1D wave equation `u_tt = u_xx` on `[x0, x1]` with homogeneous
-Dirichlet BC and a sin·cos analytic eigenmode IC. Returns a NamedTuple
-holding:
+Run the 1D scalar wave on a 1+1 ADM background (`wave1d_curved_rhs!`)
+over the periodic interval `[x0, x1]`, integrating the first-order
+(Φ, Π) system with an explicit RK scheme from OrdinaryDiffEq
+(`pick_integrator_first_order(N)`; fixed CFL-derived `dt`).
 
-* `ts :: AbstractRange` — sample times.
-* `xs_line :: Vector{T}` — physical x-coordinates of the GLL nodes
-  along the 1D mesh (linearised).
-* `us, u̇s :: Matrix{T}` of shape `(N·M, Nt)` — spacetime sample of
-  the state.
-* `l2_err :: Vector{T}` — physical-L² error at each sample time.
-* `u_final, u̇_final :: Matrix{T}` of shape `(N, M)` — final-time state.
-* `dom`, `elem`, `ops` — operator-level handles (for further analysis).
-* `params :: Params1d{T}` — the wave-equation parameter bundle used.
-* `x0, x1, dt, dx` — scalars echoed back for the plot title.
+* `background ∈ {:minkowski, :constant_shift, :gaugewave, :sineshift}`
+  — built-in backgrounds with exact solutions (`:constant_shift` uses
+  `shift`; `:gaugewave` / `:sineshift` use amplitude `A` and period
+  `d`).
+* `ic ∈ {:exact, :noise}` — exact-solution IC of wavenumber
+  `ic_wavenumber`, or √eps-amplitude noise (robust-stability mode; the
+  L² error is reported against the zero solution).
+* `ε_KO` — Kreiss-Oliger coefficient (also tightens the `dt` choice).
+
+Returns a NamedTuple with sample times `ts`, sorted node line
+`xs_line` + permutation, spacetime samples `Φs`/`Πs :: (N·M, Nt)`,
+`l2_err`, total energy `energy`, final state, and the operator-level
+handles (`mesh`, `geom`, `elem`, `ops`).
 """
 function evolve1d(; T::Type = Float64,
                     backend = CPU(),
-                    N::Int = 5,
+                    N::Int = 4,
                     M::Int = 32,
                     x0::Real = 0,
                     x1::Real = 1,
+                    background::Symbol = :sineshift,
+                    A::Real = 0.3,
+                    d::Real = 1,
+                    shift::Real = 0.5,
+                    ic::Symbol = :exact,
                     ic_wavenumber::Real = 2π,
-                    τ_mult::Real = 3//2,
+                    noise_amp::Real = sqrt(eps(Float64)),
+                    ε_KO::Real = 0,
                     t0::Real = 0,
                     t1::Real = 1,
                     Nt::Int = 200,
-                    cfl_safety::Real = 1//2)
+                    cfl::Real = 1//10)
 
     on_cpu = backend isa CPU
     on_cpu || T <: AbstractFloat ||
         error("evolve1d: non-CPU backend requires a floating-point T; got $T")
 
+    mesh = make_uniform_line(T, M, T(x0), T(x1); periodic = true)
     elem = make_element(T, N)
     ops  = make_operators(elem)
-    dom  = make_domain(T, M, T(x0), T(x1))
+    geom_host = make_geometry(mesh, elem)
+    geom = on_cpu ? geom_host : to_device(geom_host, backend)
+    ws   = make_wave1d_workspace(geom)
 
-    # Element-shaped (N, M) physical-coordinate grid. Each column holds
-    # one element's N local node positions in physical space —
-    # `elem.xs ∈ [0, 1]` scaled to element width `dom.h` and offset by
-    # the element's left edge `dom.xs[m]`.
-    x_grid = T[dom.xs[m] + dom.h * xn for xn in elem.xs, m in 1:M]
-    dx     = dom.h * elem.h
-    L_     = T(x1) - T(x0)
-
-    ic_k = T(ic_wavenumber)
-    ic_ω = ic_k                              # 1D dispersion: ω = k
-
-    params = Params1d(; A = one(T),
-                        k = ic_k,
-                        ω = ic_ω,
-                        τ = T(τ_mult) * (N - 1)^2,
-                        bL = zero(T), bR = zero(T))
-
-    # `x_grid` lives on the chosen backend so the analytic-IC
-    # broadcast `sin(k·x_grid)·cos(ω·t)` runs on-device.
+    x_grid = reshape(copy(geom_host.coords), N, M)
     if on_cpu
         x_grid_dev = x_grid
     else
@@ -174,100 +242,119 @@ function evolve1d(; T::Type = Float64,
         copyto!(x_grid_dev, x_grid)
     end
 
-    # Build IC directly on the backend.
-    u  = on_cpu ? Array{T, 2}(undef, N, M) :
-                  KernelAbstractions.allocate(backend, T, N, M)
-    u̇  = similar(u)
-    initialize!(u, u̇, x_grid_dev, zero(T);
-                 A = params.A, k = params.k, ω = params.ω)
+    bg, Φ_exact_fn, Π_exact_fn, max_speed =
+        _background1d(background, T; A, d, shift, k_w = ic_wavenumber)
 
-    dt  = recommended_dt(dom, ops, params.τ; cfl_safety = T(cfl_safety))
-    alg = pick_integrator(N)
+    # CFL-derived fixed dt: wave limit `cfl · dx_min / max_speed`,
+    # tightened by the KO-term limit when ε_KO ≠ 0 (the D⁶ term has
+    # spectral radius ≈ ε · h⁵ · (κ/dx_min)⁶ with κ ≈ 2.5 empirically;
+    # RK4's negative-real-axis reach is ≈ 2.8).
+    h_elem  = T(geom_host.jac[1, 1, 1, 1])
+    ξs      = elem.xs
+    dx_min  = minimum(ξs[i+1] - ξs[i] for i in 1:N-1) * h_elem
+    dt      = T(cfl) * dx_min / max_speed
+    if ε_KO != 0
+        μ = T(2.5) / dx_min
+        λ_KO = T(ε_KO) * h_elem^5 * μ^6
+        dt = min(dt, T(1.4) / λ_KO)
+    end
 
-    f!(ü, u̇, u, p::Params1d, t) = rhs_wave1d!(ü, u, u̇, p; dom, ops)
-    prob = SecondOrderODEProblem(f!, u̇, u, (T(t0), T(t1)), params)
+    # IC on the host grid, then migrate.
+    Φ0_host = Matrix{T}(undef, N, M)
+    Π0_host = Matrix{T}(undef, N, M)
+    if ic === :exact
+        @. Φ0_host = Φ_exact_fn(T(t0), x_grid)
+        @. Π0_host = Π_exact_fn(T(t0), x_grid)
+    elseif ic === :noise
+        amp = T(noise_amp)
+        Φ0_host .= amp .* randn(T, N, M)
+        Π0_host .= amp .* randn(T, N, M)
+    else
+        error("evolve1d: unknown ic $ic (expected :exact or :noise)")
+    end
+    Φ0 = on_cpu ? Φ0_host : copyto!(similar(x_grid_dev), Φ0_host)
+    Π0 = on_cpu ? Π0_host : copyto!(similar(x_grid_dev), Π0_host)
 
+    # Parameter bundle for the RHS: backgrounds are sampled into the
+    # preallocated coefficient fields at every integrator stage time.
+    p = (; geom, ops, ws, bg, xgrid = x_grid_dev,
+         a = similar(Φ0), β = similar(Φ0), sγ = similar(Φ0),
+         ε_KO = T(ε_KO))
+    function rhs!(du, u, p, t)
+        Φ, Π = u.x[1], u.x[2]
+        Φ̇, Π̇ = du.x[1], du.x[2]
+        sample_background!(p.a, p.β, p.sγ, p.bg, t, p.xgrid)
+        wave1d_curved_rhs!(Φ̇, Π̇, Φ, Π, p.a, p.β;
+                           p.geom, p.ops, p.ws, ε_KO = p.ε_KO)
+        return nothing
+    end
+
+    alg  = pick_integrator_first_order(N)
+    prob = ODEProblem(rhs!, ArrayPartition(Φ0, Π0), (T(t0), T(t1)), p)
     integrator = init(prob, alg; dt,
+                      adaptive       = false,
                       save_everystep = false,
                       save_start     = false,
                       save_end       = false,
                       dense          = false)
 
     ts = range(T(t0), T(t1), Nt)
-    # 1D state laid out as `(N, M)` matrix; linearise for the spacetime
-    # heatmap so the x-axis sweeps left-to-right across all elements.
-    Ns       = N * M
-    xs_line  = vec(x_grid)
-    perm     = sortperm(xs_line)
-    xs_line  = xs_line[perm]
-    us       = Array{T}(undef, Ns, Nt)
-    u̇s       = Array{T}(undef, Ns, Nt)
+    Ns      = N * M
+    xs_line = vec(x_grid)
+    perm    = sortperm(xs_line)
+    xs_line = xs_line[perm]
+    Φs       = Array{T}(undef, Ns, Nt)
+    Πs       = Array{T}(undef, Ns, Nt)
+    ts_actual = Vector{T}(undef, Nt)
     l2_err   = Vector{T}(undef, Nt)
-    # Analytic-reference buffers live on the same backend as the state
-    # so the broadcast `err_buf .= u - u_exact` plus the sum-reduction
-    # both run on-device when applicable.
-    u_exact  = similar(u)
-    u̇_exact  = similar(u)
-    err_buf  = similar(u)
-    # Host scratch — used to copy the spacetime slice back from device
-    # before scalar-index sampling.
-    u_arr_host  = Array{T, 2}(undef, N, M)
-    u̇_arr_host  = Array{T, 2}(undef, N, M)
-    # Quadrature weight per node = H_ref[i] · dom.h. Built once.
-    # On device, migrate so the L²-error `mapreduce` stays on-backend.
-    H_ref      = SVector{N, T}(ntuple(i -> ops.H[i, i], Val(N)))
-    w_node_host = Array{T, 2}(undef, N, M)
-    @inbounds for m in 1:M, i in 1:N
-        w_node_host[i, m] = H_ref[i] * dom.h
-    end
-    if on_cpu
-        w_node = w_node_host
-    else
-        w_node = KernelAbstractions.allocate(backend, T, N, M)
-        copyto!(w_node, w_node_host)
-    end
+    energy   = Vector{T}(undef, Nt)
+    Φ_host = Matrix{T}(undef, N, M)
+    Π_host = Matrix{T}(undef, N, M)
+    Φ_ref  = Matrix{T}(undef, N, M)
+    Hphys_host = geom_host.Hphys
+    sγ_host    = Matrix{T}(undef, N, M)
+    ws_host    = on_cpu ? ws : make_wave1d_workspace(geom_host)
 
     prog = Progress(Nt;
-                    desc = "evolve1d (N=$N, M=$M, backend=$(typeof(backend).name.name), τ=$(params.τ)): ",
+                    desc = "evolve1d (N=$N, M=$M, bg=$background, " *
+                           "backend=$(typeof(backend).name.name)): ",
                     barlen = 30, showspeed = true)
     for (n, t) in enumerate(ts)
         while integrator.t < t
             step!(integrator)
         end
         next!(prog)
+        # Fixed dt overshoots the sample time by < dt; record and use
+        # the actual time for the analytic reference.
+        ta = T(integrator.t)
+        ts_actual[n] = ta
 
-        u̇_arr = integrator.u.x[1]
-        u_arr  = integrator.u.x[2]
+        copyto!(Φ_host, integrator.u.x[1])
+        copyto!(Π_host, integrator.u.x[2])
+        @assert all(isfinite, Φ_host) && all(isfinite, Π_host)
+        Φs[:, n] = vec(Φ_host)[perm]
+        Πs[:, n] = vec(Π_host)[perm]
 
-        copyto!(u_arr_host,  u_arr)
-        copyto!(u̇_arr_host, u̇_arr)
-        @assert all(isfinite, u_arr_host) && all(isfinite, u̇_arr_host)
-
-        u_lin  = vec(u_arr_host)[perm]
-        u̇_lin  = vec(u̇_arr_host)[perm]
-        @inbounds for p in 1:Ns
-            us[p, n]  = u_lin[p]
-            u̇s[p, n] = u̇_lin[p]
+        # Physical-L² error vs the exact solution (zero for :noise).
+        if ic === :exact
+            @. Φ_ref = Φ_exact_fn(ta, x_grid)
+        else
+            fill!(Φ_ref, zero(T))
         end
+        l2_err[n] = sqrt(sum(@. (Φ_host - Φ_ref)^2 * Hphys_host))
 
-        # Physical-L² error using GLL quadrature weights. Works on
-        # device because `u_exact` lives on the same backend and
-        # `mapreduce` is GPU-portable through GPUArrays.
-        initialize!(u_exact, u̇_exact, x_grid_dev, t;
-                     A = params.A, k = params.k, ω = params.ω)
-        err_buf .= u_arr .- u_exact
-        l2_err[n] = sqrt(mapreduce((e, w) -> e * e * w, +, err_buf, w_node;
-                                    init = zero(T)))
+        # Total ADM energy (host-side; the state was already copied).
+        sample_background!(p.a, p.β, p.sγ, bg, ta, x_grid_dev)
+        copyto!(sγ_host, p.sγ)
+        energy[n] = wave1d_energy(Φ_host, Π_host, sγ_host;
+                                  geom = geom_host, ops, ws = ws_host)
     end
     finish!(prog)
 
-    u_final  = copy(u_arr_host)
-    u̇_final  = copy(u̇_arr_host)
-
-    return (; ts, xs_line, us, u̇s, l2_err,
-              u_final, u̇_final,
-              dom, elem, ops, params,
-              x0 = T(x0), x1 = T(x1), dt, dx,
+    return (; ts, ts_actual, xs_line, perm, Φs, Πs, l2_err, energy,
+              Φ_final = copy(Φ_host), Π_final = copy(Π_host),
+              mesh, geom = geom_host, elem, ops, background, ic,
+              x0 = T(x0), x1 = T(x1), dt, dx = dx_min,
               integrator_name = nameof(typeof(alg)))
 end
 
