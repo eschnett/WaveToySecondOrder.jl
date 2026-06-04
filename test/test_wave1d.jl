@@ -36,7 +36,7 @@ function _make_setup1d(::Type{T}, N, M; x0 = zero(T), x1 = one(T)) where {T}
     elem = make_element(T, N)
     ops  = make_operators(elem)
     geom = make_geometry(mesh, elem)
-    ws   = make_wave1d_workspace(geom)
+    ws   = make_wave1d_workspace(geom, ops)
     xgrid = reshape(geom.coords[1, :, :], N, M)
     return (; mesh, elem, ops, geom, ws, xgrid)
 end
@@ -126,13 +126,16 @@ end
         M = 8
         setup = _make_setup1d(T, N, M)
         xg = setup.xgrid
+        # ε_KO is the standard dimensionless NR coefficient (the KO
+        # term is normalised to λ_KO = ε·μ): 0.1 stabilises the sonic
+        # case (max Re goes +0.42 → ≤ 0; ε = 0.05 is marginal).
         configs = (
             ("β = 0",            x -> zero(T),                    0.0),
             ("β = 0.5",          x -> T(0.5),                     0.0),
             ("β = 2 (superlum)", x -> T(2.0),                     0.0),
             ("β var sublum",     x -> T(0.3) + T(0.2)*sinpi(2x),  0.0),
-            ("β var sonic + KO", x -> T(0.5) + sinpi(2x),         1e-4),
-            ("β var superlum + KO", x -> T(2.0) + T(0.5)*sinpi(2x), 1e-4),
+            ("β var sonic + KO", x -> T(0.5) + sinpi(2x),         0.1),
+            ("β var superlum + KO", x -> T(2.0) + T(0.5)*sinpi(2x), 0.1),
         )
         for (label, β_fn, ε_KO) in configs
             a = ones(T, N, M)          # α = γ = 1
@@ -157,15 +160,15 @@ end
     # (2) Noise robust stability — six setups, 50 light-crossings.
     # KO off where the wave operator alone is stable (constant /
     # subluminal-variable β); the superluminal- and sonic-variable
-    # cases need a small ε_KO.
+    # cases use the standard ε_KO = 0.1.
     _progress("wave1d noise: six setups, 50 crossings")
     noise_configs = (
         ("constant β = 0",     (t,x) -> zero(T),                 0.0,  0.0,  100, 1000),
         ("constant β = 0.5",   (t,x) -> T(0.5),                  0.5,  0.0,  100, 1000),
         ("constant β = 2.0",   (t,x) -> T(2.0),                  2.0,  0.0,  100, 1000),
         ("variable β sublum",  (t,x) -> T(0.3) + T(0.2)*sinpi(2x), 0.5, 0.0, 200, 2000),
-        ("variable β superlum",(t,x) -> T(2.0) + T(0.5)*sinpi(2x), 2.5, 1e-4, 200, 2000),
-        ("variable β sonic",   (t,x) -> T(0.5) + sinpi(2x),        1.5, 1e-4, 500, 2000),
+        ("variable β superlum",(t,x) -> T(2.0) + T(0.5)*sinpi(2x), 2.5, 0.1, 200, 2000),
+        ("variable β sonic",   (t,x) -> T(0.5) + sinpi(2x),        1.5, 0.1, 500, 2000),
     )
     for (i, (label, β_fn, max_β, ε_KO, boundΦ, boundΠ)) in enumerate(noise_configs)
         @testset "noise: $label bounded (50 crossings)" begin
@@ -344,12 +347,10 @@ end
             bg! = _make_bg1d((t,x) -> one(T2), (t,x) -> T2(1)/2,
                              (t,x) -> one(T2), setup.xgrid)
             stages = _make_stages1d(T2, N, M)
-            # dt within both the wave CFL and the (tighter) KO-term
-            # stability limit at this resolution.
-            dt = T2(1) / 1024
+            dt = T2(1) / 512                 # ordinary wave CFL
             t = zero(T2)
             for _ in 1:64
-                _rk4_wave1d!(Φ, Π, t, dt; setup, bg!, ε_KO = 1e-4, stages)
+                _rk4_wave1d!(Φ, Π, t, dt; setup, bg!, ε_KO = 0.1, stages)
                 t += dt
             end
             @test all(isfinite, Φ) && all(isfinite, Π)
@@ -388,12 +389,11 @@ if HAS_METAL
         xg0 = setup.xgrid
         Φ0 = sinpi.(2 .* xg0)
         Π0 = -2 .* T(π) .* cospi.(2 .* xg0)
-        # dt within both the wave CFL and the (stiffer) KO-term limit.
-        dt = T(5.0f-4)
+        dt = T(5.0f-4)                  # ordinary wave CFL
         n_steps = 50
 
         run_on = function (backend, geom, xgrid)
-            ws = make_wave1d_workspace(geom)
+            ws = make_wave1d_workspace(geom, setup.ops)
             stages = _make_stages1d(T, N, M; backend)
             Φ = KernelAbstractions.allocate(backend, T, N, M)
             Π = KernelAbstractions.allocate(backend, T, N, M)
@@ -404,7 +404,7 @@ if HAS_METAL
             t = zero(T)
             for _ in 1:n_steps
                 _rk4_wave1d!(Φ, Π, t, dt; setup = setup2, bg!,
-                             ε_KO = 1.0f-4, stages)
+                             ε_KO = 1.0f-1, stages)
                 t += dt
             end
             sγ = KernelAbstractions.allocate(backend, T, N, M)

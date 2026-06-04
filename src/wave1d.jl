@@ -31,13 +31,22 @@
 # `make_uniform_line(...; periodic = true)`). With this SAT the
 # assembled operator `H · D` is exactly skew, so the RHS spectrum is
 # purely imaginary up to background variation. RK + skew operator is
-# marginally stable; Kreiss-Oliger dissipation patches this:
+# marginally stable, and at sonic horizons (variable β crossing
+# |β| = α/√γ) the operator acquires genuinely positive real parts;
+# Kreiss-Oliger dissipation patches both:
 #
-#     u̇ += ε · h^{2p+1} · D^{2p+2} · u,    here p = 2:  +ε · h⁵ · D⁶ u.
+#     u̇ += ε · μ⁻⁵ · D⁶ u,        μ = spectral radius of D.
 #
-# Since `D` is skew, `D⁶` has eigenvalues `−μ⁶ ≤ 0` (dissipative), and
-# the contribution on smooth data scales as `ε · h⁵ · k⁶ = O(h^{2p−1})`
-# — KO does not degrade the formal order.
+# Since `D` is skew, `D⁶` has eigenvalues `−μₖ⁶ ≤ 0` (dissipative).
+# The μ⁻⁵ normalisation pins the highest-mode damping rate to
+# `λ_KO = ε·μ` — the same magnitude as the wave operator itself — so
+# ε is the standard dimensionless NR coefficient (ε ≈ 0.1) and the KO
+# term never tightens the CFL limit for ε ≤ 1. (This mirrors the
+# `1/2^{2p+2}` factor in the classic finite-difference KO operator;
+# the naive `ε·h⁵·D⁶` with the *element* width h is over-strong by
+# `(h·μ)⁵` ≈ 6×10⁴ at N = 4 and 7×10⁷ at N = 8.) On smooth data the
+# contribution scales as `ε · μ⁻⁵ · k⁶ = O(h^{2p−1}) · k⁶` since
+# μ ~ 1/h — KO does not degrade the formal order.
 
 using HexSBPSAT: MeshGeometry, SBPOps, apply_D!
 using KernelAbstractions: @kernel, @index, @Const, get_backend, allocate
@@ -132,10 +141,11 @@ end
     Wave1DWorkspace{T}
 
 Preallocated scratch for [`wave1d_curved_rhs!`](@ref) — five `(N, M)`
-buffers (`DΦ`, `F`, `DF`, two KO ping-pong buffers) plus the
-per-node Kreiss-Oliger scale `h⁵ = (∂x/∂ξ)⁵`. Allocate one per
+buffers (`DΦ`, `F`, `DF`, two KO ping-pong buffers) plus the spectral
+radius `μ` of the assembled first-derivative operator `D` and the
+Kreiss-Oliger scale `μ⁻⁵` derived from it. Allocate one per
 independent RHS evaluation context via [`make_wave1d_workspace`](@ref);
-contents are overwritten on every call.
+buffer contents are overwritten on every call.
 """
 struct Wave1DWorkspace{T, AT <: AbstractMatrix{T}}
     DΦ :: AT
@@ -143,22 +153,44 @@ struct Wave1DWorkspace{T, AT <: AbstractMatrix{T}}
     DF :: AT
     s1 :: AT
     s2 :: AT
-    h5 :: AT   # per-node (element width)⁵ for the KO term
+    μ      :: T   # spectral radius of D (power iteration at setup)
+    inv_μ5 :: T   # μ⁻⁵, the Kreiss-Oliger normalisation
 end
 
 """
-    make_wave1d_workspace(geom::MeshGeometry{1, T, N}) → Wave1DWorkspace{T}
+    make_wave1d_workspace(geom::MeshGeometry{1, T, N}, ops) →
+        Wave1DWorkspace{T}
 
-Allocate the RHS scratch on the same backend as `geom`.
+Allocate the RHS scratch on the same backend as `geom` and compute the
+spectral radius `μ` of the assembled `apply_D!` operator by power
+iteration on `D²` (`D` is skew-like with eigenvalue pairs `±iμₖ`, so
+`D²` has real spectrum `−μₖ²` and plain power iteration converges to
+`μ²`). Deterministic alternating-sign start vector — rich in the
+grid-scale modes that dominate the spectral radius; ~30 iterations
+give far more accuracy than the KO scale needs.
 """
-function make_wave1d_workspace(geom::MeshGeometry{1, T, N}) where {T, N}
+function make_wave1d_workspace(geom::MeshGeometry{1, T, N}, ops) where {T, N}
     backend = get_backend(geom.coords)
     Ne = geom.Ne
     bufs = ntuple(_ -> allocate(backend, T, N, Ne), 5)
-    h5 = allocate(backend, T, N, Ne)
-    # geom.jac[1, 1, i, e] is the element width for affine line elements.
-    copyto!(h5, reshape(geom.jac, N, Ne) .^ 5)
-    return Wave1DWorkspace{T, typeof(h5)}(bufs..., h5)
+
+    # Power iteration for μ = spectral radius of D, using two of the
+    # freshly allocated buffers as scratch.
+    v, w = bufs[4], bufs[5]
+    v_host = T[isodd(i + m) ? one(T) : -one(T) for i in 1:N, m in 1:Ne]
+    copyto!(v, v_host)
+    μ² = zero(T)
+    for _ in 1:30
+        apply_D!(w, v; geom, ops)
+        apply_D!(v, w; geom, ops)     # v ← D² v_old
+        μ² = sqrt(sum(abs2, v))       # ‖D² v_old‖ with ‖v_old‖ = 1
+        μ² > 0 || break               # degenerate (cannot happen for N ≥ 2)
+        v ./= μ²                      # normalise for the next round
+    end
+    μ = sqrt(μ²)
+    inv_μ5 = μ > 0 ? inv(μ)^5 : zero(T)
+
+    return Wave1DWorkspace{T, typeof(v)}(bufs..., μ, inv_μ5)
 end
 
 """
@@ -175,9 +207,12 @@ comment for the derivation. The kernel evolves
 
 Inputs `a`, `β` are `(N, M)` coefficient fields evaluated at the
 current integrator stage time. `ws` is a [`Wave1DWorkspace`](@ref);
-no allocations occur per call. `ε_KO` is the Kreiss-Oliger
-coefficient (`0.1` is the standard NR default; `0.0` disables the
-KO passes entirely).
+no allocations occur per call. `ε_KO` is the dimensionless
+Kreiss-Oliger coefficient: the KO term is `ε · μ⁻⁵ · D⁶` with μ the
+spectral radius of `D` (stored in `ws`), so the highest mode is
+damped at rate `ε·μ` and the term does not tighten the CFL limit for
+`ε ≤ 1`. `0.1` is the standard NR default; `0.0` disables the KO
+passes entirely.
 """
 function wave1d_curved_rhs!(Φ̇::AbstractMatrix{T}, Π̇::AbstractMatrix{T},
                             Φ::AbstractMatrix{T}, Π::AbstractMatrix{T},
@@ -189,7 +224,8 @@ function wave1d_curved_rhs!(Φ̇::AbstractMatrix{T}, Π̇::AbstractMatrix{T},
     @assert size(Φ) == size(Π) == size(Φ̇) == size(Π̇) == (N, geom.Ne)
     @assert size(a) == size(β) == (N, geom.Ne)
     εT = T(ε_KO)
-    (; DΦ, F, DF, s1, s2, h5) = ws
+    (; DΦ, F, DF, s1, s2) = ws
+    koT = εT * ws.inv_μ5
 
     apply_D!(DΦ, Φ; geom, ops)
     @. F = a * DΦ + β * Π
@@ -205,7 +241,7 @@ function wave1d_curved_rhs!(Φ̇::AbstractMatrix{T}, Π̇::AbstractMatrix{T},
         apply_D!(s1, s2; geom, ops)   # D⁴Φ
         apply_D!(s2, s1; geom, ops)   # D⁵Φ
         apply_D!(s1, s2; geom, ops)   # D⁶Φ
-        @. Φ̇ += εT * h5 * s1
+        @. Φ̇ += koT * s1
         # D⁶Π.
         apply_D!(s1, Π;  geom, ops)   # D¹Π
         apply_D!(s2, s1; geom, ops)   # D²Π
@@ -213,7 +249,7 @@ function wave1d_curved_rhs!(Φ̇::AbstractMatrix{T}, Π̇::AbstractMatrix{T},
         apply_D!(s2, s1; geom, ops)   # D⁴Π
         apply_D!(s1, s2; geom, ops)   # D⁵Π
         apply_D!(s2, s1; geom, ops)   # D⁶Π
-        @. Π̇ += εT * h5 * s2
+        @. Π̇ += koT * s2
     end
     return Φ̇, Π̇
 end

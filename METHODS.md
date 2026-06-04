@@ -65,16 +65,48 @@ initial value after each period, which the tests assert.
   `DΦ = D Φ; F = a·DΦ + β·Π; Π̇ = D F; Φ̇ = β·DΦ + a·Π`. All scratch
   lives in a preallocated `Wave1DWorkspace`; the kernel is
   allocation-free per call.
-* Kreiss–Oliger dissipation: `u̇ += ε_KO · h⁵ · D⁶ u` (p = 2) applied
-  to both Φ and Π, implemented as six `apply_D!` passes. Since D is
-  skew, D⁶ is negative semidefinite (dissipative). On smooth data the
-  term is `O(h^{2p−1}) = O(h³)` → does not degrade the formal order.
-  Defaults: `ε_KO = 0` for convergence/energy tests; `ε_KO = 1e-4`
-  for the noise stress tests with variable superluminal/sonic β
-  (which are genuinely unstable without it — the spectrum test
-  asserts both directions). NOTE: the KO term has its own, much
-  tighter CFL limit, ≈ `2.8/(ε_KO·h⁵·μ⁶)` with `μ ≈ 2.5/dx_min`;
-  `evolve1d` enforces it automatically.
+* Kreiss–Oliger dissipation: `u̇ += ε_KO · μ⁻⁵ · D⁶ u` (p = 2)
+  applied to both Φ and Π, implemented as six `apply_D!` passes; μ is
+  the spectral radius of the assembled D, computed once per
+  `Wave1DWorkspace` by power iteration on D² (D is skew-like with
+  eigenvalue pairs ±iμₖ, so D² has real spectrum −μₖ² and plain power
+  iteration converges; deterministic alternating-sign start vector,
+  ~30 iterations, accurate to a few %). Since D is skew, D⁶ is
+  negative semidefinite (dissipative). On smooth data the term is
+  `ε·μ⁻⁵·k⁶ = O(h^{2p−1})·k⁶` (μ ~ 1/h) → does not degrade the
+  formal order.
+
+  **Normalisation.** The μ⁻⁵ scaling pins the highest-mode damping
+  rate to `λ_KO = ε·μ` — the same magnitude as the wave operator — so
+  ε is the standard dimensionless NR coefficient and the KO term does
+  not tighten the CFL limit for ε ≤ 1 (`evolve1d` still checks
+  `dt ≤ 1.4/(ε·μ)` exactly). This mirrors the `1/2^{2p+2}` factor in
+  the classic finite-difference KO operator, which serves exactly
+  this purpose on uniform grids. The naive scaling `ε·h⁵·D⁶` with the
+  *element* width h is over-strong by `(h·μ)⁵` — measured
+  `λ_KO/(ε·λ_wave) ≈ 6.2·10⁴` at N = 4 and `7.1·10⁷` at N = 8
+  (growing like ~N¹⁰), which made the nominal ε = 0.1 require a dt
+  thousands to millions of times below the wave CFL.
+
+  **When is KO needed?** Only at sonic horizons. Spectrum evidence
+  (N = 4, M = 8): constant β and smooth subluminal variable β give
+  max Re(λ) at round-off (H·D skew); variable β crossing |β| = α/√γ
+  gives max Re(λ) = +0.42 without dissipation and ≤ 0 with ε = 0.1
+  (ε = 0.05 is marginal: +0.002). Defaults: `ε_KO = 0` for
+  convergence/energy tests, `ε_KO = 0.1` for the sonic/superluminal
+  noise stress tests; the spectrum test asserts both directions.
+
+  **Alternatives considered (deferred).** (a) Upwind/characteristic
+  interface SAT instead of centred flux + KO: dissipation acts only
+  on inter-element jumps (O(h^N) for resolved solutions), no CFL
+  penalty, natural at sonic points since the splitting follows the
+  characteristic speeds −β ± α/√γ; trades exact H·D skewness for
+  provable energy decay. The leading candidate for the 2D/3D
+  rebuild. (b) Per-element modal exponential filter applied
+  post-step: zero CFL cost and very GPU-friendly, but lives outside
+  the RHS, so RHS-spectrum analysis no longer captures the
+  stabilised scheme. Both deferred to keep the exactly-skew operator
+  and the spectrum-based test methodology.
 
 ## Background sampling
 
@@ -155,7 +187,7 @@ operator-level identities live in `HexSBPSAT/test/test_apply_D1d.jl`,
 1. **Spectrum**: column-probed RHS operator; `max Re(λ)` ≤ eigensolver
    round-off (`1e-5·|λ|_max`) for all stable configurations
    (constant β ∈ {0, 0.5, 2}, variable subluminal; sonic/superluminal
-   variable β with ε_KO = 1e-4), and a control asserting the sonic
+   variable β with ε_KO = 0.1), and a control asserting the sonic
    case **is** unstable with ε_KO = 0.
 2. **Noise robustness**: √eps noise, 50 light-crossings, six shift
    configurations, boundedness asserted.

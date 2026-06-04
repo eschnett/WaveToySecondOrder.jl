@@ -40,7 +40,7 @@ using WaveToySecondOrder: evolve1d
     @testset "noise IC, ε_KO > 0: bounded" begin
         res = evolve1d(; N = 4, M = 16, background = :constant_shift,
                        shift = 2.0,        # superluminal
-                       ic = :noise, ε_KO = 1e-4, t1 = 2.0, Nt = 6)
+                       ic = :noise, ε_KO = 0.1, t1 = 2.0, Nt = 6)
         @test all(isfinite, res.Φs) && all(isfinite, res.Πs)
         amp = sqrt(eps(Float64))
         @test maximum(abs, res.Φ_final) < 100 * amp

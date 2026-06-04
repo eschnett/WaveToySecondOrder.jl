@@ -232,7 +232,7 @@ function evolve1d(; T::Type = Float64,
     ops  = make_operators(elem)
     geom_host = make_geometry(mesh, elem)
     geom = on_cpu ? geom_host : to_device(geom_host, backend)
-    ws   = make_wave1d_workspace(geom)
+    ws   = make_wave1d_workspace(geom, ops)
 
     x_grid = reshape(copy(geom_host.coords), N, M)
     if on_cpu
@@ -246,17 +246,16 @@ function evolve1d(; T::Type = Float64,
         _background1d(background, T; A, d, shift, k_w = ic_wavenumber)
 
     # CFL-derived fixed dt: wave limit `cfl · dx_min / max_speed`,
-    # tightened by the KO-term limit when ε_KO ≠ 0 (the D⁶ term has
-    # spectral radius ≈ ε · h⁵ · (κ/dx_min)⁶ with κ ≈ 2.5 empirically;
-    # RK4's negative-real-axis reach is ≈ 2.8).
+    # plus the exact KO-term limit when ε_KO ≠ 0. With the μ⁻⁵
+    # normalisation the KO spectral radius is exactly `ε_KO · ws.μ`
+    # (RK4's negative-real-axis reach is ≈ 2.8, halved for safety), so
+    # this branch only binds for ε_KO ≳ 1.
     h_elem  = T(geom_host.jac[1, 1, 1, 1])
     ξs      = elem.xs
     dx_min  = minimum(ξs[i+1] - ξs[i] for i in 1:N-1) * h_elem
     dt      = T(cfl) * dx_min / max_speed
     if ε_KO != 0
-        μ = T(2.5) / dx_min
-        λ_KO = T(ε_KO) * h_elem^5 * μ^6
-        dt = min(dt, T(1.4) / λ_KO)
+        dt = min(dt, T(1.4) / (T(ε_KO) * ws.μ))
     end
 
     # IC on the host grid, then migrate.
@@ -313,7 +312,7 @@ function evolve1d(; T::Type = Float64,
     Φ_ref  = Matrix{T}(undef, N, M)
     Hphys_host = geom_host.Hphys
     sγ_host    = Matrix{T}(undef, N, M)
-    ws_host    = on_cpu ? ws : make_wave1d_workspace(geom_host)
+    ws_host    = on_cpu ? ws : make_wave1d_workspace(geom_host, ops)
 
     prog = Progress(Nt;
                     desc = "evolve1d (N=$N, M=$M, bg=$background, " *
