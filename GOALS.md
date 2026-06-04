@@ -54,6 +54,20 @@ the cubed-sphere mesh.
 Start with periodic boundaries, then Dirichlet boundaries, then
 excision boundaries, then Sommerfeld boundaries.
 
+Boundary conditions are chosen per face from the local characteristic
+*speeds* (inflow/outflow classification): superluminal outflow faces
+use excision, superluminal inflow faces use full-state Dirichlet, and
+subluminal faces use Dirichlet or radiative (Sommerfeld) conditions.
+Radiative boundaries use a characteristic-free *field-radiation*
+condition (∂_t Φ + (α/√γ)·n̂·∂_x Φ = 0, applied to the field via its
+evolution equation), valid for small shift (|β| ≲ 0.1); this is the
+choice that ports field-by-field to the Einstein equations. The
+characteristic *eigenvector* decomposition is deliberately avoided for
+boundaries — it would be needed only for perfectly-absorbing or
+constraint-preserving conditions, which are out of scope. Only the
+characteristic *speeds* (eigenvalues) are used, for face classification
+and penalty magnitudes.
+
 ## Tests
 
 Tests should include:

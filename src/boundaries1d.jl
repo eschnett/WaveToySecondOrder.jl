@@ -1,38 +1,52 @@
 # Boundary conditions for the 1D ADM scalar wave (`wave1d_curved_rhs!`).
 #
-# Characteristic structure. With v := ∂_x Φ the principal system in
-# (v, Π) has flux matrix A = [β a; a β] (a = α/√γ), eigenvectors
-# (1, ±1). Characteristic variables and coordinate propagation speeds:
+# Design goal: the package is a testbed for the Einstein equations, so
+# the *radiative* boundary conditions deliberately avoid characteristic
+# **eigenvector** projection (which is cheap here but expensive and
+# gauge-dependent for multi-field GR systems). Only characteristic
+# **speeds** (eigenvalues) are used — for inflow/outflow classification
+# and for the penalty magnitude — which is unavoidable for any open
+# boundary and far simpler than eigenvectors.
 #
-#     u_R := ∂_xΦ − Π    speed  s_R = a − β    (rightward when a > β)
-#     u_L := ∂_xΦ + Π    speed  s_L = −a − β   (leftward when a > 0)
-#
-# (Verified against the plane wave Φ = sin(k(x−(a−β)t)) at α=γ=1:
-# v = k cos, Π = −k cos ⇒ u_R = 2k cos ≠ 0, u_L = 0 — the right-mover
-# lives purely in u_R.) A mode is *outgoing* at a face with outward
-# normal n̂ iff s·n̂ > 0.
-#
-# Face classification → admissible boundary conditions:
-#   * SUBLUMINAL (|β| < a; one mode in, one out):  Dirichlet (ingoing
-#     mode from data) or Sommerfeld (ingoing mode = 0; exact in 1D).
+# Characteristic speeds. The principal system in (∂_xΦ, Π) has flux
+# matrix A = [β a; a β] (a = α/√γ) with propagation speeds (dx/dt)
+# s_R = a − β (rightward) and s_L = −a − β (leftward). A mode is
+# *outgoing* at a face with outward normal n̂ iff s·n̂ > 0. These
+# speeds classify a face:
+#   * SUBLUMINAL (|β| < a; one mode in, one out):  radiative
+#     (Sommerfeld) or Dirichlet data injection — see below.
 #   * OUTFLOW (superluminal, both modes leave):    excision — no
-#     boundary term at all; the one-sided `apply_D!` rows are already
-#     correct.
+#     boundary term; the one-sided `apply_D!` rows are already correct.
 #   * INFLOW (superluminal, both modes enter):     full-state
-#     Dirichlet — both Φ and Π pinned to data.
-#   * SONIC (|β| ≈ a at the face):                 error; the
-#     vanishing characteristic speed leaves a mode undetermined.
+#     Dirichlet — both Φ and Π pinned to data (no characteristics).
+#   * SONIC (|β| ≈ a at the face):                 error; a vanishing
+#     speed leaves a mode undetermined.
+#
+# Field-radiation SAT (subluminal faces). Rather than projecting onto
+# the eigenvector ∂_xΦ ∓ Π, impose the scalar radiation condition on
+# the FIELD,
+#     ∂_tΦ + a·n̂·∂_xΦ = (data rate),
+# rewritten with the evolution equation ∂_tΦ = β∂_xΦ + aΠ and divided
+# by a into the normalised residual
+#     r := Π + (n̂ + β/a)·∂_xΦ.
+# At β = 0, r is exactly the incoming characteristic, so the penalty
+# coincides with the textbook Sommerfeld SAT; for β ≠ 0 it differs by
+# O(β)·∂_xΦ — a perturbation of the proven operator, stable for the
+# small shift (|β| ≲ 0.1) radiative BCs are intended for. This is the
+# NR-standard "apply ∂_t f + ∂_r f = 0 to each field" outer condition,
+# and it ports field-by-field to Einstein with no eigendecomposition.
+# Sommerfeld drives r → 0 (absorbing); Dirichlet drives r → its value
+# on the boundary data (incoming wave injected, outgoing wave free).
 #
 # Energy. For E = ½∫[(Π/√γ)² + (∂_xΦ)²/γ]√γ dx the boundary terms are
 # dE/dt = −¼ Σ_faces Σ_modes (s·n̂)·u² (up to the a/√γ weights):
-# outgoing modes drain energy, ingoing modes inject +¼|s_in|u_in² and
-# must be controlled by the boundary penalty. The penalties below act
-# on the evolved variables (Φ, Π) at the single boundary node with
-# strength σ·|s|/Hphys_face; σ = 1 (full characteristic upwinding) was
-# confirmed by the dense-operator spectrum tests (max Re(λ) ≤
-# round-off for every admissible subluminal configuration; σ = 1/2 is
-# marginally unstable because the one-sided bulk operator leaves the
-# full boundary flux for the penalty to cancel).
+# outgoing modes drain energy, the radiative penalty controls the
+# ingoing injection. The penalties act on Π̇ at the single boundary
+# node with strength σ·|s_in|/Hphys_face, |s_in| = a + n̂·β; σ = 1 was
+# confirmed by the dense-operator spectrum tests (max Re(λ) ≤ round-off
+# for every admissible subluminal configuration; σ = 1/2 is marginally
+# unstable because the one-sided bulk operator leaves the full boundary
+# flux for the penalty to cancel).
 #
 # Known limitation (genuine physics, not a SAT defect): with strongly
 # space-varying *superluminal* β on an open domain the operator has
@@ -130,34 +144,28 @@ Assemble the scalar boundary-condition bundle consumed by
 [`wave1d_curved_rhs!`](@ref) (kwarg `bc1d`). `kindL`/`kindR` are
 `BC_*` codes (or Symbols) for the −x / +x faces. Data slots per face:
 
-* `BC_DIRICHLET`:      `g1` = boundary value of the ingoing
-                       characteristic `u_in` (computed from the
-                       boundary data, e.g. `u_in = ∂_xΦ ∓ Π` of an
-                       exact solution at the face); `g2` unused. This
-                       is the well-posed Dirichlet-type condition for
-                       the hyperbolic system: the single ingoing mode
-                       is specified, the outgoing mode leaves
-                       untouched. (A pointwise reflecting wall
-                       `Φ = g(t)` — the second-order-in-space
-                       Dirichlet flavour — requires a Mattsson-style
-                       two-parameter lift SAT; a state-target form
-                       `Π → (∂_tg − β∂_xΦ)/a` was tested and is
-                       spectrally unstable with the present one-sided
-                       bulk operator. Deferred.)
-* `BC_SOMMERFELD`:     ingoing characteristic driven to 0 (perfectly
-                       absorbing — the `g1 ≡ 0` special case of the
-                       above, kept as its own kind for admissibility
-                       messages and intent).
+* `BC_SOMMERFELD`:     radiative (absorbing). `g1` = 0 drives the
+                       field-radiation residual `r = Π + (n̂+β/a)∂_xΦ`
+                       to zero — no incoming wave. Characteristic-free
+                       (no eigenvector projection); valid for small
+                       shift (|β| ≲ 0.1).
+* `BC_DIRICHLET`:      data injection through the *same* field-
+                       radiation operator: `g1` = `r` evaluated on the
+                       boundary data (e.g. an exact solution), so the
+                       prescribed incoming wave enters while outgoing
+                       waves leave. `g2` unused. (Only differs from
+                       `BC_SOMMERFELD` by the nonzero target `g1`.)
 * `BC_EXCISION`:       no data.
-* `BC_FULL_DIRICHLET`: `g1` = Φ data, `g2` = Π data.
+* `BC_FULL_DIRICHLET`: `g1` = Φ data, `g2` = Π data (superluminal
+                       inflow — both modes enter, so the full state is
+                       pinned; no characteristics).
 
 All entries are plain scalars — assemble a fresh bundle at every
-integrator stage time. σ is the penalty strength; σ = 1 (full
-characteristic upwinding) makes the subluminal operators exactly
-non-growing (spectrum at round-off), while σ = 1/2 is marginally
-unstable — the one-sided bulk operator leaves the *full* boundary
-flux for the penalty to cancel. Verified by the dense-operator
-spectrum tests.
+integrator stage time. σ is the penalty strength; σ = 1 (full upwind
+weight) makes the subluminal operators exactly non-growing (spectrum
+at round-off) at β = 0, while σ = 1/2 is marginally unstable — the
+one-sided bulk operator leaves the *full* boundary flux for the
+penalty to cancel. Verified by the dense-operator spectrum tests.
 """
 make_bc1d(kindL, kindR; g1L = 0, g2L = 0, g1R = 0, g2R = 0, σ = 1) =
     (; kindL = kindL isa Symbol ? bc1d_kind(kindL) : Int(kindL),
@@ -178,19 +186,22 @@ make_bc1d(kindL, kindR; g1L = 0, g2L = 0, g1R = 0, g2R = 0, σ = 1) =
         τ = σ * (abs(s_R) + abs(s_L)) * invHf
         return -τ * (Φv - g1), -τ * (Πv - g2)
     end
-    # Subluminal faces (Dirichlet / Sommerfeld): one ingoing mode,
-    # ingoing ⟺ s·n̂ < 0. Drive the ingoing characteristic to its
-    # target — the supplied data for Dirichlet, 0 for Sommerfeld.
-    # sgn = ∂u_in/∂Π is −1 for u_R = DΦ − Π and +1 for u_L = DΦ + Π;
-    # the penalty −sgn·κ·(u_in − g_in) then drives u_in → g_in.
-    if s_R * n̂ < 0
-        u_in = DΦv - Πv;  s_in = s_R;  sgn = -one(T)
-    else
-        u_in = DΦv + Πv;  s_in = s_L;  sgn = one(T)
-    end
-    g_in = kind == BC_SOMMERFELD ? zero(T) : g1
+    # Subluminal faces (Dirichlet / Sommerfeld): field-radiation SAT.
+    # Impose the scalar radiation condition ∂_tΦ + a·n̂·∂_xΦ = 0 on the
+    # FIELD (via ∂_tΦ = β∂_xΦ + aΠ), not on a characteristic
+    # eigenvector — this is the form that ports to multi-field systems
+    # (Einstein) where eigenvector projection is expensive. Normalised
+    # residual r = Π + (n̂ + β/a)·∂_xΦ; at β = 0 this is exactly the
+    # incoming characteristic, and for β ≠ 0 it differs by O(β)·∂_xΦ
+    # (stable for |β| ≲ 0.1, the small-shift regime radiative BCs are
+    # used in). The penalty drives r → g1, where g1 is the residual's
+    # value on the boundary data (0 for Sommerfeld = absorbing). |s_in|
+    # = a + n̂·β is the incoming-mode speed (an eigenvalue, not an
+    # eigenvector); κ scales the penalty just as in the β = 0 case.
+    r = Πv + (n̂ + βv / av) * DΦv
+    s_in = av + n̂ * βv
     κ = σ * abs(s_in) * invHf
-    return zero(T), -sgn * κ * (u_in - g_in)
+    return zero(T), -κ * (r - g1)
 end
 
 @kernel function _bc1d_kernel!(Φ̇, Π̇, @Const(Φ), @Const(Π), @Const(DΦ),

@@ -204,11 +204,12 @@ function _assemble_bc1d(bg, t, xL, xR, kindL, kindR, classL0, classR0,
             "$(WaveToySecondOrder._face_class_name(classR))); the " *
             "chosen boundary conditions are no longer admissible"))
 
-    # Dirichlet data slot is the exact ingoing characteristic at the
-    # face: u_R = ∂_xΦ − Π if s_R·n̂ < 0, else u_L = ∂_xΦ + Π
-    # (mirrors the kernel's mode selection).
+    # Dirichlet data slot is the field-radiation residual evaluated on
+    # the exact solution, r = Π + (n̂ + β/a)·∂_xΦ (matches the kernel's
+    # `r`); driving the kernel residual to it injects the exact
+    # incoming wave while leaving outgoing waves free.
     g_in(x, a, β, n̂) = !withdata ? zero(T) :
-        ((a - β) * n̂ < 0 ? T(De(t, x) - Πe(t, x)) : T(De(t, x) + Πe(t, x)))
+        T(Πe(t, x) + (n̂ + β / a) * De(t, x))
 
     g1L = kindL == BC_DIRICHLET      ? g_in(xL, aL, βL, -1) :
           kindL == BC_FULL_DIRICHLET ? (withdata ? T(Φe(t, xL)) : zero(T)) :

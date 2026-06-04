@@ -405,6 +405,9 @@ end
     # non-growing up to eigensolver round-off (σ = 1, the full-upwind
     # penalty; σ = 1/2 is marginally unstable — the one-sided bulk
     # operator leaves the full boundary flux for the penalty to cancel).
+    # The radiative (Sommerfeld / Dirichlet) faces use the
+    # characteristic-free field-radiation SAT, valid for small shift;
+    # the configs stay within the |β| ≤ 0.1 policy.
     _progress("wave1d BC: spectrum max Re(λ)")
     @testset "BC spectrum: max Re(λ) ≤ round-off" begin
         M = 8
@@ -414,8 +417,9 @@ end
             ("Dir/Dir β=0",       x -> zero(T), :dirichlet, :dirichlet, 0.0),
             ("Som/Som β=0",       x -> zero(T), :sommerfeld, :sommerfeld, 0.0),
             ("Som/Som β=0 + KO",  x -> zero(T), :sommerfeld, :sommerfeld, 0.1),
-            ("Dir/Som β=0.5",     x -> T(0.5), :dirichlet, :sommerfeld, 0.0),
-            ("Som/Som β var sub", x -> T(0.3) + T(0.2)*sinpi(2x),
+            ("Dir/Som β=0.1",     x -> T(0.1), :dirichlet, :sommerfeld, 0.0),
+            ("Som/Som β=0.1 + KO",x -> T(0.1), :sommerfeld, :sommerfeld, 0.1),
+            ("Som/Som β var ≤0.1",x -> T(0.05) + T(0.05)*sinpi(2x),
                                   :sommerfeld, :sommerfeld, 0.0),
             ("β=2 exc/fullDir",   x -> T(2.0), :excision, :full_dirichlet, 0.0),
             ("β=2 exc/fullDir + KO", x -> T(2.0), :excision, :full_dirichlet, 0.1),
@@ -444,24 +448,30 @@ end
 
     # (9) BC convergence — three regimes.
     _progress("wave1d BC: convergence (3 regimes)")
-    @testset "BC convergence: travelling wave Dir→Som (β = 0.5)" begin
-        k_w = T(2π); β_val = T(0.5); c₊ = one(T) - β_val
-        Φe(t, x) = sin(k_w * (x - c₊ * t))
-        Πe(t, x) = -k_w * cos(k_w * (x - c₊ * t))
-        De(t, x) = k_w * cos(k_w * (x - c₊ * t))
+    @testset "BC convergence: travelling wave Dir→Som (β = 0)" begin
+        # At β = 0 the field-radiation SAT is exact (it coincides with
+        # the incoming characteristic): a right-mover enters through the
+        # left Dirichlet face and exits through the right Sommerfeld
+        # face, and the scheme converges spectrally. (For β ≠ 0 the
+        # radiative BC has an O(β) reflection floor — see the
+        # small-shift boundedness test below.)
+        k_w = T(2π)
+        Φe(t, x) = sin(k_w * (x - t))
+        Πe(t, x) = -k_w * cos(k_w * (x - t))
+        De(t, x) = k_w * cos(k_w * (x - t))
+        # Field-radiation residual r = Π + n̂·DΦ on the exact solution.
+        rL(t) = Πe(t, zero(T)) - De(t, zero(T))   # n̂ = −1
         errs = T[]
         for M_test in (8, 16, 32)
             setup = _make_setup1d(T, N, M_test; periodic = false)
             xg = setup.xgrid
             Φ = Φe.(zero(T), xg); Π = Πe.(zero(T), xg)
-            bg! = _make_bg1d((t,x) -> one(T), (t,x) -> β_val,
+            bg! = _make_bg1d((t,x) -> one(T), (t,x) -> zero(T),
                              (t,x) -> one(T), xg)
             stages = _make_stages1d(T, N, M_test)
-            # Left face ingoing mode is u_R = DΦ − Π (s_R = 0.5 > 0).
-            bcf = t -> make_bc1d(:dirichlet, :sommerfeld;
-                                 g1L = De(t, zero(T)) - Πe(t, zero(T)))
-            dt, _ = _cfl_dt_1d(setup, β_val; n_xing = 1)
-            n_steps = ceil(Int, 2 / dt)
+            bcf = t -> make_bc1d(:dirichlet, :sommerfeld; g1L = rL(t))
+            dt, _ = _cfl_dt_1d(setup, 0.0; n_xing = 1)
+            n_steps = ceil(Int, 1 / dt)
             t = zero(T)
             for _ in 1:n_steps
                 _rk4_wave1d!(Φ, Π, t, dt; setup, bg!, ε_KO = 0.0, stages,
@@ -475,10 +485,45 @@ end
         @test gmean > 2.5
     end
 
-    @testset "BC convergence: standing wave, exact char. data" begin
+    @testset "BC small-shift radiative: O(β) reflection floor" begin
+        # The field-radiation BC is characteristic-free and stable for
+        # |β| ≤ 0.1 but only approximately absorbing: the spurious
+        # reflection is O(β). Drive a right-mover out through a
+        # Sommerfeld face at β = 0.05 and check the reflected amplitude
+        # is bounded by a few × β (and shrinks with β), rather than
+        # asserting spectral convergence.
+        k_w = T(2π)
+        refl = T[]
+        for β_val in (T(0.05), T(0.1))
+            M = 32
+            setup = _make_setup1d(T, N, M; periodic = false)
+            xg = setup.xgrid
+            c₊ = one(T) - β_val
+            Φ = sin.(k_w .* xg); Π = -k_w .* cos.(k_w .* xg)
+            bg! = _make_bg1d((t,x) -> one(T), (t,x) -> β_val,
+                             (t,x) -> one(T), xg)
+            stages = _make_stages1d(T, N, M)
+            # Both faces absorbing; the wave should leave with only an
+            # O(β) reflected remnant.
+            bcf = t -> make_bc1d(:sommerfeld, :sommerfeld)
+            dt, _ = _cfl_dt_1d(setup, β_val; n_xing = 1)
+            t = zero(T)
+            for _ in 1:ceil(Int, 2 / dt)
+                _rk4_wave1d!(Φ, Π, t, dt; setup, bg!, ε_KO = 0.0, stages,
+                             bcf)
+                t += dt
+            end
+            push!(refl, maximum(abs, Φ))
+        end
+        @test all(isfinite, refl)
+        @test refl[1] < 0.2          # bounded, O(β) at β = 0.05
+        @test refl[1] < refl[2]      # smaller reflection at smaller β
+    end
+
+    @testset "BC convergence: standing wave, exact radiation data" begin
         # Standing wave sin(2πx)cos(2πt): both movers present; the
-        # characteristic Dirichlet injects the exact ingoing mode at
-        # both faces.
+        # Dirichlet faces inject the exact field-radiation residual
+        # r = Π + n̂·∂_xΦ at β = 0 (where the SAT is exact).
         k_w = T(2π)
         Φe(t, x) = sin(k_w * x) * cos(k_w * t)
         Πe(t, x) = -k_w * sin(k_w * x) * sin(k_w * t)
@@ -491,10 +536,10 @@ end
             bg! = _make_bg1d((t,x) -> one(T), (t,x) -> zero(T),
                              (t,x) -> one(T), xg)
             stages = _make_stages1d(T, N, M_test)
-            # β = 0: ingoing at −x is u_R = DΦ − Π; at +x is u_L = DΦ + Π.
+            # r = Π + n̂·DΦ: n̂ = −1 at −x, +1 at +x.
             bcf = t -> make_bc1d(:dirichlet, :dirichlet;
-                                 g1L = De(t, zero(T)) - Πe(t, zero(T)),
-                                 g1R = De(t, one(T)) + Πe(t, one(T)))
+                                 g1L = Πe(t, zero(T)) - De(t, zero(T)),
+                                 g1R = Πe(t, one(T)) + De(t, one(T)))
             dt, _ = _cfl_dt_1d(setup, 0.0; n_xing = 1)
             n_steps = ceil(Int, 1 / dt)
             t = zero(T)
@@ -578,7 +623,7 @@ end
     bc_noise_configs = (
         ("Som/Som β=0",        (t,x) -> zero(T),  0.0, 0.0,
          t -> make_bc1d(:sommerfeld, :sommerfeld)),
-        ("Dir/Som β=0.5",      (t,x) -> T(0.5),   0.5, 0.0,
+        ("Dir/Som β=0.05",     (t,x) -> T(0.05),  0.05, 0.0,
          t -> make_bc1d(:dirichlet, :sommerfeld)),
         ("exc/fullDir β=2",    (t,x) -> T(2.0),   2.0, 0.1,
          t -> make_bc1d(:excision, :full_dirichlet)),
