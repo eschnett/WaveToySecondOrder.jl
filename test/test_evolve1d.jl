@@ -53,4 +53,58 @@ using WaveToySecondOrder: evolve1d
         @test res.integrator_name == :Tsit5
         @test maximum(res.l2_err) < 1e-3
     end
+
+    _progress("evolve1d: boundary conditions")
+    @testset "bc = :auto, subluminal (Dirichlet data injection)" begin
+        errs = Float64[]
+        for M in (8, 16, 32)
+            res = evolve1d(; N = 4, M, background = :constant_shift,
+                           shift = 0.5, bc = :auto, t1 = 1.0, Nt = 5)
+            push!(errs, maximum(res.l2_err))
+        end
+        @test (errs[1] / errs[end])^(1/2) > 2.5
+    end
+
+    @testset "bc = :auto, superluminal (excision + full Dirichlet)" begin
+        errs = Float64[]
+        for M in (8, 16, 32)
+            res = evolve1d(; N = 4, M, background = :constant_shift,
+                           shift = 2.0, bc = :auto, t1 = 1.0, Nt = 5)
+            push!(errs, maximum(res.l2_err))
+        end
+        @test (errs[1] / errs[end])^(1/2) > 1.8   # state pin: ~2nd order
+    end
+
+    @testset "explicit bc tuple on a curved background" begin
+        res = evolve1d(; N = 4, M = 16, background = :sineshift, A = 0.3,
+                       bc = (left = :dirichlet, right = :sommerfeld),
+                       t1 = 1.0, Nt = 5)
+        @test maximum(res.l2_err) < 1e-3
+    end
+
+    @testset "noise + Sommerfeld: energy absorbed, bounded" begin
+        res = evolve1d(; N = 4, M = 16, background = :minkowski,
+                       bc = (left = :sommerfeld, right = :sommerfeld),
+                       ic = :noise, ε_KO = 0.1, t1 = 3.0, Nt = 5)
+        @test all(isfinite, res.Φ_final)
+        @test res.energy[end] < res.energy[1]
+    end
+
+    @testset "inadmissible bc combinations throw" begin
+        # Sommerfeld at superluminal faces.
+        @test_throws ArgumentError evolve1d(; N = 4, M = 8,
+            background = :constant_shift, shift = 2.0,
+            bc = (left = :sommerfeld, right = :sommerfeld), t1 = 0.1, Nt = 2)
+        # Plain Dirichlet at a superluminal inflow face.
+        @test_throws ArgumentError evolve1d(; N = 4, M = 8,
+            background = :constant_shift, shift = 2.0,
+            bc = (left = :excision, right = :dirichlet), t1 = 0.1, Nt = 2)
+        # Excision at a subluminal face.
+        @test_throws ArgumentError evolve1d(; N = 4, M = 8,
+            background = :constant_shift, shift = 0.5,
+            bc = (left = :excision, right = :sommerfeld), t1 = 0.1, Nt = 2)
+        # Unknown bc spec.
+        @test_throws ArgumentError evolve1d(; N = 4, M = 8,
+            background = :minkowski, bc = :nonsense, t1 = 0.1, Nt = 2)
+    end
 end

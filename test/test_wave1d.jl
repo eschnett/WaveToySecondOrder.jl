@@ -24,15 +24,21 @@ using StaticArrays: SVector
 using Test
 using WaveToySecondOrder: AnalyticBackground1D, MetricBackground1D,
                           make_wave1d_workspace, sample_background!,
-                          wave1d_curved_rhs!, wave1d_energy
+                          wave1d_curved_rhs!, wave1d_energy,
+                          make_bc1d, classify_face1d, validate_bc1d,
+                          BC_DIRICHLET, BC_SOMMERFELD, BC_EXCISION,
+                          BC_FULL_DIRICHLET,
+                          FACE_SUBLUMINAL, FACE_OUTFLOW, FACE_INFLOW,
+                          FACE_SONIC
 
 @isdefined(_progress) ||
     (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
                        flush(stderr)))
 
 # Bundle mesh + operators + scratch for one (N, M) configuration.
-function _make_setup1d(::Type{T}, N, M; x0 = zero(T), x1 = one(T)) where {T}
-    mesh = make_uniform_line(T, M, x0, x1; periodic = true)
+function _make_setup1d(::Type{T}, N, M; x0 = zero(T), x1 = one(T),
+                       periodic = true) where {T}
+    mesh = make_uniform_line(T, M, x0, x1; periodic)
     elem = make_element(T, N)
     ops  = make_operators(elem)
     geom = make_geometry(mesh, elem)
@@ -53,23 +59,29 @@ _make_bg1d(α_fn, β_fn, γ_fn, xgrid) =
 # RK4 with time-dependent background sampling at stage times.
 function _rk4_wave1d!(Φ::AbstractMatrix{T}, Π::AbstractMatrix{T},
                       t::T, dt::T;
-                      setup, bg!, ε_KO::Real, stages) where {T}
+                      setup, bg!, ε_KO::Real, stages,
+                      bcf = nothing) where {T}
     (; geom, ops, ws) = setup
     (; a, β, sγ, k1Φ, k1Π, k2Φ, k2Π, k3Φ, k3Π, k4Φ, k4Π, Φs, Πs) = stages
+    bc(τ) = bcf === nothing ? nothing : bcf(τ)
 
     bg!(a, β, sγ, t)
-    wave1d_curved_rhs!(k1Φ, k1Π, Φ, Π, a, β; geom, ops, ws, ε_KO)
+    wave1d_curved_rhs!(k1Φ, k1Π, Φ, Π, a, β; geom, ops, ws, ε_KO,
+                       bc1d = bc(t))
 
     bg!(a, β, sγ, t + dt/2)
     @. Φs = Φ + (dt/2) * k1Φ; @. Πs = Π + (dt/2) * k1Π
-    wave1d_curved_rhs!(k2Φ, k2Π, Φs, Πs, a, β; geom, ops, ws, ε_KO)
+    wave1d_curved_rhs!(k2Φ, k2Π, Φs, Πs, a, β; geom, ops, ws, ε_KO,
+                       bc1d = bc(t + dt/2))
 
     @. Φs = Φ + (dt/2) * k2Φ; @. Πs = Π + (dt/2) * k2Π
-    wave1d_curved_rhs!(k3Φ, k3Π, Φs, Πs, a, β; geom, ops, ws, ε_KO)
+    wave1d_curved_rhs!(k3Φ, k3Π, Φs, Πs, a, β; geom, ops, ws, ε_KO,
+                       bc1d = bc(t + dt/2))
 
     bg!(a, β, sγ, t + dt)
     @. Φs = Φ + dt * k3Φ; @. Πs = Π + dt * k3Π
-    wave1d_curved_rhs!(k4Φ, k4Π, Φs, Πs, a, β; geom, ops, ws, ε_KO)
+    wave1d_curved_rhs!(k4Φ, k4Π, Φs, Πs, a, β; geom, ops, ws, ε_KO,
+                       bc1d = bc(t + dt))
 
     @. Φ += (dt/6) * (k1Φ + 2k2Φ + 2k3Φ + k4Φ)
     @. Π += (dt/6) * (k1Π + 2k2Π + 2k3Π + k4Π)
@@ -99,7 +111,7 @@ function _cfl_dt_1d(setup, max_speed; n_xing, cfl = 0.1)
 end
 
 # Column-probe the linear RHS operator at a frozen background.
-function _build_rhs_operator1d(setup, a, β; ε_KO)
+function _build_rhs_operator1d(setup, a, β; ε_KO, bc1d = nothing)
     (; geom, ops, ws) = setup
     T = eltype(a)
     N, M = size(a)
@@ -110,7 +122,7 @@ function _build_rhs_operator1d(setup, a, β; ε_KO)
     for j in 1:n
         fill!(Φ, 0); fill!(Π, 0)
         j ≤ N*M ? (Φ[j] = 1) : (Π[j - N*M] = 1)
-        wave1d_curved_rhs!(Φ̇, Π̇, Φ, Π, a, β; geom, ops, ws, ε_KO)
+        wave1d_curved_rhs!(Φ̇, Π̇, Φ, Π, a, β; geom, ops, ws, ε_KO, bc1d)
         A[1:N*M, j]     = vec(Φ̇)
         A[N*M+1:end, j] = vec(Π̇)
     end
@@ -357,6 +369,241 @@ end
             results[T2] = Float64.(Φ)
         end
         @test maximum(abs, results[Float64] .- results[Float64x2]) < 1e-12
+    end
+
+    # (7) Boundary conditions: characteristic classification +
+    # admissibility validation.
+    _progress("wave1d BC: classification + validation")
+    @testset "face classification and BC validation" begin
+        # Subluminal: one in, one out at every face.
+        @test classify_face1d(1.0, 0.0, -1) == FACE_SUBLUMINAL
+        @test classify_face1d(1.0, 0.5, +1) == FACE_SUBLUMINAL
+        # β > a: both modes leftward — exit at −x, enter at +x.
+        @test classify_face1d(1.0, 2.0, -1) == FACE_OUTFLOW
+        @test classify_face1d(1.0, 2.0, +1) == FACE_INFLOW
+        # β < −a: mirrored.
+        @test classify_face1d(1.0, -2.0, -1) == FACE_INFLOW
+        @test classify_face1d(1.0, -2.0, +1) == FACE_OUTFLOW
+        # Sonic.
+        @test classify_face1d(1.0, 1.0, -1) == FACE_SONIC
+
+        @test validate_bc1d(FACE_SUBLUMINAL, BC_DIRICHLET, "x") === nothing
+        @test validate_bc1d(FACE_SUBLUMINAL, BC_SOMMERFELD, "x") === nothing
+        @test validate_bc1d(FACE_OUTFLOW, BC_EXCISION, "x") === nothing
+        @test validate_bc1d(FACE_INFLOW, BC_FULL_DIRICHLET, "x") === nothing
+        # Inappropriate combinations must throw.
+        @test_throws ArgumentError validate_bc1d(FACE_OUTFLOW, BC_SOMMERFELD, "x")
+        @test_throws ArgumentError validate_bc1d(FACE_OUTFLOW, BC_DIRICHLET, "x")
+        @test_throws ArgumentError validate_bc1d(FACE_INFLOW, BC_DIRICHLET, "x")
+        @test_throws ArgumentError validate_bc1d(FACE_INFLOW, BC_SOMMERFELD, "x")
+        @test_throws ArgumentError validate_bc1d(FACE_SUBLUMINAL, BC_EXCISION, "x")
+        @test_throws ArgumentError validate_bc1d(FACE_SUBLUMINAL, BC_FULL_DIRICHLET, "x")
+        @test_throws ArgumentError validate_bc1d(FACE_SONIC, BC_DIRICHLET, "x")
+    end
+
+    # (8) Boundary-condition spectra: every admissible configuration is
+    # non-growing up to eigensolver round-off (σ = 1, the full-upwind
+    # penalty; σ = 1/2 is marginally unstable — the one-sided bulk
+    # operator leaves the full boundary flux for the penalty to cancel).
+    _progress("wave1d BC: spectrum max Re(λ)")
+    @testset "BC spectrum: max Re(λ) ≤ round-off" begin
+        M = 8
+        setup = _make_setup1d(T, N, M; periodic = false)
+        xg = setup.xgrid
+        configs = (
+            ("Dir/Dir β=0",       x -> zero(T), :dirichlet, :dirichlet, 0.0),
+            ("Som/Som β=0",       x -> zero(T), :sommerfeld, :sommerfeld, 0.0),
+            ("Som/Som β=0 + KO",  x -> zero(T), :sommerfeld, :sommerfeld, 0.1),
+            ("Dir/Som β=0.5",     x -> T(0.5), :dirichlet, :sommerfeld, 0.0),
+            ("Som/Som β var sub", x -> T(0.3) + T(0.2)*sinpi(2x),
+                                  :sommerfeld, :sommerfeld, 0.0),
+            ("β=2 exc/fullDir",   x -> T(2.0), :excision, :full_dirichlet, 0.0),
+            ("β=2 exc/fullDir + KO", x -> T(2.0), :excision, :full_dirichlet, 0.1),
+            ("β=-2 fullDir/exc",  x -> T(-2.0), :full_dirichlet, :excision, 0.0),
+        )
+        for (label, β_fn, bcL, bcR, ε_KO) in configs
+            a = ones(T, N, M)
+            β = β_fn.(xg)
+            bc1d = make_bc1d(bcL, bcR)    # homogeneous data (linear probe)
+            A = _build_rhs_operator1d(setup, a, β; ε_KO, bc1d)
+            λ = eigvals(A)
+            @test maximum(real, λ) ≤ 1e-5 * maximum(abs, λ)
+        end
+        # Strongly varying superluminal β on an open domain: genuine
+        # compression amplification with rate bounded by the continuum
+        # estimate max|∂_xβ| (present already with pure excision and no
+        # penalties; absent on periodic meshes). Assert the bound, and
+        # that it is a true positive-growth regime.
+        a = ones(T, N, M)
+        β = (x -> T(1.5) + T(0.4)*sinpi(2x)).(xg)
+        max_dβ = T(0.4) * 2 * T(π)
+        bc1d = make_bc1d(:excision, :full_dirichlet)
+        λ = eigvals(_build_rhs_operator1d(setup, a, β; ε_KO = 0.1, bc1d))
+        @test 0 < maximum(real, λ) ≤ max_dβ
+    end
+
+    # (9) BC convergence — three regimes.
+    _progress("wave1d BC: convergence (3 regimes)")
+    @testset "BC convergence: travelling wave Dir→Som (β = 0.5)" begin
+        k_w = T(2π); β_val = T(0.5); c₊ = one(T) - β_val
+        Φe(t, x) = sin(k_w * (x - c₊ * t))
+        Πe(t, x) = -k_w * cos(k_w * (x - c₊ * t))
+        De(t, x) = k_w * cos(k_w * (x - c₊ * t))
+        errs = T[]
+        for M_test in (8, 16, 32)
+            setup = _make_setup1d(T, N, M_test; periodic = false)
+            xg = setup.xgrid
+            Φ = Φe.(zero(T), xg); Π = Πe.(zero(T), xg)
+            bg! = _make_bg1d((t,x) -> one(T), (t,x) -> β_val,
+                             (t,x) -> one(T), xg)
+            stages = _make_stages1d(T, N, M_test)
+            # Left face ingoing mode is u_R = DΦ − Π (s_R = 0.5 > 0).
+            bcf = t -> make_bc1d(:dirichlet, :sommerfeld;
+                                 g1L = De(t, zero(T)) - Πe(t, zero(T)))
+            dt, _ = _cfl_dt_1d(setup, β_val; n_xing = 1)
+            n_steps = ceil(Int, 2 / dt)
+            t = zero(T)
+            for _ in 1:n_steps
+                _rk4_wave1d!(Φ, Π, t, dt; setup, bg!, ε_KO = 0.0, stages,
+                             bcf)
+                t += dt
+            end
+            push!(errs, maximum(abs, Φ .- Φe.(t, xg)))
+        end
+        gmean = (errs[1] / errs[end])^(1 / (length(errs) - 1))
+        @test all(isfinite, errs)
+        @test gmean > 2.5
+    end
+
+    @testset "BC convergence: standing wave, exact char. data" begin
+        # Standing wave sin(2πx)cos(2πt): both movers present; the
+        # characteristic Dirichlet injects the exact ingoing mode at
+        # both faces.
+        k_w = T(2π)
+        Φe(t, x) = sin(k_w * x) * cos(k_w * t)
+        Πe(t, x) = -k_w * sin(k_w * x) * sin(k_w * t)
+        De(t, x) = k_w * cos(k_w * x) * cos(k_w * t)
+        errs = T[]
+        for M_test in (8, 16, 32)
+            setup = _make_setup1d(T, N, M_test; periodic = false)
+            xg = setup.xgrid
+            Φ = Φe.(zero(T), xg); Π = Πe.(zero(T), xg)
+            bg! = _make_bg1d((t,x) -> one(T), (t,x) -> zero(T),
+                             (t,x) -> one(T), xg)
+            stages = _make_stages1d(T, N, M_test)
+            # β = 0: ingoing at −x is u_R = DΦ − Π; at +x is u_L = DΦ + Π.
+            bcf = t -> make_bc1d(:dirichlet, :dirichlet;
+                                 g1L = De(t, zero(T)) - Πe(t, zero(T)),
+                                 g1R = De(t, one(T)) + Πe(t, one(T)))
+            dt, _ = _cfl_dt_1d(setup, 0.0; n_xing = 1)
+            n_steps = ceil(Int, 1 / dt)
+            t = zero(T)
+            for _ in 1:n_steps
+                _rk4_wave1d!(Φ, Π, t, dt; setup, bg!, ε_KO = 0.0, stages,
+                             bcf)
+                t += dt
+            end
+            push!(errs, maximum(abs, Φ .- Φe.(t, xg)))
+        end
+        gmean = (errs[1] / errs[end])^(1 / (length(errs) - 1))
+        @test all(isfinite, errs)
+        @test gmean > 2.5
+    end
+
+    @testset "BC convergence: superluminal advection (β = 2)" begin
+        # β = 2 ⇒ c₊ = −1: the wave moves leftward, exits through the
+        # −x face (excision) and enters through +x (full Dirichlet).
+        k_w = T(2π); β_val = T(2); c₊ = one(T) - β_val
+        Φe(t, x) = sin(k_w * (x - c₊ * t))
+        Πe(t, x) = -k_w * cos(k_w * (x - c₊ * t))
+        errs = T[]
+        for M_test in (8, 16, 32)
+            setup = _make_setup1d(T, N, M_test; periodic = false)
+            xg = setup.xgrid
+            Φ = Φe.(zero(T), xg); Π = Πe.(zero(T), xg)
+            bg! = _make_bg1d((t,x) -> one(T), (t,x) -> β_val,
+                             (t,x) -> one(T), xg)
+            stages = _make_stages1d(T, N, M_test)
+            bcf = t -> make_bc1d(:excision, :full_dirichlet;
+                                 g1R = Φe(t, one(T)), g2R = Πe(t, one(T)))
+            dt, _ = _cfl_dt_1d(setup, β_val; n_xing = 1)
+            n_steps = ceil(Int, 1 / dt)
+            t = zero(T)
+            for _ in 1:n_steps
+                _rk4_wave1d!(Φ, Π, t, dt; setup, bg!, ε_KO = 0.0, stages,
+                             bcf)
+                t += dt
+            end
+            push!(errs, maximum(abs, Φ .- Φe.(t, xg)))
+        end
+        gmean = (errs[1] / errs[end])^(1 / (length(errs) - 1))
+        @test all(isfinite, errs)
+        @test gmean > 2.5
+    end
+
+    # (10) Energy: Sommerfeld absorbs — a centred Gaussian pulse splits
+    # and exits; the energy must drop to a small fraction (reflection
+    # bound), and must never increase.
+    _progress("wave1d BC: Sommerfeld pulse exit (energy)")
+    @testset "Sommerfeld pulse exit: energy absorbed" begin
+        M = 32
+        setup = _make_setup1d(T, N, M; periodic = false)
+        xg = setup.xgrid
+        Φ = exp.(-((xg .- T(0.5)) ./ T(0.08)).^2)
+        Π = zeros(T, N, M)
+        bg! = _make_bg1d((t,x) -> one(T), (t,x) -> zero(T),
+                         (t,x) -> one(T), xg)
+        stages = _make_stages1d(T, N, M)
+        bcf = t -> make_bc1d(:sommerfeld, :sommerfeld)
+        sγ = ones(T, N, M)
+        E0 = wave1d_energy(Φ, Π, sγ; setup.geom, setup.ops, setup.ws)
+        dt, _ = _cfl_dt_1d(setup, 0.0; n_xing = 1)
+        t = zero(T)
+        Eprev = E0
+        monotone = true
+        for _ in 1:ceil(Int, 2 / dt)
+            _rk4_wave1d!(Φ, Π, t, dt; setup, bg!, ε_KO = 0.0, stages, bcf)
+            t += dt
+            E = wave1d_energy(Φ, Π, sγ; setup.geom, setup.ops, setup.ws)
+            monotone &= E ≤ Eprev * (1 + 100 * eps(T))
+            Eprev = E
+        end
+        E1 = wave1d_energy(Φ, Π, sγ; setup.geom, setup.ops, setup.ws)
+        @test monotone
+        @test E1 / E0 < 1e-4
+    end
+
+    # (11) Noise robustness with boundaries — one run per BC regime.
+    _progress("wave1d BC: noise stability per regime")
+    bc_noise_configs = (
+        ("Som/Som β=0",        (t,x) -> zero(T),  0.0, 0.0,
+         t -> make_bc1d(:sommerfeld, :sommerfeld)),
+        ("Dir/Som β=0.5",      (t,x) -> T(0.5),   0.5, 0.0,
+         t -> make_bc1d(:dirichlet, :sommerfeld)),
+        ("exc/fullDir β=2",    (t,x) -> T(2.0),   2.0, 0.1,
+         t -> make_bc1d(:excision, :full_dirichlet)),
+    )
+    for (i, (label, β_fn, max_β, ε_KO, bcf)) in enumerate(bc_noise_configs)
+        @testset "BC noise: $label bounded (20 crossings)" begin
+            M = 16
+            setup = _make_setup1d(T, N, M; periodic = false)
+            bg! = _make_bg1d((t,x) -> one(T), β_fn, (t,x) -> one(T),
+                             setup.xgrid)
+            stages = _make_stages1d(T, N, M)
+            Random.seed!(20260610 + i)
+            amp = sqrt(eps(T))
+            Φ = amp .* randn(T, N, M)
+            Π = amp .* randn(T, N, M)
+            dt, n_steps = _cfl_dt_1d(setup, max_β; n_xing = 20)
+            t = zero(T)
+            for _ in 1:n_steps
+                _rk4_wave1d!(Φ, Π, t, dt; setup, bg!, ε_KO, stages, bcf)
+                t += dt
+            end
+            @test all(isfinite, Φ) && all(isfinite, Π)
+            @test maximum(abs, Φ) < 100 * amp
+            @test maximum(abs, Π) < 1000 * amp
+        end
     end
 end
 

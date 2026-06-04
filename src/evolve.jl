@@ -121,10 +121,12 @@ end
 # evolve1d
 
 # Built-in 1D backgrounds with their exact scalar-wave solutions
-# (used as IC and as the L²-error reference). Each entry returns
-# `(bg :: Background1D, Φ_exact(t, x), Π_exact(t, x), max_speed)`.
-# `Π = (√γ/α)(∂_t Φ − β ∂_x Φ)`; `max_speed = max |β| + α/√γ` bounds
-# the coordinate characteristic speeds `−β ± α/√γ`.
+# (used as IC, as the L²-error reference, and as boundary data). Each
+# entry returns `(bg :: Background1D, Φ_exact(t, x), Π_exact(t, x),
+# DΦ_exact(t, x), max_speed)`. `Π = (√γ/α)(∂_t Φ − β ∂_x Φ)`;
+# `DΦ = ∂_x Φ` (needed to assemble characteristic boundary data);
+# `max_speed = max |β| + α/√γ` bounds the coordinate characteristic
+# speeds `−β ± α/√γ`.
 function _background1d(kind::Symbol, ::Type{T};
                        A::Real, d::Real, shift::Real,
                        k_w::Real) where {T}
@@ -139,10 +141,12 @@ function _background1d(kind::Symbol, ::Type{T};
         c₊ = one(T) - β₀
         Φe = (t, x) -> sin(k₀ * (x - c₊ * t))
         Πe = (t, x) -> -k₀ * cos(k₀ * (x - c₊ * t))
-        return bg, Φe, Πe, abs(β₀) + one(T)
+        De = (t, x) -> k₀ * cos(k₀ * (x - c₊ * t))
+        return bg, Φe, Πe, De, abs(β₀) + one(T)
     elseif kind === :gaugewave
         # AwA gauge wave: α = √H, β = 0, γ_xx = H. Exact solution
-        # Φ = sin(k₀(x̂ − t̂)) with x̂ − t̂ = x − t + 2C cos(2π(x−t)/d).
+        # Φ = sin(k₀(x̂ − t̂)) with x̂ − t̂ = x − t + 2C cos(2π(x−t)/d);
+        # ∂_x(x̂ − t̂) = 1 − A sin(2π(x−t)/d) = H.
         Aᵥ, dᵥ = T(A), T(d)
         kᵥ = 2 * T(π) / dᵥ
         C = Aᵥ * dᵥ / (4 * T(π))
@@ -150,10 +154,12 @@ function _background1d(kind::Symbol, ::Type{T};
         ψ = (t, x) -> x - t + 2C * cos(kᵥ * (x - t))
         Φe = (t, x) -> sin(k₀ * ψ(t, x))
         Πe = (t, x) -> -k₀ * (1 - Aᵥ * sin(kᵥ * (x - t))) * cos(k₀ * ψ(t, x))
-        return bg, Φe, Πe, one(T)            # α/√γ = 1, β = 0
+        De = (t, x) -> k₀ * (1 - Aᵥ * sin(kᵥ * (x - t))) * cos(k₀ * ψ(t, x))
+        return bg, Φe, Πe, De, one(T)        # α/√γ = 1, β = 0
     elseif kind === :sineshift
         # Sine shift: α = 1, β = −Ac/(1+Ac), γ_xx = (1+Ac)²,
-        # c = cos(2π(x−t)/d). Exact Φ = sin(k₀ ψ), ψ = x + C sin(…) − t.
+        # c = cos(2π(x−t)/d). Exact Φ = sin(k₀ ψ), ψ = x + C sin(…) − t;
+        # ∂_xψ = 1 + A cos(2π(x−t)/d) = √γ.
         Aᵥ, dᵥ = T(A), T(d)
         kᵥ = 2 * T(π) / dᵥ
         C = Aᵥ * dᵥ / (2 * T(π))
@@ -161,12 +167,60 @@ function _background1d(kind::Symbol, ::Type{T};
         ψ = (t, x) -> x + C * sin(kᵥ * (x - t)) - t
         Φe = (t, x) -> sin(k₀ * ψ(t, x))
         Πe = (t, x) -> -k₀ * (1 + Aᵥ * cos(kᵥ * (x - t))) * cos(k₀ * ψ(t, x))
+        De = (t, x) -> k₀ * (1 + Aᵥ * cos(kᵥ * (x - t))) * cos(k₀ * ψ(t, x))
         # max |β| + α/√γ = A/(1−A) + 1/(1−A).
-        return bg, Φe, Πe, (Aᵥ + 1) / (1 - Aᵥ)
+        return bg, Φe, Πe, De, (Aᵥ + 1) / (1 - Aᵥ)
     else
         error("evolve1d: unknown background $kind " *
               "(expected :minkowski, :constant_shift, :gaugewave, :sineshift)")
     end
+end
+
+# ADM coefficients (a = α/√γ, β) of a Background1D at a single point —
+# host-side helper for boundary-face classification and data assembly.
+function _bg_point(bg::Background1D, t, x)
+    α, β, γ = WaveToySecondOrder._bg_adm(bg, t, x)
+    sγ = sqrt(γ)
+    return α / sγ, β
+end
+
+# Per-stage boundary bundle for `evolve1d`: classify both faces from
+# the background at time `t` (must match the setup-time classes —
+# time-dependent backgrounds may not change a face's characteristic
+# class mid-run), then assemble the scalar data from the exact-solution
+# closures (`g ≡ 0` for noise runs).
+function _assemble_bc1d(bg, t, xL, xR, kindL, kindR, classL0, classR0,
+                        Φe, Πe, De, withdata::Bool, ::Type{T}) where {T}
+    aL, βL = _bg_point(bg, t, xL)
+    aR, βR = _bg_point(bg, t, xR)
+    classL = classify_face1d(aL, βL, -1)
+    classR = classify_face1d(aR, βR, +1)
+    (classL == classL0 && classR == classR0) ||
+        throw(ArgumentError("evolve1d: a boundary face changed its " *
+            "characteristic class at t = $t (left: " *
+            "$(WaveToySecondOrder._face_class_name(classL0)) → " *
+            "$(WaveToySecondOrder._face_class_name(classL)), right: " *
+            "$(WaveToySecondOrder._face_class_name(classR0)) → " *
+            "$(WaveToySecondOrder._face_class_name(classR))); the " *
+            "chosen boundary conditions are no longer admissible"))
+
+    # Dirichlet data slot is the exact ingoing characteristic at the
+    # face: u_R = ∂_xΦ − Π if s_R·n̂ < 0, else u_L = ∂_xΦ + Π
+    # (mirrors the kernel's mode selection).
+    g_in(x, a, β, n̂) = !withdata ? zero(T) :
+        ((a - β) * n̂ < 0 ? T(De(t, x) - Πe(t, x)) : T(De(t, x) + Πe(t, x)))
+
+    g1L = kindL == BC_DIRICHLET      ? g_in(xL, aL, βL, -1) :
+          kindL == BC_FULL_DIRICHLET ? (withdata ? T(Φe(t, xL)) : zero(T)) :
+          zero(T)
+    g2L = kindL == BC_FULL_DIRICHLET ? (withdata ? T(Πe(t, xL)) : zero(T)) :
+          zero(T)
+    g1R = kindR == BC_DIRICHLET      ? g_in(xR, aR, βR, +1) :
+          kindR == BC_FULL_DIRICHLET ? (withdata ? T(Φe(t, xR)) : zero(T)) :
+          zero(T)
+    g2R = kindR == BC_FULL_DIRICHLET ? (withdata ? T(Πe(t, xR)) : zero(T)) :
+          zero(T)
+    return make_bc1d(kindL, kindR; g1L, g2L, g1R, g2R)
 end
 
 # Constant-value closure as a callable struct so the background stays
@@ -198,6 +252,19 @@ over the periodic interval `[x0, x1]`, integrating the first-order
   `ic_wavenumber`, or √eps-amplitude noise (robust-stability mode; the
   L² error is reported against the zero solution).
 * `ε_KO` — Kreiss-Oliger coefficient (also tightens the `dt` choice).
+* `bc` — outer boundary treatment:
+  - `:periodic` (default): periodic ring mesh, no outer boundary.
+  - `:auto`: classify each face from the background at `t0` and pick
+    the natural admissible condition — on subluminal faces Dirichlet
+    (exact data) for `ic = :exact` / Sommerfeld for `ic = :noise`;
+    excision on superluminal outflow faces; full-state Dirichlet on
+    superluminal inflow faces.
+  - `(left = :sym, right = :sym)` with symbols from `:dirichlet`,
+    `:sommerfeld`, `:excision`, `:full_dirichlet` — validated against
+    each face's characteristic class (see `boundaries1d.jl`);
+    inadmissible combinations throw an `ArgumentError`. Dirichlet
+    data come from the background's exact solution for `ic = :exact`
+    and are homogeneous for `ic = :noise`.
 
 Returns a NamedTuple with sample times `ts`, sorted node line
 `xs_line` + permutation, spacetime samples `Φs`/`Πs :: (N·M, Nt)`,
@@ -218,6 +285,7 @@ function evolve1d(; T::Type = Float64,
                     ic_wavenumber::Real = 2π,
                     noise_amp::Real = sqrt(eps(Float64)),
                     ε_KO::Real = 0,
+                    bc = :periodic,
                     t0::Real = 0,
                     t1::Real = 1,
                     Nt::Int = 200,
@@ -227,7 +295,8 @@ function evolve1d(; T::Type = Float64,
     on_cpu || T <: AbstractFloat ||
         error("evolve1d: non-CPU backend requires a floating-point T; got $T")
 
-    mesh = make_uniform_line(T, M, T(x0), T(x1); periodic = true)
+    periodic = bc === :periodic
+    mesh = make_uniform_line(T, M, T(x0), T(x1); periodic)
     elem = make_element(T, N)
     ops  = make_operators(elem)
     geom_host = make_geometry(mesh, elem)
@@ -242,8 +311,38 @@ function evolve1d(; T::Type = Float64,
         copyto!(x_grid_dev, x_grid)
     end
 
-    bg, Φ_exact_fn, Π_exact_fn, max_speed =
+    bg, Φ_exact_fn, Π_exact_fn, DΦ_exact_fn, max_speed =
         _background1d(background, T; A, d, shift, k_w = ic_wavenumber)
+
+    # Boundary-condition setup: classify the two outer faces from the
+    # background at t0, resolve :auto, and validate the requested kinds
+    # against the characteristic classes.
+    xL, xR = T(x0), T(x1)
+    local kindL::Int, kindR::Int, classL0::Int, classR0::Int
+    if !periodic
+        aL, βL = _bg_point(bg, T(t0), xL)
+        aR, βR = _bg_point(bg, T(t0), xR)
+        classL0 = classify_face1d(aL, βL, -1)
+        classR0 = classify_face1d(aR, βR, +1)
+        # :auto picks the natural admissible condition per face. At
+        # subluminal faces: Dirichlet (exact-solution data) for
+        # ic = :exact so the analytic reference keeps entering the
+        # domain; Sommerfeld (absorbing) for ic = :noise.
+        auto(class) = class == FACE_SUBLUMINAL ?
+                          (ic === :exact ? BC_DIRICHLET : BC_SOMMERFELD) :
+                      class == FACE_OUTFLOW    ? BC_EXCISION :
+                                                 BC_FULL_DIRICHLET
+        if bc === :auto
+            kindL, kindR = auto(classL0), auto(classR0)
+        elseif bc isa NamedTuple && haskey(bc, :left) && haskey(bc, :right)
+            kindL, kindR = bc1d_kind(bc.left), bc1d_kind(bc.right)
+        else
+            throw(ArgumentError("evolve1d: bc must be :periodic, :auto, " *
+                "or (left = :sym, right = :sym); got $bc"))
+        end
+        validate_bc1d(classL0, kindL, "left (−x)")
+        validate_bc1d(classR0, kindR, "right (+x)")
+    end
 
     # CFL-derived fixed dt: wave limit `cfl · dx_min / max_speed`,
     # plus the exact KO-term limit when ε_KO ≠ 0. With the μ⁻⁵
@@ -275,7 +374,11 @@ function evolve1d(; T::Type = Float64,
     Π0 = on_cpu ? Π0_host : copyto!(similar(x_grid_dev), Π0_host)
 
     # Parameter bundle for the RHS: backgrounds are sampled into the
-    # preallocated coefficient fields at every integrator stage time.
+    # preallocated coefficient fields at every integrator stage time;
+    # for non-periodic meshes the boundary bundle (face classes
+    # re-checked, data scalars from the exact closures) is assembled
+    # host-side per stage.
+    withdata = ic === :exact
     p = (; geom, ops, ws, bg, xgrid = x_grid_dev,
          a = similar(Φ0), β = similar(Φ0), sγ = similar(Φ0),
          ε_KO = T(ε_KO))
@@ -283,8 +386,13 @@ function evolve1d(; T::Type = Float64,
         Φ, Π = u.x[1], u.x[2]
         Φ̇, Π̇ = du.x[1], du.x[2]
         sample_background!(p.a, p.β, p.sγ, p.bg, t, p.xgrid)
+        bc1d = periodic ? nothing :
+            _assemble_bc1d(p.bg, t, xL, xR, kindL, kindR,
+                           classL0, classR0,
+                           Φ_exact_fn, Π_exact_fn, DΦ_exact_fn,
+                           withdata, T)
         wave1d_curved_rhs!(Φ̇, Π̇, Φ, Π, p.a, p.β;
-                           p.geom, p.ops, p.ws, ε_KO = p.ε_KO)
+                           p.geom, p.ops, p.ws, ε_KO = p.ε_KO, bc1d)
         return nothing
     end
 
@@ -352,7 +460,7 @@ function evolve1d(; T::Type = Float64,
 
     return (; ts, ts_actual, xs_line, perm, Φs, Πs, l2_err, energy,
               Φ_final = copy(Φ_host), Π_final = copy(Π_host),
-              mesh, geom = geom_host, elem, ops, background, ic,
+              mesh, geom = geom_host, elem, ops, background, ic, bc,
               x0 = T(x0), x1 = T(x1), dt, dx = dx_min,
               integrator_name = nameof(typeof(alg)))
 end

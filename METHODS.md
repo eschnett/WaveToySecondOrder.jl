@@ -8,8 +8,10 @@ the same scheme and documented here as they are rebuilt.
 
 Scalar wave equation on a prescribed 1+1 ADM background with
 space- and time-varying lapse α(t,x), shift βˣ(t,x), and spatial
-metric γ_xx(t,x). Superluminal shift (|β| > α/√γ) is supported;
-periodic boundaries only (see Boundary conditions below).
+metric γ_xx(t,x). Superluminal shift (|β| > α/√γ) is supported.
+Boundaries: periodic, characteristic Dirichlet, Sommerfeld, excision,
+and full-state Dirichlet, validated against each face's
+characteristic class (see Boundary conditions below).
 
 ## Continuous formulation
 
@@ -169,14 +171,78 @@ Kernels are type- and backend-agnostic via KernelAbstractions:
 
 ## Boundary conditions
 
-* **Implemented: periodic** (ring connectivity in `Mesh{1}`).
-* Planned (in order): Dirichlet SAT, then excision boundaries, then
-  Sommerfeld SAT. Dirichlet and Sommerfeld are only meaningful for
-  subluminal shift at the boundary; for superluminal shift all
-  characteristics leave the domain on one side — use excision/outflow
-  there (no SAT — exactly what `apply_D!` already does at `bdry ≠ 0`
-  faces). Entry points: `make_uniform_line(...; periodic = false)`
-  boundary tags 1/2 and the `bdry`-gated SAT in `apply_D!`.
+Implemented: periodic (ring connectivity in `Mesh{1}`) plus four
+outer-boundary conditions on non-periodic meshes (`src/boundaries1d.jl`;
+`make_uniform_line(...; periodic = false)` tags the −x/+x faces 1/2).
+
+**Characteristic structure.** With `v := ∂_xΦ` the principal system
+in `(v, Π)` has flux matrix `[β a; a β]` (`a = α/√γ`); characteristic
+variables and coordinate propagation speeds:
+
+| variable | speed |
+|---|---|
+| `u_R = ∂_xΦ − Π` | `s_R = a − β` (rightward when `a > β`) |
+| `u_L = ∂_xΦ + Π` | `s_L = −a − β` (leftward) |
+
+A mode is outgoing at a face with outward normal n̂ iff `s·n̂ > 0`.
+Face classes (`classify_face1d`): **subluminal** (`|β| < a`, one in /
+one out), **superluminal outflow** (both out), **superluminal inflow**
+(both in), **sonic** (`|β| ≈ a` within `eps^(1/4)·a` — always an
+error: a vanishing characteristic speed leaves a mode undetermined).
+
+**Admissible conditions** (validated at setup *and* re-checked at
+every stage time — time-dependent backgrounds may not change a face's
+class mid-run; `validate_bc1d` throws otherwise):
+
+* Subluminal → `:dirichlet` (ingoing characteristic set from boundary
+  data) or `:sommerfeld` (ingoing characteristic = 0; in 1D this
+  radiation condition is exact).
+* Superluminal outflow → `:excision`: no boundary term at all — the
+  one-sided `apply_D!` rows (no SAT at `bdry ≠ 0` faces) are already
+  the correct outflow treatment.
+* Superluminal inflow → `:full_dirichlet`: both modes enter, so the
+  full state (Φ, Π) is pinned to data.
+
+**SAT penalties** (a 2-node post-pass in `wave1d_curved_rhs!` after
+the bulk + KO passes; HexSBPSAT stays equation-agnostic). At a
+boundary node with face mass `Hf = Hphys[face]`, penalty strength
+`σ·|s_in|/Hf` with **σ = 1** (full characteristic upwinding —
+σ = 1/2 is marginally unstable because the one-sided bulk operator
+leaves the *full* boundary flux for the penalty to cancel; verified
+by the dense-operator spectrum tests, max Re(λ) ≤ round-off for every
+admissible configuration, including with KO):
+
+* Dirichlet/Sommerfeld: `Π̇ += −sgn(∂u_in/∂Π)·σ|s_in|/Hf·(u_in − g_in)`
+  with `g_in` the data (0 for Sommerfeld). Energy:
+  `dE/dt = −¼Σ(s·n̂)u²` per mode, so the outgoing mode drains and the
+  penalty controls the ingoing injection.
+* Full-state Dirichlet: `Φ̇ += −τ/Hf(Φ−g_Φ)`, `Π̇ += −τ/Hf(Π−g_Π)`
+  with `τ = σ(|s_R|+|s_L|)`; observed ≈ 2nd-order accurate at the
+  boundary (vs. spectral in the interior) — acceptable for an inflow
+  data pin.
+
+Dirichlet here is the **characteristic** (hyperbolic) flavour: the
+single ingoing mode is specified, with data assembled from exact
+solutions as `u_in = ∂_xΦ_exact ∓ Π_exact` at the face. A pointwise
+reflecting wall `Φ = g(t)` (the second-order-in-space Dirichlet
+flavour) was tested in the state-target form
+`Π → (∂_tg − β∂_xΦ)/a` and is spectrally **unstable** with the
+present one-sided bulk operator; it would need a Mattsson-style
+two-parameter lift SAT — deferred.
+
+**Known limitation** (genuine physics, not a SAT defect): strongly
+space-varying *superluminal* β on an open domain produces operator
+eigenvalues with `0 < Re(λ) ≤ max|∂_xβ|` (compression amplification;
+present already with pure excision and no penalties, absent on
+periodic meshes where modes recirculate through the exactly-skew
+operator; KO does not help — the growing mode is smooth). The tests
+assert the continuum bound.
+
+`evolve1d(; bc = ...)` accepts `:periodic`, `:auto` (classify per
+face and pick the natural admissible condition; subluminal gets
+Dirichlet-with-exact-data for `ic = :exact`, Sommerfeld for
+`ic = :noise`), or `(left = :sym, right = :sym)`. The app exposes
+`--bc`, `--bc-left`, `--bc-right`.
 
 ## Tests
 
@@ -199,6 +265,15 @@ operator-level identities live in `HexSBPSAT/test/test_apply_D1d.jl`,
 5. **Types/backends**: Float64x2 trajectory agrees with Float64 to
    < 1e-12; Metal Float32 run agrees with CPU Float32 to 1e-3
    (auto-skipped without hardware).
+6. **Boundary conditions**: face classification + admissibility
+   (`@test_throws` for every inappropriate combination); spectra of
+   all admissible configs ≤ round-off (and the strongly-varying
+   superluminal control within its continuum bound); convergence for
+   travelling wave Dirichlet→Sommerfeld, standing wave with exact
+   characteristic data, and superluminal advection
+   excision/full-Dirichlet; Sommerfeld pulse-exit energy absorption
+   (E_final/E_0 < 1e-4, monotone decay); noise stability per BC
+   regime; driver-level `bc` kwarg tests incl. `:auto`.
 
 Each testset runs in seconds (full 1D set ≈ 15 s; Metal adds ≈ 30 s).
 

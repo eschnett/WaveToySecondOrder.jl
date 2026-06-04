@@ -213,6 +213,12 @@ spectral radius of `D` (stored in `ws`), so the highest mode is
 damped at rate `ε·μ` and the term does not tighten the CFL limit for
 `ε ≤ 1`. `0.1` is the standard NR default; `0.0` disables the KO
 passes entirely.
+
+`bc1d` selects the outer-boundary treatment on non-periodic meshes:
+`nothing` (default) for periodic meshes, or a scalar bundle from
+[`make_bc1d`](@ref) for Dirichlet / Sommerfeld / excision /
+full-state-Dirichlet faces — see `boundaries1d.jl` for the
+characteristic analysis and admissibility rules.
 """
 function wave1d_curved_rhs!(Φ̇::AbstractMatrix{T}, Π̇::AbstractMatrix{T},
                             Φ::AbstractMatrix{T}, Π::AbstractMatrix{T},
@@ -220,7 +226,8 @@ function wave1d_curved_rhs!(Φ̇::AbstractMatrix{T}, Π̇::AbstractMatrix{T},
                             geom::MeshGeometry{1, T, N},
                             ops::SBPOps{N, T},
                             ws::Wave1DWorkspace{T},
-                            ε_KO::Real = 0.1) where {N, T}
+                            ε_KO::Real = 0.1,
+                            bc1d = nothing) where {N, T}
     @assert size(Φ) == size(Π) == size(Φ̇) == size(Π̇) == (N, geom.Ne)
     @assert size(a) == size(β) == (N, geom.Ne)
     εT = T(ε_KO)
@@ -250,6 +257,13 @@ function wave1d_curved_rhs!(Φ̇::AbstractMatrix{T}, Π̇::AbstractMatrix{T},
         apply_D!(s1, s2; geom, ops)   # D⁵Π
         apply_D!(s2, s1; geom, ops)   # D⁶Π
         @. Π̇ += koT * s2
+    end
+
+    # Outer-boundary SAT penalties (non-periodic meshes; see
+    # `boundaries1d.jl`). Runs last; reads the bulk DΦ, which the KO
+    # chain does not overwrite. `bc1d === nothing` ⇒ periodic, no-op.
+    if bc1d !== nothing
+        _apply_bc1d!(Φ̇, Π̇, Φ, Π, ws.DΦ, a, β; geom, bc1d)
     end
     return Φ̇, Π̇
 end

@@ -85,17 +85,23 @@ include("wave_curved_rhs.jl")
 # Bayliss–Turkel Sommerfeld at outer faces (tag 7).
 include("wave_strong_rhs.jl")
 
-# `evolve.jl`: high-level drivers `evolve1d`, `evolve2d`, `evolve3d`.
-# Each builds the geometry, runs a symplectic integration, samples a
-# spacetime slice + L² error, and returns a NamedTuple consumed by
-# the matching `bin/waveplot{1,2,3}d.jl` plot script.
-include("evolve.jl")
-
 # `wave1d.jl`: conservative-form 1D scalar wave on a 1+1 ADM
 # background with arbitrary lapse α(t,x), shift β(t,x), and spatial
 # metric γ_xx(t,x), discretised with `HexMeshes.Mesh{1}` +
 # `HexSBPSAT.apply_D!`, plus the `Background1D` sampling layer.
+# `boundaries1d.jl`: outer-boundary conditions for that system —
+# characteristic face classification, admissibility validation, and
+# the SAT penalty pass (Dirichlet / Sommerfeld / excision /
+# full-state Dirichlet). Both precede `evolve.jl`, whose 1D driver
+# dispatches on their types.
+include("boundaries1d.jl")
 include("wave1d.jl")
+
+# `evolve.jl`: high-level drivers `evolve1d`, `evolve2d`, `evolve3d`.
+# Each builds the geometry, runs the time integration, samples a
+# spacetime slice + L² error, and returns a NamedTuple consumed by
+# the matching `bin/` plot script.
+include("evolve.jl")
 
 # Re-export the operator-layer symbols that downstream `bin/` scripts
 # and tests are used to seeing at the WaveToy level. Keeps the existing
@@ -129,6 +135,10 @@ export
     # ADM background sampling (analytic closures or SpacetimeMetrics).
     Background1D, AnalyticBackground1D, MetricBackground1D,
     sample_background!,
+    # 1D outer-boundary conditions (`boundaries1d.jl`).
+    BC_DIRICHLET, BC_SOMMERFELD, BC_EXCISION, BC_FULL_DIRICHLET,
+    FACE_SUBLUMINAL, FACE_OUTFLOW, FACE_INFLOW, FACE_SONIC,
+    bc1d_kind, classify_face1d, validate_bc1d, make_bc1d,
     # Re-export the connectivity-driven 1D derivative from HexSBPSAT.
     apply_D!,
     # Wave-equation layer — 2D

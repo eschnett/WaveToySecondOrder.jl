@@ -23,6 +23,14 @@
 #     --shift <float>      shift β for constant_shift [0.5]
 #     --ic <name>          exact | noise [exact]
 #     --wavenumber <float> IC wavenumber k₀ [2π]
+#     --bc <name>          periodic | auto | dirichlet | sommerfeld
+#                          [periodic]; `auto` classifies each face from
+#                          the background (subluminal → dirichlet for
+#                          --ic exact / sommerfeld for --ic noise;
+#                          superluminal → excision at outflow +
+#                          full_dirichlet at inflow)
+#     --bc-left <name>     per-face override (dirichlet | sommerfeld |
+#     --bc-right <name>    excision | full_dirichlet)
 #     --eps-ko <float>     Kreiss-Oliger coefficient [0.0]
 #     --t1 <float>         final time [1.0]
 #     --Nt <int>           number of samples [200]
@@ -151,11 +159,31 @@ function _pick_backend(name, T)
     error("wave1d.jl: unknown --backend $name (cpu | metal | cuda)")
 end
 
+# Resolve the --bc / --bc-left / --bc-right flags into the `bc` kwarg
+# of `evolve1d`: a bare Symbol (:periodic / :auto) or a per-face
+# NamedTuple. Per-face overrides force the NamedTuple form (defaulting
+# the other side from --bc when it names a concrete condition, else
+# requiring both overrides).
+function _pick_bc(o)
+    base = get(o, "bc", "periodic")
+    left = get(o, "bc-left", nothing)
+    right = get(o, "bc-right", nothing)
+    if left === nothing && right === nothing
+        base in ("periodic", "auto") && return Symbol(base)
+        return (left = Symbol(base), right = Symbol(base))
+    end
+    base in ("periodic", "auto") && (left === nothing || right === nothing) &&
+        error("wave1d.jl: with --bc $base, give both --bc-left and --bc-right")
+    return (left  = Symbol(something(left, base)),
+            right = Symbol(something(right, base)))
+end
+
 function main1d_cli(args)
     o = _parse_args(args)
     T = _pick_type(get(o, "type", "Float64"))
     backend = _pick_backend(get(o, "backend", "cpu"), T)
     return main1d(;
+        bc = _pick_bc(o),
         T, backend,
         N  = parse(Int, get(o, "N", "4")),
         M  = parse(Int, get(o, "M", "32")),
