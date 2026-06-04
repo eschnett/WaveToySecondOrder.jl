@@ -132,8 +132,26 @@ function _apply_bc2d_curv!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
                            Φ::AbstractArray{T,3}, Π::AbstractArray{T,3},
                            coef, ws, metric; geom::MeshGeometry{2, T, N},
                            ops::SBPOps{N, T}, bc2d) where {N, T}
-    get_backend(Φ̇) isa KernelAbstractions.CPU ||
-        error("_apply_bc2d_curv!: curvilinear boundary pass is CPU-only")
+    backend = get_backend(Φ̇)
+    if !(backend isa KernelAbstractions.CPU)
+        kind = bc2d.kinds[1]
+        kind == BC_EXCISION && return nothing
+        # Substitute the field arrays as dummies where no data is given
+        # (the corresponding kind-branch in the kernel never reads them).
+        gΦ  = bc2d.gΦ  === nothing ? Φ : bc2d.gΦ
+        gΠ  = bc2d.gΠ  === nothing ? Φ : bc2d.gΠ
+        gDx = bc2d.gDx === nothing ? Φ : bc2d.gDx
+        gDy = bc2d.gDy === nothing ? Φ : bc2d.gDy
+        _bc2d_curv_kernel!(backend, (N, N))(
+            Φ̇, Π̇, Φ, Π, ws.DΦ1, ws.DΦ2,
+            coef.alpha, coef.sqrtγ, coef.gu11, coef.gu12, coef.gu22,
+            coef.b1, coef.b2, geom.jac, geom.detjac, geom.handedness,
+            geom.conn.bdry, ops, gΦ, gΠ, gDx, gDy,
+            bc2d.gΦ === nothing, bc2d.gΠ === nothing,
+            bc2d.gDx === nothing, bc2d.gDy === nothing,
+            Int32(kind), T(bc2d.σ), Val(N); ndrange = (N, N, geom.Ne))
+        return nothing
+    end
     DΦ1, DΦ2 = ws.DΦ1, ws.DΦ2
     H1 = ops.H; σ = T(bc2d.σ); conn = geom.conn
     kind = bc2d.kinds[1]               # single outer BC kind
@@ -194,4 +212,71 @@ function _apply_bc2d_curv!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
         end
     end
     return nothing
+end
+
+using KernelAbstractions: @kernel, @index, @Const
+
+# GPU form of `_apply_bc2d_curv!`. Parallelised over NODES (i, j, e):
+# each workitem owns its own output node and loops over the ≤ 2 boundary
+# faces it lies on, accumulating into local increments and writing once
+# — so a corner node touched by two faces gets both contributions with
+# no cross-workitem race (per-face parallelisation would race there).
+# `kind` is the single outer BC code (Int32); `noΦ/noΠ/noDx/noDy` flag a
+# missing data array (its argument is then a dummy and never read). The
+# arithmetic mirrors the CPU body line-for-line.
+@kernel function _bc2d_curv_kernel!(Fdot, Pdot, @Const(F), @Const(P),
+                                    @Const(DΦ1), @Const(DΦ2),
+                                    @Const(alpha), @Const(sqrtγ),
+                                    @Const(gu11), @Const(gu12), @Const(gu22),
+                                    @Const(b1), @Const(b2), @Const(jac),
+                                    @Const(detjac), @Const(handed),
+                                    @Const(bdry), ops, @Const(gΦ), @Const(gΠ),
+                                    @Const(gDx), @Const(gDy), noΦ, noΠ, noDx,
+                                    noDy, kind, σ, ::Val{N}) where {N}
+    i, j, m = @index(Global, NTuple)
+    T = eltype(Fdot)
+    dF = zero(T); dP = zero(T)
+    @inbounds for f in 1:4
+        bdry[f, m] == 0 && continue
+        a_idx = (f + 1) ÷ 2
+        row = isodd(f) ? 1 : N
+        on = a_idx == 1 ? (i == row) : (j == row)
+        on || continue
+        axis_p = a_idx == 1 ? 2 : 1
+        sgn_f = isodd(f) ? -one(T) : one(T)
+        sgn_c = a_idx == 1 ? one(T) : -one(T)
+        sgn_out = sgn_f * sgn_c * T(handed[m])
+        tpx = jac[1, axis_p, i, j, m]; tpy = jac[2, axis_p, i, j, m]
+        nfx =  sgn_out * tpy; nfy = -sgn_out * tpx
+        JF = sqrt(nfx*nfx + nfy*nfy)
+        nx = nfx / JF; ny = nfy / JF
+        αv = alpha[i,j,m]; sγ = sqrtγ[i,j,m]
+        g11 = gu11[i,j,m]; g12 = gu12[i,j,m]; g22 = gu22[i,j,m]
+        a = αv / sγ
+        a_n = αv * sqrt(g11*nx*nx + 2*g12*nx*ny + g22*ny*ny)
+        βn = b1[i,j,m]*nx + b2[i,j,m]*ny
+        wt = JF / (ops.H[row, row] * detjac[i,j,m])
+        if kind == Int32(BC_FULL_DIRICHLET)
+            τ = σ * (abs(a_n - βn) + abs(a_n + βn)) * wt
+            gΦv = noΦ ? zero(T) : gΦ[i,j,m]
+            gΠv = noΠ ? zero(T) : gΠ[i,j,m]
+            dF += -τ * (F[i,j,m] - gΦv)
+            dP += -τ * (P[i,j,m] - gΠv)
+        else
+            q = nx*DΦ1[i,j,m] + ny*DΦ2[i,j,m]
+            r = P[i,j,m] + ((βn + a_n) / a) * q
+            g = if kind == Int32(BC_SOMMERFELD)
+                zero(T)
+            else
+                gΠv = noΠ  ? zero(T) : gΠ[i,j,m]
+                gx  = noDx ? zero(T) : gDx[i,j,m]
+                gy  = noDy ? zero(T) : gDy[i,j,m]
+                gΠv + ((βn + a_n) / a) * (nx*gx + ny*gy)
+            end
+            s_in = a_n + βn
+            dP += -σ * s_in * wt * (r - g)
+        end
+    end
+    @inbounds Fdot[i,j,m] += dF
+    @inbounds Pdot[i,j,m] += dP
 end
