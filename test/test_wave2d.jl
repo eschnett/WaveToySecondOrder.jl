@@ -7,8 +7,10 @@
 # robustness, gauge-wave (varying lapse via SpacetimeMetrics).
 
 using HexMeshes: make_uniform_quad
-using HexSBPSAT: make_element, make_operators, make_geometry
+using HexSBPSAT: make_element, make_operators, make_geometry, to_device
+using KernelAbstractions
 using LinearAlgebra
+using MultiFloats
 using Random
 using SpacetimeMetrics: GaugeWave
 using Test
@@ -168,5 +170,89 @@ _flat2d(::Type{T}) where {T} =
         end
         @test all(isfinite, errs)
         @test (errs[1]/errs[end])^(1/(length(errs)-1)) > 2.5
+    end
+
+    _progress("wave2d: Float64x2 (MultiFloats) CPU")
+    @testset "Float64x2 agrees with Float64 (plane wave)" begin
+        M = 4
+        results = Dict{DataType, Array{Float64,3}}()
+        for T2 in (Float64, Float64x2)
+            s = _setup2d(T2, N, M)
+            xg64 = Float64.(s.xg)
+            Φ = T2.(sin.(2 .* Float64(π) .* xg64))
+            Π = T2.(zeros(Float64, size(xg64)))
+            bg = _flat2d(T2)
+            k = [similar(Φ) for _ in 1:8]; Φs = similar(Φ); Πs = similar(Π)
+            dt = T2(1) / 256
+            t = zero(T2)
+            for _ in 1:48
+                _rk4_2d!(Φ, Π, t, dt, bg, s; ε_KO = T2(0.1), k, Φs, Πs)
+                t += dt
+            end
+            @test all(isfinite, Φ)
+            results[T2] = Float64.(Φ)
+        end
+        @test maximum(abs, results[Float64] .- results[Float64x2]) < 1e-11
+    end
+end
+
+# GPU smoke test: full 2D RHS + background sampling on Metal (Float32)
+# vs CPU Float32. Auto-skips without Metal.
+if !@isdefined(HAS_METAL)
+    const HAS_METAL = try
+        @eval using Metal
+        Metal.functional()
+    catch
+        false
+    end
+end
+
+if HAS_METAL
+    @testset "wave2d on Metal (Float32)" begin
+        _progress("wave2d Metal smoke test (Float32)")
+        T = Float32; N = 4; M = 8
+        # isbits closures (no Type capture) so the bg passes to the kernel.
+        bg = AnalyticBackground2D((t,x,y) -> 1.0f0,
+                                  (t,x,y) -> (0.3f0, 0.2f0),
+                                  (t,x,y) -> (1.0f0, 0.0f0, 1.0f0))
+        mesh = make_uniform_quad(T, M, M, 0.0f0, 1.0f0; periodic = true)
+        elem = make_element(T, N); ops = make_operators(elem)
+        geom_h = make_geometry(mesh, elem)
+        xg_h = geom_h.coords[1, :, :, :]; yg_h = geom_h.coords[2, :, :, :]
+        Φ0 = sinpi.(2 .* xg_h); Π0 = -2 .* T(π) .* cospi.(2 .* xg_h)
+        dt = T(5.0f-4); nst = 40
+
+        run_on = function (backend, geom, xg, yg)
+            ws = make_wave2d_workspace(geom, ops)
+            coef = make_coef2d(geom)
+            Φ = KernelAbstractions.allocate(backend, T, N, N, geom.Ne)
+            Π = similar(Φ); copyto!(Φ, Φ0); copyto!(Π, Π0)
+            k = [similar(Φ) for _ in 1:8]; Φs = similar(Φ); Πs = similar(Π)
+            t = zero(T)
+            for _ in 1:nst
+                sample_background2d!(coef, bg, t, xg, yg)
+                wave2d_curved_rhs!(k[1], k[2], Φ, Π, coef; geom, ops, ws, ε_KO=1f-4)
+                @. Φs = Φ + dt/2*k[1]; @. Πs = Π + dt/2*k[2]
+                sample_background2d!(coef, bg, t+dt/2, xg, yg)
+                wave2d_curved_rhs!(k[3], k[4], Φs, Πs, coef; geom, ops, ws, ε_KO=1f-4)
+                @. Φs = Φ + dt/2*k[3]; @. Πs = Π + dt/2*k[4]
+                wave2d_curved_rhs!(k[5], k[6], Φs, Πs, coef; geom, ops, ws, ε_KO=1f-4)
+                @. Φs = Φ + dt*k[5]; @. Πs = Π + dt*k[6]
+                sample_background2d!(coef, bg, t+dt, xg, yg)
+                wave2d_curved_rhs!(k[7], k[8], Φs, Πs, coef; geom, ops, ws, ε_KO=1f-4)
+                @. Φ += dt/6*(k[1]+2k[3]+2k[5]+k[7]); @. Π += dt/6*(k[2]+2k[4]+2k[6]+k[8])
+                t += dt
+            end
+            return Array(Φ)
+        end
+
+        Φc = run_on(KernelAbstractions.CPU(), geom_h, xg_h, yg_h)
+        backend = MetalBackend()
+        geom_d = to_device(geom_h, backend)
+        xg_d = KernelAbstractions.allocate(backend, T, N, N, geom_h.Ne)
+        yg_d = similar(xg_d); copyto!(xg_d, xg_h); copyto!(yg_d, yg_h)
+        Φg = run_on(backend, geom_d, xg_d, yg_d)
+        @test all(isfinite, Φg)
+        @test maximum(abs, Φg .- Φc) ≤ 1e-3 * max(1, maximum(abs, Φc))
     end
 end
