@@ -91,10 +91,36 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
   Verified CPU↔Metal Float32 (operator agreement on both curvilinear
   meshes; short curved-Sommerfeld evolution to 1e-3). The 3D
   curvilinear case (which needs the harder conservative-curl metric
-  form) remains out of scope.
+  form) remains out of scope. **Curvilinear test parity** with the
+  affine path: robust stability under √eps noise (Sommerfeld + KO),
+  energy non-increasing under the absorbing boundary, and a variable
+  background (gaugewave, varying lapse) with curved Dirichlet — all on
+  cubed-square.
+* **2D annulus + inner excision (BH-excision model).** `mesh_kind =
+  :annulus` (`HexMeshes.make_annulus_mesh`) is a pure 4-patch shell ring
+  `R1 ≤ |x| ≤ R2` — the 2D analog of the 3D `make_radial_shell_mesh` —
+  with distinct inner/outer boundary tags (inner `:excision`→8, outer
+  `:sommerfeld`→7). The curvilinear BC pass gives **no SAT** (pure
+  outflow) to any face whose mesh tag is the excision tag (`make_bc2d`
+  `excision_tag`); excision is declared by the mesh, not auto-classified
+  by speed. The `:radial_shift` background (flat α, γ; outward radial
+  shift ramping linearly from `V > 1` at `R1` to `< 0.1` at `R2`) makes
+  the inner circle superluminal-outflow and the outer subluminal.
+  **Sign:** this solver advects with `+βⁱ∂_iΦ` and a face's incoming-mode
+  speed is `a_n + β^n` (`β^n = n̂·β`); the inner outward normal is `−r̂`,
+  so an **outward** shift gives `β^n < −1` there ⇒ a superluminal-outflow
+  (excision) face. An *ingoing* shift is instead classified inflow
+  (→ full-Dirichlet) — opposite to the naive picture. A **linear** radial
+  ramp is essential: a `1/r²` profile's steep `β'` drives a variable-β
+  instability (uncancelled indefinite source) that KO does not tame
+  (max Re λ ≈ 9). With the linear outward profile the RHS spectrum is
+  stable (max Re λ ≤ round-off at `V = 1.2`) and a noisy annulus
+  evolution stays bounded with non-increasing, decaying energy
+  (`evolve2d`, `bin/wave2d.jl --mesh annulus`).
 * **Deferred** (same as 1D's open items, plus): subluminal Dirichlet
   data-injection in the 2D driver (Sommerfeld is the radiative
-  default).
+  default); per-face characteristic-speed auto-classification on curved
+  faces (excision is declared by the mesh tag instead).
 
 ## Scope (1D)
 
