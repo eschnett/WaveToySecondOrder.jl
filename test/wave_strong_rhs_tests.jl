@@ -1,3 +1,6 @@
+@testitem "wave_strong_rhs" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 using HexMeshes: make_uniform_hex, make_inflated_cube_mesh
 using HexSBPSAT: make_element, make_operators, make_geometry, make_workspace,
                   apply_laplacian!
@@ -147,5 +150,7 @@ using WaveToySecondOrder: wave_lap_strong_conservative_mesh!,
         # a divergent solution — bounded within ~10× the initial pulse.
         @test maximum(abs, u) < 20 * max_u0
     end
+
+end
 
 end

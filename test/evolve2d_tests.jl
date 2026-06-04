@@ -1,3 +1,6 @@
+@testitem "evolve2d" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 # End-to-end tests of the 2D driver `evolve2d` (conservative
 # first-order (Φ,Π) on uniform_quad + ADM backgrounds + field-radiation
 # BCs). Kernel physics is covered by test_wave2d.jl; this checks the
@@ -6,9 +9,6 @@
 using Test
 using WaveToySecondOrder: evolve2d
 
-@isdefined(_progress) ||
-    (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
-                       flush(stderr)))
 
 @testset "evolve2d driver" begin
     _progress("evolve2d: periodic minkowski convergence")
@@ -84,4 +84,6 @@ using WaveToySecondOrder: evolve2d
         @test_throws ArgumentError evolve2d(; N = 4, M = 4,
             background = :minkowski, bc = :nonsense, t1 = 0.1, Nt = 2)
     end
+end
+
 end

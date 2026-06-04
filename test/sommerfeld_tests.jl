@@ -1,3 +1,6 @@
+@testitem "sommerfeld" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 # Tests for the Sommerfeld radiative boundary condition.
 #
 # These tests probe the wave-equation post-pass `_sommerfeld_pass_kernel!`
@@ -22,9 +25,6 @@ using StaticArrays
 using LinearAlgebra
 using Test
 
-@isdefined(_progress) ||
-    (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
-                       flush(stderr)))
 
 # Walks every Sommerfeld face quadrature node and returns
 #   (max |B₁u|, rms |B₁u|, num_face_nodes, max |n − r̂|)
@@ -175,5 +175,7 @@ end
         # this resolution. (Empirically ≈ 50% at N=3 M=4.)
         @test mx_bgt1 < T(0.7) * mx_bgt0
     end
+
+end
 
 end

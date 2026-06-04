@@ -1,3 +1,6 @@
+@testitem "radial_shell" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 using HexMeshes: make_radial_shell_mesh, Shell
 using HexSBPSAT: make_element, make_operators, make_geometry
 using Test
@@ -73,5 +76,7 @@ using WaveToySecondOrder: wave_strong_rhs_mesh!, evolve3d
         @test Int8(8) ∉ tags                    # no excision
         @test Int8(2) ∈ tags                    # inner Dirichlet tag
     end
+
+end
 
 end

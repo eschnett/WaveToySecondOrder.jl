@@ -1,3 +1,6 @@
+@testitem "wave1d" tags=[:gpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 # Conservative-form 1D scalar wave on a 1+1 ADM background
 # (`wave1d_curved_rhs!` in src/wave1d.jl), discretised on
 # HexMeshes.Mesh{1} + HexSBPSAT.apply_D!. Evolves the densitised
@@ -31,9 +34,6 @@ using WaveToySecondOrder: AnalyticBackground1D, MetricBackground1D,
                           FACE_SUBLUMINAL, FACE_OUTFLOW, FACE_INFLOW,
                           FACE_SONIC
 
-@isdefined(_progress) ||
-    (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
-                       flush(stderr)))
 
 # Bundle mesh + operators + scratch for one (N, M) configuration.
 function _make_setup1d(::Type{T}, N, M; x0 = zero(T), x1 = one(T),
@@ -720,4 +720,6 @@ if HAS_METAL
         @test maximum(abs, Πg .- Πc) ≤ 1e-3 * max(1, maximum(abs, Πc))
         @test abs(Eg - Ec) ≤ 1e-3 * abs(Ec)
     end
+end
+
 end

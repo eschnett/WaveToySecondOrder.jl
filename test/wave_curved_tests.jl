@@ -1,3 +1,6 @@
+@testitem "wave_curved" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 using HexMeshes: make_uniform_hex
 using HexSBPSAT: make_element, make_operators
 using LinearAlgebra: Diagonal, Symmetric, dot, eigvals
@@ -374,4 +377,6 @@ end
         @test rel > 1e-6
         @test rel < 10.0
     end
+end
+
 end

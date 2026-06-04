@@ -1,3 +1,6 @@
+@testitem "wave_lap_strong" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 using LinearAlgebra: eigvals
 using StaticArrays
 using Test
@@ -145,4 +148,6 @@ using WaveToySecondOrder: make_element, make_operators,
         @test all(isfinite, u̇)
         @test bound_seen < 5 * initial_max
     end
+end
+
 end

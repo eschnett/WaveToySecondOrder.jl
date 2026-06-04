@@ -1,3 +1,6 @@
+@testitem "evolve1d" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 # End-to-end tests of the DiffEq-based 1D driver `evolve1d` (mesh +
 # geometry + Background1D + ODEProblem/ArrayPartition + explicit RK).
 # The kernel-level physics is covered by `test_wave1d.jl`; this file
@@ -7,9 +10,6 @@
 using Test
 using WaveToySecondOrder: evolve1d
 
-@isdefined(_progress) ||
-    (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
-                       flush(stderr)))
 
 @testset "evolve1d driver" begin
     _progress("evolve1d: sine-shift exact IC, one period")
@@ -113,4 +113,6 @@ using WaveToySecondOrder: evolve1d
         @test_throws ArgumentError evolve1d(; N = 4, M = 8,
             background = :minkowski, bc = :nonsense, t1 = 0.1, Nt = 2)
     end
+end
+
 end

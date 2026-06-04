@@ -1,3 +1,6 @@
+@testitem "wave2d" tags=[:gpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 # Conservative-form 2D scalar wave on a 2+1 ADM background
 # (`wave2d_curved_rhs!` in src/wave2d_curved.jl), on axis-aligned
 # affine meshes (make_uniform_quad). Mirrors test_wave1d.jl.
@@ -20,9 +23,6 @@ using WaveToySecondOrder: AnalyticBackground2D, MetricBackground2D,
                           make_wave2d_workspace, wave2d_curved_rhs!,
                           wave2d_energy, make_bc2d
 
-@isdefined(_progress) ||
-    (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
-                       flush(stderr)))
 
 function _setup2d(::Type{T}, N, M; periodic = true) where {T}
     mesh = make_uniform_quad(T, M, M, zero(T), one(T); periodic)
@@ -327,4 +327,6 @@ if HAS_METAL
         @test all(isfinite, Φg)
         @test maximum(abs, Φg .- Φc) ≤ 1e-3 * max(1, maximum(abs, Φc))
     end
+end
+
 end

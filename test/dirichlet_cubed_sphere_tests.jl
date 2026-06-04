@@ -1,3 +1,6 @@
+@testitem "dirichlet_cubed_sphere" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 using HexMeshes: make_inflated_cube_mesh, Cubic, Inflation, Shell
 using HexSBPSAT: make_element, make_operators, make_geometry
 using LinearAlgebra: Diagonal, dot, eigvals
@@ -184,5 +187,7 @@ end
         @test all(isfinite, u̇)
         @test bound_seen < 5 * max_u0
     end
+
+end
 
 end

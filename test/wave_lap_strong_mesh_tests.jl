@@ -1,3 +1,6 @@
+@testitem "wave_lap_strong_mesh" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 using HexMeshes: make_uniform_hex
 using HexSBPSAT: make_element, make_operators
 using LinearAlgebra: Diagonal, Symmetric, eigvals, dot
@@ -184,4 +187,6 @@ end
         @test env_a < 0.5            # bounded oscillation at the larger dt
         @test env_b < env_a / 3      # ≈ 4× shrink when dt halves ⇒ O(dt²)
     end
+end
+
 end

@@ -1,3 +1,6 @@
+@testitem "wave_lap_strong_conservative" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 using LinearAlgebra: Diagonal, Symmetric, eigvals, dot
 using StaticArrays
 using Test
@@ -229,4 +232,6 @@ end
         @test abs(drift_a) ≤ env_a
         @test abs(drift_b) ≤ env_b
     end
+end
+
 end

@@ -90,6 +90,8 @@ Tests should include:
 Tests should finish in a relatively short time. (A rule of thumb is
 less than 30 seconds each.)
 
+Run the tests in parallel if possible.
+
 ## Examples and visualizations
 
 Provide apps that evolve the scalar wave equation in 1d, 2d, and 3d
@@ -101,6 +103,8 @@ Also allow choosing the floating-point type and accelerator backend.
 These apps serve both as confirmation that long-term evolutions are
 working (although you are not expected to run these apps yourself) and
 serve as examples to users of this package.
+
+The apps should run in parallel if possible.
 
 Include visualizations via CairoMakie and FileIO (png) / SixelTerm
 (terminal) output. For each case, show figures showing the grid

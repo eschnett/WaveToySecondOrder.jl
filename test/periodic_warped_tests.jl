@@ -1,3 +1,6 @@
+@testitem "periodic_warped" tags=[:cpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 using HexMeshes: make_uniform_hex, make_warped_uniform_hex
 using HexSBPSAT: make_element, make_operators, make_geometry
 using LinearAlgebra: dot, eigvals
@@ -161,4 +164,6 @@ using WaveToySecondOrder: wave_strong_rhs_mesh!,
         @test all(isfinite, u̇)
         @test maximum(abs, u) < 5 * max_u0
     end
+end
+
 end

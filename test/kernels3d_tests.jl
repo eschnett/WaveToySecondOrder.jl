@@ -1,3 +1,6 @@
+@testitem "kernels3d" tags=[:gpu] begin
+    _progress(m) = (printstyled(stderr, "  • ", m, "\n"; color = :cyan); flush(stderr))
+
 # Tests for `src/kernels3d.jl`: curvilinear-aware `rhs_wave3d!`. The full
 # wave-evolution check against the analytic separable eigenmode is the
 # end-to-end correctness gate. Each wave-evolution / stability test runs
@@ -44,9 +47,6 @@ function discrete_energy(u::AbstractArray{T,4}, u̇::AbstractArray{T,4},
 end
 
 # `_progress` is defined in `runtests.jl`; fallback for stand-alone runs.
-@isdefined(_progress) ||
-    (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
-                       flush(stderr)))
 
 @testset "kernels3d (T=$T)" for T in (Float64, Float32)
 
@@ -479,4 +479,6 @@ if HAS_METAL
         @test all(isfinite, u_dev_end)
         @test u_host_end == u_dev_end   # bit-identical
     end
+end
+
 end
