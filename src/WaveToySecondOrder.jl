@@ -97,9 +97,12 @@ include("wave_strong_rhs.jl")
 include("boundaries1d.jl")
 include("wave1d.jl")
 
-# `wave2d_curved.jl`: conservative-form 2D scalar wave on a 2+1 ADM
-# background (uniform_quad / axis-aligned affine), mirroring wave1d.jl
-# on the per-axis `apply_D!(·, d)` gradient/divergence pair.
+# `boundaries2d.jl` / `wave2d_curved.jl`: conservative-form 2D scalar
+# wave on a 2+1 ADM background (uniform_quad / axis-aligned affine),
+# mirroring wave1d.jl on the per-axis `apply_D!(·, d)` pair, plus the
+# characteristic-free field-radiation / excision / full-Dirichlet
+# boundary pass.
+include("boundaries2d.jl")
 include("wave2d_curved.jl")
 
 # `evolve.jl`: high-level drivers `evolve1d`, `evolve2d`, `evolve3d`.
@@ -152,6 +155,7 @@ export
     sample_background2d!, make_coef2d,
     Wave2DWorkspace, make_wave2d_workspace,
     wave2d_curved_rhs!, wave2d_energy,
+    classify_face2d, make_bc2d,
     # Wave-equation layer — 2D
     Params2d, initialize2d!,
     eigenmode_cartesian_2d!, eigenmode_radial_2d!,

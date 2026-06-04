@@ -470,241 +470,234 @@ end
 # evolve2d
 
 """
-    evolve2d(; T = Float64, backend = CPU(), mesh_kind = :cubical,
-                ic_kind = :cartesian, N = 5, M = 8,
-                R = 0.1, L = 0.1, R1 = 0.3, R2 = 1.0,
-                ic_wavenumber = 3π, ic_radial_mode = 1, ic_radius = nothing,
-                outer_bc = :dirichlet,
-                t0 = 0, t1 = 1, Nt = 200, cfl_safety = 1//2,
-                slice_y = nothing) → NamedTuple
+    evolve2d(; T = Float64, backend = CPU(), N = 4, M = 16,
+               x0 = 0, x1 = 1, background = :minkowski,
+               A = 0.1, d = 1, shift = (0.0, 0.0),
+               ic = :exact, bc = :periodic, ε_KO = 0,
+               t0 = 0, t1 = 1, Nt = 200, cfl = 1//10) → NamedTuple
 
-2D wave-equation driver. `mesh_kind ∈ {:cubical, :cubed_square,
-:inflated_square}`; `ic_kind ∈ {:cartesian, :radial, :outgoing}`;
-`outer_bc ∈ {:dirichlet, :sommerfeld}` (only valid on
-`:inflated_square`). Returns the sampled spacetime slice, the L² error
-trace, and the final-time snapshot for downstream plotting.
+2D scalar wave on a 2+1 ADM background (`wave2d_curved_rhs!`) on the
+uniform_quad domain `[x0,x1]²`, first-order (Φ,Π) system integrated
+with explicit RK (`pick_integrator_first_order`). Mirrors `evolve1d`.
 
-`:outgoing` uses the Hankel-transform Gaussian-pulse solution from
-[`outgoing_pulse_2d!`](@ref) — the closest analytic analog to a
-smooth, localized, outgoing radial wave that exists in 2D. The
-Gaussian width is controlled by `ic_pulse_width` (default
-`L_/12` where `L_` is the bounding-box side); the quadrature order
-of the Hankel integral is `ic_pulse_n_quad` (default `128`, accurate
-to ~14 digits for `t · σ ≲ 10`). The pulse spreads outward but
-leaves a wake — the 2D wave equation isn't Huygens. Pair with
-`outer_bc = :sommerfeld` to absorb the leading edge at the outer
-circle.
+* `background ∈ {:minkowski, :constant_shift, :gaugewave}` — built-in
+  backgrounds with exact solutions (`:constant_shift` uses the
+  2-vector `shift`; `:gaugewave` uses amplitude `A`, period `d`,
+  propagating in x).
+* `ic ∈ {:exact, :noise}`.
+* `bc` — `:periodic`, `:auto` (per-side classification: subluminal →
+  absorbing Sommerfeld, superluminal outflow → excision, superluminal
+  inflow → full-state Dirichlet with exact data), or a 4-tuple of
+  symbols for the (−x,+x,−y,+y) sides. The radiative (Sommerfeld) BC
+  is the characteristic-free field-radiation SAT, valid for small
+  shift; see `boundaries2d.jl`.
 
-With `outer_bc = :sommerfeld` the outer-circle faces are tagged `7`
-and `rhs_wave2d!`'s post-pass adds the BGT-0 (plane-wave) dissipative
-drag. See the docstring on `rhs_wave2d!` for the 2D-specific physics
-caveat (no exact BGT-1 in 2D).
-
-Returned NamedTuple keys mirror `evolve3d` minus the `z_target` /
-`sommerfeld_R` triple (2D has `sommerfeld_R` too).
+Returns `(; ts, ts_actual, xs_line, perm, Φs, Πs, l2_err, energy,
+Φ_final, Π_final, mesh, geom, elem, ops, background, ic, bc, x0, x1,
+dt, dx, slice_y, integrator_name)` for the `bin/wave2d.jl` plot app.
 """
 function evolve2d(; T::Type = Float64,
                     backend = CPU(),
-                    mesh_kind::Symbol = :cubical,
-                    ic_kind::Symbol = :cartesian,
-                    N::Int = 5,
-                    M::Int = 8,
-                    R::Real  = 0.1,
-                    L::Real  = 0.1,
-                    R1::Real = 0.3,
-                    R2::Real = 1.0,
-                    ic_wavenumber::Real = 3π,
-                    ic_radial_mode::Int  = 1,
-                    ic_radius::Union{Nothing, Real} = nothing,
-                    ic_pulse_width::Union{Nothing, Real} = nothing,
-                    ic_pulse_n_quad::Int = 128,
-                    outer_bc::Symbol = :dirichlet,
+                    N::Int = 4,
+                    M::Int = 16,
+                    x0::Real = 0,
+                    x1::Real = 1,
+                    background::Symbol = :minkowski,
+                    A::Real = 0.1,
+                    d::Real = 1,
+                    shift = (0.0, 0.0),
+                    ic::Symbol = :exact,
+                    bc = :periodic,
+                    noise_amp::Real = sqrt(eps(Float64)),
+                    ε_KO::Real = 0,
                     t0::Real = 0,
                     t1::Real = 1,
                     Nt::Int = 200,
-                    cfl_safety::Real = 1//2,
+                    cfl::Real = 1//10,
                     slice_y::Union{Nothing, Real} = nothing)
 
     on_cpu = backend isa CPU
     on_cpu || T <: AbstractFloat ||
-        error("non-CPU backend requires a floating-point T; got $T")
-    if outer_bc !== :dirichlet && mesh_kind !== :inflated_square
-        error("evolve2d: outer_bc = :$outer_bc only supported on mesh_kind = :inflated_square")
-    end
+        error("evolve2d: non-CPU backend requires a floating-point T; got $T")
+    periodic = bc === :periodic
+    (periodic || on_cpu) ||
+        error("evolve2d: non-periodic boundary pass is CPU-only for now")
 
-    elem = make_element(T, N)
-    ops  = make_operators(elem)
-
-    if mesh_kind === :cubical
-        x0, x1 = zero(T), one(T)
-        mesh = make_uniform_quad(T, M, x0, x1)
-    elseif mesh_kind === :cubed_square
-        x0, x1 = -one(T), one(T)
-        mesh = make_cubed_square_mesh(T, M, T(R))
-    elseif mesh_kind === :inflated_square
-        x0, x1 = -T(R2), T(R2)
-        mesh = make_inflated_square_mesh(T, T(L), T(R1), T(R2), M; outer_bc)
-    else
-        error("evolve2d: unknown mesh_kind: $mesh_kind (use :cubical, :cubed_square, :inflated_square)")
-    end
-
+    mesh = make_uniform_quad(T, M, M, T(x0), T(x1); periodic)
+    elem = make_element(T, N); ops = make_operators(elem)
     geom_host = make_geometry(mesh, elem)
-    geom      = on_cpu ? geom_host : to_device(geom_host, backend)
-    work      = make_workspace(geom)
-    coords    = geom_host.coords
+    geom = on_cpu ? geom_host : to_device(geom_host, backend)
+    ws   = make_wave2d_workspace(geom, ops)
+    coef = make_coef2d(geom)
 
-    dx = _min_node_spacing_2d(coords)
-    L_ = x1 - x0
+    xg = reshape(copy(geom_host.coords[1, :, :, :]), N, N, mesh.Ne)
+    yg = reshape(copy(geom_host.coords[2, :, :, :]), N, N, mesh.Ne)
+    xg_d = on_cpu ? xg : copyto!(similar(coef.alpha), xg)
+    yg_d = on_cpu ? yg : copyto!(similar(coef.alpha), yg)
 
-    # Build IC parameters.
-    ic_center = ((x0 + x1) / 2, (x0 + x1) / 2)
-    if ic_kind === :cartesian
-        ic_k = T(ic_wavenumber)
-        ic_ω = T(sqrt(2 * ic_wavenumber^2)) / L_
-        ic_R = zero(T)
-        ic_σ = zero(T)
-    elseif ic_kind === :radial
-        ic_R = ic_radius === nothing ? L_ / 2 : T(ic_radius)
-        ic_ω = T(WaveToySecondOrder._J0_ZEROS[ic_radial_mode]) / ic_R
-        ic_k = ic_ω
-        ic_σ = zero(T)
-    elseif ic_kind === :outgoing
-        # Default Gaussian width: bounding-box side / 12. On the
-        # `:inflated_square` mesh (L_ = 2 R2) this gives σ = R2/6,
-        # which puts the FWHM (≈ 2.35 σ) at ≈ 0.4 R2 — well-localized
-        # near the origin yet not so sharp that 128-node Gauss-
-        # Legendre under-resolves the integrand.
-        ic_σ = ic_pulse_width === nothing ? L_ / 12 : T(ic_pulse_width)
-        ic_k = zero(T); ic_ω = zero(T); ic_R = zero(T)
+    bg, Φe, Πe, max_speed = _background2d(background, T; A, d, shift)
+
+    h_elem = T(geom_host.jac[1, 1, 1, 1, 1])
+    ξs = elem.xs
+    dx_min = minimum(ξs[i+1] - ξs[i] for i in 1:N-1) * h_elem
+    dt = T(cfl) * dx_min / max_speed
+    if ε_KO != 0
+        dt = min(dt, T(1.4) / (T(ε_KO) * ws.μ))
+    end
+
+    # Boundary setup: classify the four sides at t0, resolve :auto,
+    # validate. Side normal axis/sign: 1→(−x), 2→(+x), 3→(−y), 4→(+y).
+    local kinds::NTuple{4,Int}
+    if !periodic
+        sample_background2d!(coef, bg, T(t0), xg, yg)
+        side_axis = (1, 1, 2, 2); side_sign = (-1, 1, -1, 1)
+        classes = ntuple(4) do f
+            # representative boundary node on side f
+            classify_face2d(coef.alpha[1], coef.b1[1], coef.b2[1],
+                            coef.gu11[1], coef.gu22[1],
+                            side_axis[f], side_sign[f])
+        end
+        autopick(c) = c == FACE_SUBLUMINAL ? BC_SOMMERFELD :
+                      c == FACE_OUTFLOW    ? BC_EXCISION : BC_FULL_DIRICHLET
+        if bc === :auto
+            kinds = ntuple(f -> autopick(classes[f]), 4)
+        elseif bc isa Tuple || bc isa NamedTuple
+            syms = bc isa NamedTuple ? (bc.mx, bc.px, bc.my, bc.py) : bc
+            kinds = ntuple(f -> bc1d_kind(syms[f]), 4)
+        else
+            throw(ArgumentError("evolve2d: bc must be :periodic, :auto, " *
+                "or a 4-tuple of side symbols; got $bc"))
+        end
+        for f in 1:4
+            validate_bc1d(classes[f], kinds[f],
+                          ("−x","+x","−y","+y")[f] * " side")
+        end
+    end
+
+    # IC.
+    Φ0 = Array{T,3}(undef, N, N, mesh.Ne); Π0 = similar(Φ0)
+    if ic === :exact
+        @. Φ0 = Φe(T(t0), xg, yg); @. Π0 = Πe(T(t0), xg, yg)
+    elseif ic === :noise
+        Φ0 .= T(noise_amp) .* randn(T, N, N, mesh.Ne)
+        Π0 .= T(noise_amp) .* randn(T, N, N, mesh.Ne)
     else
-        error("evolve2d: unknown ic_kind: $ic_kind (use :cartesian, :radial, or :outgoing)")
+        error("evolve2d: unknown ic $ic")
+    end
+    Φdev = on_cpu ? Φ0 : copyto!(similar(coef.alpha), Φ0)
+    Πdev = on_cpu ? Π0 : copyto!(similar(coef.alpha), Π0)
+
+    withdata = ic === :exact
+    gΦ = (!periodic && any(==(BC_FULL_DIRICHLET), kinds)) ?
+         zeros(T, N, N, mesh.Ne) : nothing
+    gΠ = gΦ === nothing ? nothing : zeros(T, N, N, mesh.Ne)
+
+    p = (; geom, ops, ws, coef, bg, xg = xg_d, yg = yg_d)
+    function rhs!(du, u, p, t)
+        Φ, Π = u.x[1], u.x[2]; Φ̇, Π̇ = du.x[1], du.x[2]
+        sample_background2d!(p.coef, p.bg, t, p.xg, p.yg)
+        bc2d = nothing
+        if !periodic
+            if gΦ !== nothing && withdata
+                @. gΦ = Φe(t, xg, yg); @. gΠ = Πe(t, xg, yg)
+            end
+            bc2d = make_bc2d(kinds; gΦ, gΠ)
+        end
+        wave2d_curved_rhs!(Φ̇, Π̇, Φ, Π, p.coef; p.geom, p.ops, p.ws,
+                           ε_KO = T(ε_KO), bc2d)
+        return nothing
     end
 
-    # Cache the Hankel-transform Bessel table once if we'll be sampling
-    # the analytic `:outgoing` reference at every step. `nothing` for
-    # other IC families avoids the ~MB allocation when it isn't needed.
-    pulse_cache = ic_kind === :outgoing ?
-        outgoing_pulse_2d_cache(coords; σ = ic_σ, center = ic_center,
-                                 n_quad = ic_pulse_n_quad) :
-        nothing
+    alg  = pick_integrator_first_order(N)
+    prob = ODEProblem(rhs!, ArrayPartition(Φdev, Πdev), (T(t0), T(t1)), p)
+    integrator = init(prob, alg; dt, adaptive = false,
+                      save_everystep = false, save_start = false,
+                      save_end = false, dense = false)
 
-    # `sommerfeld_R = R2` on the inflated-square outer circle would
-    # plug into the BGT-1 `+u/R` term, but 2D BGT-1 isn't exact (see
-    # `rhs_wave2d!` docstring). Use `Inf` here so the post-pass runs as
-    # plane-wave BGT-0, which is the safe default on a curved boundary
-    # in 2D. The mesh still gets tagged `7` via `outer_bc`, which is
-    # what triggers the dissipative kernel.
-    sommerfeld_R = T(Inf)
+    # Slice along y for the spacetime plot.
+    y_target = T(slice_y === nothing ? (x0 + x1) / 2 : slice_y)
+    slice_idx, xs_line = _build_slice_2d(geom_host.coords, y_target;
+                                         atol = sqrt(eps(T)))
+    isempty(xs_line) && error("evolve2d: slice y=$y_target hit no nodes")
+    perm = sortperm(xs_line); xs_line = xs_line[perm]
+    sidx = slice_idx[perm]
 
-    τ_mult = mesh_kind === :cubical ? T(3//2) : T(8)
-    params = Params2d(; A = one(T),
-                        k = (ic_k, ic_k),
-                        ω = ic_ω,
-                        τ = τ_mult * (N - 1)^2,
-                        bdry_values = ntuple(_ -> zero(T), Val(4)),
-                        sommerfeld_R = sommerfeld_R)
+    ts = range(T(t0), T(t1), Nt)
+    Ns = length(xs_line)
+    Φs = Array{T}(undef, Ns, Nt); Πs = similar(Φs)
+    ts_actual = Vector{T}(undef, Nt)
+    l2_err = Vector{T}(undef, Nt); energy = Vector{T}(undef, Nt)
+    Φh = Array{T,3}(undef, N, N, mesh.Ne); Πh = similar(Φh)
+    Φref = similar(Φh)
+    Hphys_h = geom_host.Hphys
+    ws_h = on_cpu ? ws : make_wave2d_workspace(geom_host, ops)
+    coef_h = on_cpu ? coef : make_coef2d(geom_host)
 
-    # IC into host buffer, then `copyto!` to device.
-    u_host = Array{T, 3}(undef, N, N, mesh.Ne)
-    u̇_host = similar(u_host)
-    if ic_kind === :cartesian
-        eigenmode_cartesian_2d!(u_host, u̇_host, coords, zero(T);
-                                 A = params.A,
-                                 kx = params.k[1], ky = params.k[2],
-                                 ω = params.ω, x0 = x0, x1 = x1)
-    elseif ic_kind === :radial
-        eigenmode_radial_2d!(u_host, u̇_host, coords, zero(T);
-                              A = params.A, R = ic_R, n = ic_radial_mode,
-                              center = ic_center)
-    else  # :outgoing
-        outgoing_pulse_2d!(u_host, u̇_host, pulse_cache, zero(T);
-                            A = params.A)
-    end
-    if on_cpu
-        u, u̇ = u_host, u̇_host
-    else
-        u  = KernelAbstractions.allocate(backend, T, size(u_host)...)
-        u̇  = KernelAbstractions.allocate(backend, T, size(u̇_host)...)
-        copyto!(u,  u_host)
-        copyto!(u̇, u̇_host)
-    end
-
-    dt  = recommended_dt(geom, ops, params.τ; cfl_safety = T(cfl_safety))
-    alg = pick_integrator(N)
-
-    f!(ü, u̇, u, p::Params2d, t) = rhs_wave2d!(ü, u, u̇, p; geom, ops, work)
-    prob = SecondOrderODEProblem(f!, u̇, u, (T(t0), T(t1)), params)
-    integrator = init(prob, alg; dt,
-                      save_everystep = false,
-                      save_start     = false,
-                      save_end       = false,
-                      dense          = false)
-
-    y_target = T(slice_y === nothing ?
-                 (mesh_kind === :cubical ? 1//4 : 0) :
-                 slice_y)
-    slice_idx, xs_line = _build_slice_2d(coords, y_target; atol = sqrt(eps(T)))
-    isempty(xs_line) && error("evolve2d: slice at y=$y_target hit no GLL nodes")
-
-    ts       = range(T(t0), T(t1), Nt)
-    Ns       = length(xs_line)
-    us       = Array{T}(undef, Ns, Nt)
-    u̇s       = Array{T}(undef, Ns, Nt)
-    l2_err   = Vector{T}(undef, Nt)
-    u_exact  = similar(u)
-    u̇_exact  = similar(u)
-    err_buf  = similar(u)
-    u_arr_host = Array{T, 3}(undef, N, N, mesh.Ne)
-    u̇_arr_host = Array{T, 3}(undef, N, N, mesh.Ne)
-
-    prog = Progress(Nt;
-                    desc = "evolve2d (mesh=$(mesh_kind), ic=$(ic_kind), τ=$(params.τ)): ",
+    prog = Progress(Nt; desc = "evolve2d (M=$M, bg=$background, " *
+                    "backend=$(typeof(backend).name.name)): ",
                     barlen = 30, showspeed = true)
     for (n, t) in enumerate(ts)
-        while integrator.t < t
-            step!(integrator)
-        end
+        while integrator.t < t; step!(integrator); end
         next!(prog)
-
-        u̇_arr = integrator.u.x[1]
-        u_arr  = integrator.u.x[2]
-
-        copyto!(u_arr_host,  u_arr)
-        copyto!(u̇_arr_host, u̇_arr)
-        @assert all(isfinite, u_arr_host) && all(isfinite, u̇_arr_host)
-
-        for (p, (e, ii, jj)) in enumerate(slice_idx)
-            us[p, n] = u_arr_host[ii, jj, e]
-            u̇s[p, n] = u̇_arr_host[ii, jj, e]
+        ta = T(integrator.t); ts_actual[n] = ta
+        copyto!(Φh, integrator.u.x[1]); copyto!(Πh, integrator.u.x[2])
+        @assert all(isfinite, Φh) && all(isfinite, Πh)
+        for (q, (e, ii, jj)) in enumerate(sidx)
+            Φs[q, n] = Φh[ii, jj, e]; Πs[q, n] = Πh[ii, jj, e]
         end
-
-        if ic_kind === :cartesian
-            eigenmode_cartesian_2d!(u_exact, u̇_exact, geom.coords, t;
-                                     A = params.A,
-                                     kx = params.k[1], ky = params.k[2],
-                                     ω = params.ω, x0 = x0, x1 = x1)
-        elseif ic_kind === :radial
-            eigenmode_radial_2d!(u_exact, u̇_exact, geom.coords, t;
-                                  A = params.A, R = ic_R, n = ic_radial_mode,
-                                  center = ic_center)
-        else  # :outgoing
-            outgoing_pulse_2d!(u_exact, u̇_exact, pulse_cache, t;
-                                A = params.A)
+        if ic === :exact
+            @. Φref = Φe(ta, xg, yg)
+        else
+            fill!(Φref, zero(T))
         end
-        err_buf .= u_arr .- u_exact
-        l2_err[n] = discrete_l2_norm(err_buf, geom, ops)
+        l2_err[n] = sqrt(sum(@. (Φh - Φref)^2 * Hphys_h))
+        sample_background2d!(coef_h, bg, ta, xg, yg)
+        energy[n] = wave2d_energy(Φh, Πh, coef_h; geom = geom_host, ops, ws = ws_h)
     end
     finish!(prog)
 
-    u_final = on_cpu ? copy(integrator.u.x[2]) : Array(integrator.u.x[2])
-
-    return (; ts, xs_line, us, u̇s, l2_err,
-              u_final,
-              mesh, geom = geom_host, elem, ops, params,
-              x0, x1, dt, dx, y_target,
-              sommerfeld_R, ic_kind, mesh_kind, outer_bc,
+    return (; ts, ts_actual, xs_line, perm, Φs, Πs, l2_err, energy,
+              Φ_final = copy(Φh), Π_final = copy(Πh),
+              mesh, geom = geom_host, elem, ops, background, ic, bc,
+              x0 = T(x0), x1 = T(x1), dt, dx = dx_min, y_target,
               integrator_name = nameof(typeof(alg)))
 end
+
+# Built-in 2D backgrounds with exact scalar-wave solutions.
+# Returns (bg::Background2D, Φe(t,x,y), Πe(t,x,y), max_speed).
+function _background2d(kind::Symbol, ::Type{T}; A, d, shift) where {T}
+    if kind === :minkowski || kind === :constant_shift
+        bx, by = kind === :minkowski ? (zero(T), zero(T)) :
+                 (T(shift[1]), T(shift[2]))
+        bg = AnalyticBackground2D(_Const3(one(T)), _ConstVec2(bx, by),
+                                  _ConstMet2(one(T), zero(T), one(T)))
+        # Diagonal plane wave Φ = sin(2π(x+y) − ωt); dispersion (α=γ=1)
+        # ω = β·k + |k| with k = 2π(1,1): ω = 2π(bx+by) + 2π√2.
+        k = 2 * T(π); ω = k * (bx + by) + k * sqrt(T(2))
+        Φe = (t,x,y) -> sin(k*(x+y) - ω*t)
+        # Π = ∂_tΦ − βⁱ∂_iΦ = (−ω − k(bx+by))cos.
+        Πe = (t,x,y) -> (-ω - k*(bx+by)) * cos(k*(x+y) - ω*t)
+        return bg, Φe, Πe, abs(bx) + abs(by) + sqrt(T(2))
+    elseif kind === :gaugewave
+        Aᵥ, dᵥ = T(A), T(d); kᵥ = 2*T(π)/dᵥ; k₀ = 2*T(π); C = Aᵥ*dᵥ/(4*T(π))
+        bg = MetricBackground2D(SpacetimeMetrics.GaugeWave(Aᵥ, dᵥ))
+        ψ = (t,x) -> x - t + 2C*cos(kᵥ*(x-t))
+        Φe = (t,x,y) -> sin(k₀*ψ(t,x))
+        Πe = (t,x,y) -> -k₀*(1 - Aᵥ*sin(kᵥ*(x-t)))*cos(k₀*ψ(t,x))
+        return bg, Φe, Πe, one(T)
+    else
+        error("evolve2d: unknown background $kind " *
+              "(:minkowski, :constant_shift, :gaugewave)")
+    end
+end
+
+# isbits callable closures so the backgrounds pass into GPU kernels.
+struct _Const3{T}; v::T; end
+(f::_Const3)(t, x, y) = f.v
+struct _ConstVec2{T}; b1::T; b2::T; end
+(f::_ConstVec2)(t, x, y) = (f.b1, f.b2)
+struct _ConstMet2{T}; g11::T; g12::T; g22::T; end
+(f::_ConstMet2)(t, x, y) = (f.g11, f.g12, f.g22)
 
 ################################################################################
 # evolve3d

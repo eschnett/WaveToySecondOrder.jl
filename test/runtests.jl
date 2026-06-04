@@ -45,10 +45,10 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
     _section("test_dirichlet_cubed_cube.jl"); include("test_dirichlet_cubed_cube.jl")
     _section("test_dirichlet_cubed_sphere.jl"); include("test_dirichlet_cubed_sphere.jl")
     _section("test_radial_shell.jl"); include("test_radial_shell.jl")
-    # `test_evolve1d.jl` exercises the DiffEq-based `evolve1d` driver
-    # end-to-end (the 1D kernel itself is covered by `test_wave1d.jl`
-    # at the top).
+    # `test_evolve{1,2}d.jl` exercise the DiffEq-based drivers
+    # end-to-end (the kernels are covered by `test_wave{1,2}d.jl`).
     _section("test_evolve1d.jl");    include("test_evolve1d.jl")
+    _section("test_evolve2d.jl");    include("test_evolve2d.jl")
     # The mesh-topology tests live in `HexMeshes/test/test_mesh.jl`.
     # The operator-level tests (SBP identities, MeshGeometry shape,
     # apply_laplacian! symmetry / spectrum, to_device round-trip)

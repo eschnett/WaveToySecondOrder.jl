@@ -1,8 +1,50 @@
 # Numerical methods
 
 This file records the numerical choices made in WaveToySecondOrder.
-It currently covers the 1D implementation; 2D/3D will be migrated to
-the same scheme and documented here as they are rebuilt.
+It documents the 1D implementation in full; the 2D implementation
+mirrors it on axis-aligned affine meshes (`make_uniform_quad`) — see
+the "2D" note at the end. 3D is not yet migrated; the old
+second-order-in-time 3D path remains.
+
+## 2D (summary)
+
+The 2D scalar wave on a 2+1 ADM background reuses the entire 1D design
+on the per-axis first-derivative operator `HexSBPSAT.apply_D!(·, d)`
+(reference SBP-G along reference axis `d` + centred-flux SAT; on
+axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
+
+* Conservative system: `Π = (√γ/α)(∂_tΦ − βⁱ∂_iΦ)`,
+  `∂_tΦ = βⁱ∂_iΦ + (α/√γ)Π`, `∂_tΠ = ∂_i(βⁱΠ + α√γ γ^{ij}∂_jΦ)`. The
+  gradient `∂_jΦ` and the flux divergence `∂_iFⁱ` both go through
+  `apply_D!(·, d)`; coefficient fields per node are `α, √γ, βⁱ,
+  γ^{ij}` (`src/wave2d_curved.jl`, `wave2d_curved_rhs!`). KO `ε·μ⁻⁵·D⁶`
+  applied per axis.
+* Backgrounds: `Background2D` / `AnalyticBackground2D` /
+  `MetricBackground2D` (SpacetimeMetrics `adm_decompose`, (x,y)
+  sub-block of the 3-metric); `sample_background2d!` is one KA kernel.
+* Boundaries (`src/boundaries2d.jl`): each axis-aligned face is
+  classified from its *normal* speeds `c± = −β^n ± a_n`
+  (`β^n = n̂·β^{dₙ}`, `a_n = α√γ^{dₙdₙ}`) — the 1D analysis in the
+  normal direction. Same admissibility rules and the same
+  characteristic-free field-radiation SAT (residual
+  `r = Π + ((β^n+a_n)/a)·n̂·∂_nΦ`, penalty on Π̇, σ=1); excision and
+  full-state Dirichlet as in 1D. Confirmed energy-stable by the
+  dense-operator spectrum tests (flat / small shift / anisotropic γ).
+  CPU boundary pass (periodic 2D runs on GPU; non-periodic CPU-only
+  for now).
+* Driver `evolve2d` and app `bin/wave2d.jl` mirror the 1D versions
+  (first-order ODEProblem, `pick_integrator_first_order`, energy/L²
+  monitoring, `bc ∈ {:periodic, :auto, 4-tuple}`). Backgrounds:
+  `:minkowski`, `:constant_shift`, `:gaugewave`.
+* Type/backend matrix as in 1D: Float64/Float32 CPU+CUDA, Float32
+  Metal, Float64x2 CPU; the kernel and `apply_D!` have GPU paths
+  (verified CPU↔Metal Float32).
+* **Deferred** (same as 1D's open items, plus): curvilinear 2D meshes
+  (cubed-square / inflated — node-varying full invjac needs discrete
+  metric identities / free-stream preservation, the known-hard SBP
+  problem); subluminal Dirichlet data-injection in the 2D driver
+  (Sommerfeld is the radiative default); GPU non-periodic boundary
+  pass.
 
 ## Scope (1D)
 
