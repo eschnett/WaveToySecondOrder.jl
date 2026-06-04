@@ -134,3 +134,18 @@ and automatically skip these tests if the hardware is not available.
 Make the kernels type-agnostic. They should work at least with
 Float64, Float32, and the types Float64x2 or Float32x2 from
 MultiFloats.
+
+Write each operator as a single KernelAbstractions kernel that runs on
+both CPU and GPU — do not keep a separate hand-written CPU loop. The
+CPU backend exists to test the GPU kernels; highest CPU efficiency is
+not a goal. For operators that couple neighbouring elements (SBP-SAT
+face terms), use a two-pass structure: a first kernel gathers each
+element's face-node data into a temporary per-face buffer (the mesh
+workspace "face trace"); a second per-element kernel computes the
+volume term and applies the SAT by reading the neighbour's gathered
+face data. This keeps each element's work local (shared-memory
+staging, coalesced access) and confines the irregular inter-element
+communication to the explicit gather pass — the same structure a
+future distributed / multi-GPU halo exchange maps onto. Each output
+node is written by exactly one workitem (gather, not scatter), so
+there are no write races.
