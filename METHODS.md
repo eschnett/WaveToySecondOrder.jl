@@ -105,18 +105,19 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
   `excision_tag`); excision is declared by the mesh, not auto-classified
   by speed. The `:radial_shift` background (flat α, γ; outward radial
   shift ramping linearly from `V > 1` at `R1` to `< 0.1` at `R2`) makes
-  the inner circle superluminal-outflow and the outer subluminal.
-  **Sign:** this solver advects with `+βⁱ∂_iΦ` and a face's incoming-mode
-  speed is `a_n + β^n` (`β^n = n̂·β`); the inner outward normal is `−r̂`,
-  so an **outward** shift gives `β^n < −1` there ⇒ a superluminal-outflow
-  (excision) face. An *ingoing* shift is instead classified inflow
-  (→ full-Dirichlet) — opposite to the naive picture. A **linear** radial
-  ramp is essential: a `1/r²` profile's steep `β'` drives a variable-β
-  instability (uncancelled indefinite source) that KO does not tame
-  (max Re λ ≈ 9). With the linear outward profile the RHS spectrum is
-  stable (max Re λ ≤ round-off at `V = 1.2`) and a noisy annulus
-  evolution stays bounded with non-increasing, decaying energy
-  (`evolve2d`, `bin/wave2d.jl --mesh annulus`).
+  the inner circle superluminal-outflow and the outer subluminal. The
+  radial characteristic speeds are `dr/dt = −(β_r ± a)` (this solver
+  advects with `+βⁱ∂_iΦ`, `a = α√γ^rr`); at `R1` both are `< 0` for
+  `β_r > 1` (both characteristics fall into the hole) ⇒ the inner circle
+  is **superluminal outflow**, correctly handled by **excision** (no
+  SAT); the outer circle is subluminal ⇒ Sommerfeld. (The opposite sign,
+  `β_r < −1`, would be superluminal *inflow* / full-Dirichlet — out of
+  scope.) The shift is a **linear** radial ramp so it is well resolved on
+  the grid; a steep `1/r²` profile would be under-resolved at these
+  resolutions and is not an appropriate test. The RHS spectrum is stable
+  (max Re λ ≤ round-off at `V = 1.2`) and a noisy annulus evolution stays
+  bounded with non-increasing, decaying energy (`evolve2d`,
+  `bin/wave2d.jl --mesh annulus`).
 * **Deferred** (same as 1D's open items, plus): subluminal Dirichlet
   data-injection in the 2D driver (Sommerfeld is the radiative
   default); per-face characteristic-speed auto-classification on curved

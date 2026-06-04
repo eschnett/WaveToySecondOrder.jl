@@ -753,20 +753,23 @@ function _background2d(kind::Symbol, ::Type{T}; A, d, shift, R1 = 0, R2 = 1) whe
         Dye = (t,x,y) -> zero(T)
         return bg, Φe, Πe, Dxe, Dye, one(T)
     elseif kind === :radial_shift
-        # Flat space (α=1, γ=I) with an OUTWARD radial shift whose
-        # magnitude ramps LINEARLY in r from `V` (>1, superluminal) at
-        # the inner radius R1 to `V_out` (<0.1, subluminal) at the outer
-        # radius R2: β_r(r) = V + (V_out − V)·(r − R1)/(R2 − R1),
-        # β = +β_r·(x,y)/r. A linear ramp keeps β' small (a 1/r² profile's
-        # steep gradient drives a variable-β instability).
-        #
-        # Sign: this solver advects with +βⁱ∂_iΦ, and a face's incoming
-        # characteristic speed is a_n + β^n with β^n = n̂·β (see
-        # `classify_face2d`). At the inner circle the outward normal is
-        # −r̂, so β^n = −β_r < −1 there: a SUPERLUMINAL-OUTFLOW face that
-        # is correctly handled by EXCISION (no SAT). At the outer circle
-        # β^n = +β_r is subluminal ⇒ Sommerfeld. No analytic solution →
-        # use ic=:noise. `A` sets V. max_speed = V + 1.
+        # Flat space (α=1, γ=I) with a radial shift whose magnitude ramps
+        # LINEARLY in r from `V` (>1) at the inner radius R1 to `V_out`
+        # (<0.1) at the outer radius R2:
+        #   β_r(r) = V + (V_out − V)·(r − R1)/(R2 − R1),  β = β_r·(x,y)/r.
+        # The radial characteristic speeds are dr/dt = −(β_r ± a) (this
+        # solver advects with +βⁱ∂_iΦ; a = α√γ^rr = 1). At R1 both are
+        # < 0 (V > 1 ⇒ both characteristics fall into the hole) → the
+        # inner circle is SUPERLUMINAL OUTFLOW, correctly handled by
+        # EXCISION (no SAT). At R2 the face is subluminal ⇒ Sommerfeld.
+        # Because dr/dt = −(β_r ± a), infall (outflow at the inner
+        # circle) corresponds to β_r > 0 — the shift VECTOR points
+        # radially outward even though matter falls inward; the opposite
+        # sign (β_r < −1) would be superluminal INFLOW (full-Dirichlet),
+        # which is out of scope. A linear ramp is used so the shift is
+        # well resolved on the grid (a steep 1/r² profile would be
+        # under-resolved and drive a spurious variable-β instability). No
+        # analytic solution → use ic=:noise. `A` sets V. max_speed = V+1.
         V = T(A); R1v = T(R1); R2v = T(R2); Vout = T(1)/20
         bg = AnalyticBackground2D(_Const3(one(T)),
                                   _RadialShift2(V, Vout, R1v, R2v),
@@ -779,10 +782,10 @@ function _background2d(kind::Symbol, ::Type{T}; A, d, shift, R1 = 0, R2 = 1) whe
     end
 end
 
-# Outward radial shift with magnitude ramping linearly in r from `Vin`
-# at `R1` to `Vout` at `R2`: β = +β_r(r)·(x,y)/r (points outward), making
-# the inner circle (outward normal −r̂) a superluminal-outflow / excision
-# surface in this solver's sign convention.
+# Radial shift with magnitude ramping linearly in r from `Vin` at `R1`
+# to `Vout` at `R2`: β = β_r(r)·(x,y)/r. With β_r > 0 the radial
+# characteristic speeds −(β_r ± a) are negative (matter falls inward),
+# making the inner circle a superluminal-outflow / excision surface.
 struct _RadialShift2{T}; Vin::T; Vout::T; R1::T; R2::T; end
 function (f::_RadialShift2)(t, x, y)
     r = sqrt(x*x + y*y)
