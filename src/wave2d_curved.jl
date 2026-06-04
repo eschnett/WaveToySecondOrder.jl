@@ -17,7 +17,8 @@
 #
 # CAPITAL Greek Φ, Π (lowercase π is the constant).
 
-using HexSBPSAT: MeshGeometry, SBPOps, apply_D!
+using HexSBPSAT: MeshGeometry, SBPOps, apply_D!,
+                 make_metric_terms2d, apply_gradient2d!, apply_divergence2d!
 using KernelAbstractions: @kernel, @index, @Const, get_backend, allocate
 using SpacetimeMetrics: adm_decompose
 using StaticArrays: SVector, SMatrix
@@ -186,6 +187,12 @@ end
 bundle from [`sample_background2d!`] at the current stage time. Flux
 `Fⁱ = βⁱΠ + α√γ γ^{ij}∂_jΦ`, evolved as
 `∂_tΦ = βⁱ∂_iΦ + (α/√γ)Π`, `∂_tΠ = ∂_iFⁱ`. Allocation-free.
+
+`metric === nothing` (default) selects the axis-aligned affine path
+(per-axis `apply_D!`, for `make_uniform_quad`). Passing the discrete
+metric terms from `make_metric_terms2d` selects the curvilinear path
+(free-stream-preserving `apply_gradient2d!`/`apply_divergence2d!`, for
+cubed-square etc.). KO dissipation stays per-axis in both cases.
 """
 function wave2d_curved_rhs!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
                             Φ::AbstractArray{T,3}, Π::AbstractArray{T,3},
@@ -194,21 +201,30 @@ function wave2d_curved_rhs!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
                             ops::SBPOps{N, T},
                             ws::Wave2DWorkspace{T},
                             ε_KO::Real = 0.1,
-                            bc2d = nothing) where {N, T}
+                            bc2d = nothing,
+                            metric = nothing) where {N, T}
     (; DΦ1, DΦ2, F1, F2, s1, s2) = ws
     (; alpha, sqrtγ, b1, b2, gu11, gu12, gu22) = coef
     εT = T(ε_KO); koT = εT * ws.inv_μ5
 
-    apply_D!(DΦ1, Φ, 1; geom, ops)
-    apply_D!(DΦ2, Φ, 2; geom, ops)
+    if metric === nothing
+        apply_D!(DΦ1, Φ, 1; geom, ops)        # affine per-axis gradient
+        apply_D!(DΦ2, Φ, 2; geom, ops)
+    else
+        apply_gradient2d!(DΦ1, DΦ2, Φ; geom, ops, metric)   # curvilinear
+    end
 
     # Flux Fⁱ = βⁱΠ + α√γ γ^{ij}∂_jΦ.
     @. F1 = b1 * Π + alpha * sqrtγ * (gu11 * DΦ1 + gu12 * DΦ2)
     @. F2 = b2 * Π + alpha * sqrtγ * (gu12 * DΦ1 + gu22 * DΦ2)
 
-    apply_D!(s1, F1, 1; geom, ops)
-    apply_D!(s2, F2, 2; geom, ops)
-    @. Π̇ = s1 + s2
+    if metric === nothing
+        apply_D!(s1, F1, 1; geom, ops)
+        apply_D!(s2, F2, 2; geom, ops)
+        @. Π̇ = s1 + s2
+    else
+        apply_divergence2d!(Π̇, F1, F2; geom, ops, metric)
+    end
     @. Φ̇ = b1 * DΦ1 + b2 * DΦ2 + (alpha / sqrtγ) * Π
 
     if εT != 0
@@ -219,25 +235,38 @@ function wave2d_curved_rhs!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
     end
 
     if bc2d !== nothing
-        _apply_bc2d!(Φ̇, Π̇, Φ, Π, coef, ws; geom, ops, bc2d)
+        if metric === nothing
+            _apply_bc2d!(Φ̇, Π̇, Φ, Π, coef, ws; geom, ops, bc2d)
+        else
+            _apply_bc2d_curv!(Φ̇, Π̇, Φ, Π, coef, ws, metric; geom, ops, bc2d)
+        end
     end
     return Φ̇, Π̇
 end
 
 """
-    wave2d_energy(Φ, Π, coef; geom, ops, ws) → E
+    wave2d_energy(Φ, Π, coef; geom, ops, ws, metric = nothing) → E
 
-Discrete ADM energy `E = Σ ½[ Π²/√γ + √γ γ^{ij}∂_iΦ∂_jΦ ]·Hphys`.
+Discrete ADM energy `E = Σ ½[ Π²/√γ + √γ γ^{ij}∂_iΦ∂_jΦ ]·H`. On the
+affine path the mass `H` is `geom.Hphys`; on the curvilinear path
+(`metric` provided) it is the consistent discrete mass `metric.Hd` and
+the gradient is the free-stream-preserving `apply_gradient2d!`.
 Overwrites `ws.DΦ1, ws.DΦ2`.
 """
 function wave2d_energy(Φ::AbstractArray{T,3}, Π::AbstractArray{T,3}, coef;
                        geom::MeshGeometry{2, T, N}, ops::SBPOps{N, T},
-                       ws::Wave2DWorkspace{T}) where {N, T}
+                       ws::Wave2DWorkspace{T}, metric = nothing) where {N, T}
     (; DΦ1, DΦ2) = ws
     (; sqrtγ, gu11, gu12, gu22) = coef
-    apply_D!(DΦ1, Φ, 1; geom, ops)
-    apply_D!(DΦ2, Φ, 2; geom, ops)
+    if metric === nothing
+        apply_D!(DΦ1, Φ, 1; geom, ops)
+        apply_D!(DΦ2, Φ, 2; geom, ops)
+        H = geom.Hphys
+    else
+        apply_gradient2d!(DΦ1, DΦ2, Φ; geom, ops, metric)
+        H = metric.Hd
+    end
     return sum(@. (Π^2 / sqrtγ +
                    sqrtγ * (gu11 * DΦ1^2 + 2 * gu12 * DΦ1 * DΦ2 +
-                            gu22 * DΦ2^2)) * geom.Hphys / 2)
+                            gu22 * DΦ2^2)) * H / 2)
 end

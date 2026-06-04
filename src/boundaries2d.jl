@@ -116,3 +116,69 @@ function _apply_bc2d!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
     end
     return nothing
 end
+
+# Curvilinear outer-boundary pass: a single BC `kind` applied to every
+# `bdry ≠ 0` face, using the PHYSICAL outward normal from the discrete
+# metric terms. The field-radiation residual and penalty generalise the
+# axis-aligned version with n = (nflux)/JF, a_n = α√(γ^{ij}n_in_j),
+# β^n = βⁱn_i, and the boundary weight JF·invdetJ/H_1d[row] (which
+# reduces to invjac[dₙ,dₙ]/H_1d on axis-aligned affine faces). Reads the
+# physical gradient from `ws.DΦ1/DΦ2`. `kind` is the single outer BC
+# code; data via `bc2d.gΦ/gΠ` (boundary-node entries).
+function _apply_bc2d_curv!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
+                           Φ::AbstractArray{T,3}, Π::AbstractArray{T,3},
+                           coef, ws, metric; geom::MeshGeometry{2, T, N},
+                           ops::SBPOps{N, T}, bc2d) where {N, T}
+    get_backend(Φ̇) isa KernelAbstractions.CPU ||
+        error("_apply_bc2d_curv!: curvilinear boundary pass is CPU-only")
+    DΦ1, DΦ2 = ws.DΦ1, ws.DΦ2
+    H1 = ops.H; σ = T(bc2d.σ); conn = geom.conn
+    kind = bc2d.kinds[1]               # single outer BC kind
+    @inbounds for m in 1:geom.Ne, f in 1:4
+        conn.bdry[f, m] == 0 && continue
+        kind == BC_EXCISION && continue
+        a_idx  = (f + 1) ÷ 2                       # normal reference axis
+        axis_p = a_idx == 1 ? 2 : 1                # tangent axis
+        sgn_f  = isodd(f) ? -one(T) : one(T)
+        sgn_c  = a_idx == 1 ? one(T) : -one(T)
+        row = isodd(f) ? 1 : N
+        for p in 1:N
+            i = f ≤ 2 ? row : p
+            j = f ≤ 2 ? p   : row
+            # Outward unit normal + surface element from the analytic
+            # Jacobian columns, exactly as the curvilinear Laplacian's
+            # face SAT (`_face_sat_compute_2d!`): 90° rotation of the
+            # face tangent, oriented by sgn_f·sgn_c·handedness.
+            sgn_out = sgn_f * sgn_c * T(geom.handedness[m])
+            tpx = geom.jac[1, axis_p, i, j, m]
+            tpy = geom.jac[2, axis_p, i, j, m]
+            nfx =  sgn_out * tpy
+            nfy = -sgn_out * tpx
+            JF  = sqrt(nfx*nfx + nfy*nfy)
+            nx  = nfx / JF; ny = nfy / JF
+            αv = coef.alpha[i,j,m]; sγ = coef.sqrtγ[i,j,m]
+            g11 = coef.gu11[i,j,m]; g12 = coef.gu12[i,j,m]; g22 = coef.gu22[i,j,m]
+            a   = αv / sγ
+            a_n = αv * sqrt(g11*nx*nx + 2*g12*nx*ny + g22*ny*ny)
+            βn  = coef.b1[i,j,m]*nx + coef.b2[i,j,m]*ny
+            # SAT lift = surface element / volume mass-per-reference-face
+            #          = JF / (H_1d[row]·detjac).
+            wt  = JF / (H1[row, row] * geom.detjac[i,j,m])
+            if kind == BC_FULL_DIRICHLET
+                τ = σ * (abs(a_n - βn) + abs(a_n + βn)) * wt
+                gΦv = bc2d.gΦ === nothing ? zero(T) : bc2d.gΦ[i,j,m]
+                gΠv = bc2d.gΠ === nothing ? zero(T) : bc2d.gΠ[i,j,m]
+                Φ̇[i,j,m] += -τ * (Φ[i,j,m] - gΦv)
+                Π̇[i,j,m] += -τ * (Π[i,j,m] - gΠv)
+            else
+                q = nx*DΦ1[i,j,m] + ny*DΦ2[i,j,m]      # outward normal deriv
+                r = Π[i,j,m] + ((βn + a_n) / a) * q
+                g = kind == BC_SOMMERFELD ? zero(T) :
+                    (bc2d.gΦ === nothing ? zero(T) : bc2d.gΦ[i,j,m])
+                s_in = a_n + βn
+                Π̇[i,j,m] += -σ * s_in * wt * (r - g)
+            end
+        end
+    end
+    return nothing
+end

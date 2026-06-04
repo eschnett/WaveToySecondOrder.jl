@@ -6,8 +6,9 @@
 # shift), plane-wave convergence, energy conservation, noise
 # robustness, gauge-wave (varying lapse via SpacetimeMetrics).
 
-using HexMeshes: make_uniform_quad
-using HexSBPSAT: make_element, make_operators, make_geometry, to_device
+using HexMeshes: make_uniform_quad, make_cubed_square_mesh
+using HexSBPSAT: make_element, make_operators, make_geometry, to_device,
+                 make_metric_terms2d
 using KernelAbstractions
 using LinearAlgebra
 using MultiFloats
@@ -17,7 +18,7 @@ using Test
 using WaveToySecondOrder: AnalyticBackground2D, MetricBackground2D,
                           make_coef2d, sample_background2d!,
                           make_wave2d_workspace, wave2d_curved_rhs!,
-                          wave2d_energy
+                          wave2d_energy, make_bc2d
 
 @isdefined(_progress) ||
     (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
@@ -170,6 +171,77 @@ _flat2d(::Type{T}) where {T} =
         end
         @test all(isfinite, errs)
         @test (errs[1]/errs[end])^(1/(length(errs)-1)) > 2.5
+    end
+
+    # Curvilinear mesh (cubed-square): free-stream-preserving
+    # conservative operator + physical-normal Sommerfeld outer BC.
+    _progress("wave2d: curvilinear cubed-square (spectrum, free-stream, energy)")
+    @testset "cubed-square: stability, free-stream, energy decay" begin
+        flatbg(::Type{S}) where {S} =
+            AnalyticBackground2D((t,x,y)->one(S), (t,x,y)->(zero(S),zero(S)),
+                                 (t,x,y)->(one(S),zero(S),one(S)))
+        sommerfeld4 = make_bc2d((:sommerfeld,:sommerfeld,:sommerfeld,:sommerfeld))
+
+        # Spectrum: stable (max Re(λ) ≤ round-off) with the outer
+        # Sommerfeld BC — the closed domain is unstable without it.
+        # M=2 only (Ne≈12, n=2·N²·Ne≈384) keeps the dense eigensolve
+        # fast; free-stream/energy below run at M=4.
+        let M = 2
+            mesh = make_cubed_square_mesh(T, M, T(0.3))
+            elem = make_element(T, N); ops = make_operators(elem)
+            geom = make_geometry(mesh, elem); metric = make_metric_terms2d(geom, ops)
+            ws = make_wave2d_workspace(geom, ops); coef = make_coef2d(geom)
+            Ne = geom.Ne
+            sample_background2d!(coef, flatbg(T), zero(T),
+                                 geom.coords[1,:,:,:], geom.coords[2,:,:,:])
+            nn = N*N*Ne; n = 2nn
+            Φ = zeros(T,N,N,Ne); Π = similar(Φ); Φ̇ = similar(Φ); Π̇ = similar(Φ)
+            for ε in (0.0, 0.1)
+                A = zeros(T, n, n)
+                for j in 1:n
+                    fill!(Φ,0); fill!(Π,0); j ≤ nn ? (Φ[j]=1) : (Π[j-nn]=1)
+                    wave2d_curved_rhs!(Φ̇, Π̇, Φ, Π, coef; geom, ops, ws,
+                                       ε_KO=ε, bc2d=sommerfeld4, metric)
+                    A[1:nn,j]=vec(Φ̇); A[nn+1:end,j]=vec(Π̇)
+                end
+                λ = eigvals(A)
+                @test maximum(real, λ) ≤ 1e-5 * maximum(abs, λ)
+            end
+        end
+
+        # Full-RHS free-stream: a constant (Φ, Π=0) state is a fixed
+        # point (∂_tΦ = ∂_tΠ = 0) on the curved mesh.
+        mesh = make_cubed_square_mesh(T, 4, T(0.3))
+        elem = make_element(T, N); ops = make_operators(elem)
+        geom = make_geometry(mesh, elem); metric = make_metric_terms2d(geom, ops)
+        ws = make_wave2d_workspace(geom, ops); coef = make_coef2d(geom)
+        Ne = geom.Ne
+        sample_background2d!(coef, flatbg(T), zero(T),
+                             geom.coords[1,:,:,:], geom.coords[2,:,:,:])
+        Φ̇ = zeros(T,N,N,Ne); Π̇ = similar(Φ̇)
+        wave2d_curved_rhs!(Φ̇, Π̇, fill(T(3), N,N,Ne), zeros(T,N,N,Ne), coef;
+                           geom, ops, ws, ε_KO=0.1, bc2d=sommerfeld4, metric)
+        @test maximum(abs, Φ̇) ≤ 1e-10
+        @test maximum(abs, Π̇) ≤ 1e-9
+
+        # Noise + Sommerfeld: bounded, energy non-increasing (absorbed).
+        Random.seed!(20260604)
+        Φ = randn(T,N,N,Ne); Π = randn(T,N,N,Ne)
+        Eof(Φ,Π) = wave2d_energy(Φ,Π,coef; geom, ops, ws, metric)
+        E0 = Eof(Φ,Π)
+        k = [similar(Φ) for _ in 1:8]; Φs = similar(Φ); Πs = similar(Π)
+        h = 2*T(0.3)/4; dt = T(0.05)*minimum(diff(elem.xs))*h
+        rhs(a,b,c,d) = wave2d_curved_rhs!(a,b,c,d,coef; geom, ops, ws,
+                                          ε_KO=0.1, bc2d=sommerfeld4, metric)
+        for _ in 1:200
+            rhs(k[1],k[2],Φ,Π); @. Φs=Φ+dt/2*k[1]; @. Πs=Π+dt/2*k[2]
+            rhs(k[3],k[4],Φs,Πs); @. Φs=Φ+dt/2*k[3]; @. Πs=Π+dt/2*k[4]
+            rhs(k[5],k[6],Φs,Πs); @. Φs=Φ+dt*k[5]; @. Πs=Π+dt*k[6]
+            rhs(k[7],k[8],Φs,Πs)
+            @. Φ+=dt/6*(k[1]+2k[3]+2k[5]+k[7]); @. Π+=dt/6*(k[2]+2k[4]+2k[6]+k[8])
+        end
+        @test all(isfinite, Φ) && all(isfinite, Π)
+        @test Eof(Φ,Π) ≤ E0
     end
 
     _progress("wave2d: Float64x2 (MultiFloats) CPU")
