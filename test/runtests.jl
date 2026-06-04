@@ -31,6 +31,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
 
 @testset verbose = true "WaveToySecondOrder" begin
     _section("test_wave1d.jl");      include("test_wave1d.jl")
+    _section("test_wave2d.jl");      include("test_wave2d.jl")
     _section("test_kernels3d.jl");   include("test_kernels3d.jl")
     _section("test_sommerfeld.jl");  include("test_sommerfeld.jl")
     _section("test_wave_lap_strong.jl"); include("test_wave_lap_strong.jl")

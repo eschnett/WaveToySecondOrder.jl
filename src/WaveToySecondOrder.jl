@@ -97,6 +97,11 @@ include("wave_strong_rhs.jl")
 include("boundaries1d.jl")
 include("wave1d.jl")
 
+# `wave2d_curved.jl`: conservative-form 2D scalar wave on a 2+1 ADM
+# background (uniform_quad / axis-aligned affine), mirroring wave1d.jl
+# on the per-axis `apply_D!(·, d)` gradient/divergence pair.
+include("wave2d_curved.jl")
+
 # `evolve.jl`: high-level drivers `evolve1d`, `evolve2d`, `evolve3d`.
 # Each builds the geometry, runs the time integration, samples a
 # spacetime slice + L² error, and returns a NamedTuple consumed by
@@ -141,6 +146,12 @@ export
     bc1d_kind, classify_face1d, validate_bc1d, make_bc1d,
     # Re-export the connectivity-driven 1D derivative from HexSBPSAT.
     apply_D!,
+    # Conservative-form 2D scalar wave on a 2+1 ADM background
+    # (`wave2d_curved.jl`).
+    Background2D, AnalyticBackground2D, MetricBackground2D,
+    sample_background2d!, make_coef2d,
+    Wave2DWorkspace, make_wave2d_workspace,
+    wave2d_curved_rhs!, wave2d_energy,
     # Wave-equation layer — 2D
     Params2d, initialize2d!,
     eigenmode_cartesian_2d!, eigenmode_radial_2d!,

@@ -1,0 +1,172 @@
+# Conservative-form 2D scalar wave on a 2+1 ADM background
+# (`wave2d_curved_rhs!` in src/wave2d_curved.jl), on axis-aligned
+# affine meshes (make_uniform_quad). Mirrors test_wave1d.jl.
+#
+# Testsets: spectrum (max Re(λ) ≤ round-off for flat + constant
+# shift), plane-wave convergence, energy conservation, noise
+# robustness, gauge-wave (varying lapse via SpacetimeMetrics).
+
+using HexMeshes: make_uniform_quad
+using HexSBPSAT: make_element, make_operators, make_geometry
+using LinearAlgebra
+using Random
+using SpacetimeMetrics: GaugeWave
+using Test
+using WaveToySecondOrder: AnalyticBackground2D, MetricBackground2D,
+                          make_coef2d, sample_background2d!,
+                          make_wave2d_workspace, wave2d_curved_rhs!,
+                          wave2d_energy
+
+@isdefined(_progress) ||
+    (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
+                       flush(stderr)))
+
+function _setup2d(::Type{T}, N, M; periodic = true) where {T}
+    mesh = make_uniform_quad(T, M, M, zero(T), one(T); periodic)
+    elem = make_element(T, N); ops = make_operators(elem)
+    geom = make_geometry(mesh, elem)
+    ws   = make_wave2d_workspace(geom, ops)
+    coef = make_coef2d(geom)
+    xg = geom.coords[1, :, :, :]; yg = geom.coords[2, :, :, :]
+    return (; mesh, elem, ops, geom, ws, coef, xg, yg)
+end
+
+# RK4 step with stage-time background sampling.
+function _rk4_2d!(Φ, Π, t, dt, bg, s; ε_KO, k, Φs, Πs)
+    (; geom, ops, ws, coef, xg, yg) = s
+    sample_background2d!(coef, bg, t, xg, yg)
+    wave2d_curved_rhs!(k[1], k[2], Φ, Π, coef; geom, ops, ws, ε_KO)
+    sample_background2d!(coef, bg, t + dt/2, xg, yg)
+    @. Φs = Φ + dt/2*k[1]; @. Πs = Π + dt/2*k[2]
+    wave2d_curved_rhs!(k[3], k[4], Φs, Πs, coef; geom, ops, ws, ε_KO)
+    @. Φs = Φ + dt/2*k[3]; @. Πs = Π + dt/2*k[4]
+    wave2d_curved_rhs!(k[5], k[6], Φs, Πs, coef; geom, ops, ws, ε_KO)
+    sample_background2d!(coef, bg, t + dt, xg, yg)
+    @. Φs = Φ + dt*k[5]; @. Πs = Π + dt*k[6]
+    wave2d_curved_rhs!(k[7], k[8], Φs, Πs, coef; geom, ops, ws, ε_KO)
+    @. Φ += dt/6*(k[1] + 2k[3] + 2k[5] + k[7])
+    @. Π += dt/6*(k[2] + 2k[4] + 2k[6] + k[8])
+    return nothing
+end
+
+_flat2d(::Type{T}) where {T} =
+    AnalyticBackground2D((t,x,y) -> one(T), (t,x,y) -> (zero(T), zero(T)),
+                         (t,x,y) -> (one(T), zero(T), one(T)))
+
+@testset "2D ADM scalar-wave kernel (wave2d_curved_rhs!)" begin
+    T = Float64; N = 4
+
+    _progress("wave2d: spectrum max Re(λ)")
+    @testset "spectrum: max Re(λ) ≤ round-off" begin
+        M = 3
+        s = _setup2d(T, N, M)
+        nn = N*N*s.geom.Ne; n = 2nn
+        Φ = zeros(T,N,N,s.geom.Ne); Π = similar(Φ); Φ̇ = similar(Φ); Π̇ = similar(Φ)
+        for (label, bg) in (
+                ("flat",          _flat2d(T)),
+                ("shift (0.3,0.2)", AnalyticBackground2D((t,x,y)->one(T),
+                     (t,x,y)->(T(0.3),T(0.2)), (t,x,y)->(one(T),zero(T),one(T)))),
+                ("aniso metric",  AnalyticBackground2D((t,x,y)->one(T),
+                     (t,x,y)->(zero(T),zero(T)),
+                     (t,x,y)->(one(T)+T(0.3)*sinpi(2x), zero(T), one(T)+T(0.2)*sinpi(2y)))))
+            sample_background2d!(s.coef, bg, zero(T), s.xg, s.yg)
+            A = zeros(T, n, n)
+            for j in 1:n
+                fill!(Φ,0); fill!(Π,0); j ≤ nn ? (Φ[j]=1) : (Π[j-nn]=1)
+                wave2d_curved_rhs!(Φ̇, Π̇, Φ, Π, s.coef; s.geom, s.ops, s.ws, ε_KO=0.0)
+                A[1:nn,j] = vec(Φ̇); A[nn+1:end,j] = vec(Π̇)
+            end
+            λ = eigvals(A)
+            @test maximum(real, λ) ≤ 1e-5 * maximum(abs, λ)
+        end
+    end
+
+    _progress("wave2d: plane-wave convergence")
+    @testset "diagonal plane-wave convergence (periodic)" begin
+        ω = 2π*sqrt(2)
+        Φe(t,x,y) = sin(2π*(x+y) - ω*t)
+        Πe(t,x,y) = -ω*cos(2π*(x+y) - ω*t)
+        bg = _flat2d(T)
+        errs = T[]
+        for M in (4, 8, 16)
+            s = _setup2d(T, N, M)
+            Φ = Φe.(zero(T), s.xg, s.yg); Π = Πe.(zero(T), s.xg, s.yg)
+            k = [similar(Φ) for _ in 1:8]; Φs = similar(Φ); Πs = similar(Π)
+            h = one(T)/M; dxmin = minimum(diff(s.elem.xs))*h; dt = T(0.1)*dxmin/sqrt(2)
+            t = zero(T)
+            for _ in 1:ceil(Int, 0.5/dt)
+                _rk4_2d!(Φ, Π, t, dt, bg, s; ε_KO=0.0, k, Φs, Πs); t += dt
+            end
+            push!(errs, maximum(abs.(Φ .- Φe.(t, s.xg, s.yg))))
+        end
+        @test all(isfinite, errs)
+        @test (errs[1]/errs[end])^(1/(length(errs)-1)) > 2.5
+    end
+
+    _progress("wave2d: energy conservation (flat)")
+    @testset "energy drift < 1e-3 (flat periodic)" begin
+        M = 12
+        s = _setup2d(T, N, M)
+        ω = 2π*sqrt(2)
+        Φ = sin.(2π .* (s.xg .+ s.yg)); Π = -ω .* cos.(2π .* (s.xg .+ s.yg))
+        bg = _flat2d(T)
+        sample_background2d!(s.coef, bg, zero(T), s.xg, s.yg)
+        E0 = wave2d_energy(Φ, Π, s.coef; s.geom, s.ops, s.ws)
+        k = [similar(Φ) for _ in 1:8]; Φs = similar(Φ); Πs = similar(Π)
+        h = one(T)/M; dt = T(0.1)*minimum(diff(s.elem.xs))*h/sqrt(2)
+        t = zero(T)
+        for _ in 1:ceil(Int, 1.0/dt)
+            _rk4_2d!(Φ, Π, t, dt, bg, s; ε_KO=0.0, k, Φs, Πs); t += dt
+        end
+        E1 = wave2d_energy(Φ, Π, s.coef; s.geom, s.ops, s.ws)
+        @test abs(E1/E0 - 1) < 1e-3
+    end
+
+    _progress("wave2d: noise robustness")
+    @testset "noise bounded (flat + shift, 20 crossings)" begin
+        for (label, bg, maxβ) in (("flat", _flat2d(T), 0.0),
+                ("shift", AnalyticBackground2D((t,x,y)->one(T),
+                     (t,x,y)->(T(0.4),T(0.3)), (t,x,y)->(one(T),zero(T),one(T))), 0.7))
+            M = 8
+            s = _setup2d(T, N, M)
+            Random.seed!(20260604)
+            amp = sqrt(eps(T))
+            Φ = amp .* randn(T,N,N,s.geom.Ne); Π = amp .* randn(T,N,N,s.geom.Ne)
+            k = [similar(Φ) for _ in 1:8]; Φs = similar(Φ); Πs = similar(Π)
+            h = one(T)/M; dxmin = minimum(diff(s.elem.xs))*h
+            dt = T(0.1)*dxmin/(1+maxβ); nst = ceil(Int, 20/(1+maxβ)/dt)
+            t = zero(T)
+            for _ in 1:nst
+                _rk4_2d!(Φ, Π, t, dt, bg, s; ε_KO=0.1, k, Φs, Πs); t += dt
+            end
+            @test all(isfinite, Φ) && all(isfinite, Π)
+            @test maximum(abs, Φ) < 1000*amp
+        end
+    end
+
+    _progress("wave2d: gauge wave (varying lapse via SpacetimeMetrics)")
+    @testset "gauge-wave background convergence (MetricBackground2D)" begin
+        # AwA gauge wave propagating in x: α=√H, β=0, γ=diag(H,1),
+        # H = 1 − A sin(2π(x−t)). Exact Φ = sin(k₀(x̂−t̂)),
+        # x̂−t̂ = x − t + 2C cos(2π(x−t)), C = A/(4π) (d=1).
+        A = T(0.1); k = 2T(π); k₀ = 2T(π); C = A/(4T(π))
+        bg = MetricBackground2D(GaugeWave(A, one(T)))
+        ψ(t,x) = x - t + 2C*cos(k*(x-t))
+        Φe(t,x,y) = sin(k₀*ψ(t,x))
+        Πe(t,x,y) = -k₀*(1 - A*sin(k*(x-t)))*cos(k₀*ψ(t,x))
+        errs = T[]
+        for M in (4, 8, 16)
+            s = _setup2d(T, N, M)
+            Φ = Φe.(zero(T), s.xg, s.yg); Π = Πe.(zero(T), s.xg, s.yg)
+            k8 = [similar(Φ) for _ in 1:8]; Φs = similar(Φ); Πs = similar(Π)
+            h = one(T)/M; dt = T(0.1)*minimum(diff(s.elem.xs))*h
+            t = zero(T)
+            for _ in 1:ceil(Int, 0.5/dt)
+                _rk4_2d!(Φ, Π, t, dt, bg, s; ε_KO=0.0, k=k8, Φs, Πs); t += dt
+            end
+            push!(errs, maximum(abs.(Φ .- Φe.(t, s.xg, s.yg))))
+        end
+        @test all(isfinite, errs)
+        @test (errs[1]/errs[end])^(1/(length(errs)-1)) > 2.5
+    end
+end
