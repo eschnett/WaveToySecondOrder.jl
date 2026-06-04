@@ -242,25 +242,10 @@ function _apply_bc1d!(Φ̇::AbstractMatrix{T}, Π̇::AbstractMatrix{T},
     g1L, g2L = T(bc1d.g1L), T(bc1d.g2L)
     g1R, g2R = T(bc1d.g1R), T(bc1d.g2R)
     σ = T(bc1d.σ)
-    if backend isa KernelAbstractions.CPU
-        @inbounds begin
-            dΦ̇, dΠ̇ = _bc1d_increments(kindL, Φ[1, 1], Π[1, 1], DΦ[1, 1],
-                                      a[1, 1], β[1, 1],
-                                      inv(geom.Hphys[1, 1]), -1,
-                                      g1L, g2L, σ)
-            Φ̇[1, 1] += dΦ̇
-            Π̇[1, 1] += dΠ̇
-            dΦ̇, dΠ̇ = _bc1d_increments(kindR, Φ[N, Ne], Π[N, Ne], DΦ[N, Ne],
-                                      a[N, Ne], β[N, Ne],
-                                      inv(geom.Hphys[N, Ne]), +1,
-                                      g1R, g2R, σ)
-            Φ̇[N, Ne] += dΦ̇
-            Π̇[N, Ne] += dΠ̇
-        end
-    else
-        _bc1d_kernel!(backend, 2)(Φ̇, Π̇, Φ, Π, DΦ, a, β, geom.Hphys,
-                                  kindL, kindR, g1L, g2L, g1R, g2R,
-                                  σ, Val(N); ndrange = 2)
-    end
+    # A single KA kernel (ndrange = 2, one workitem per outer face) runs
+    # on both CPU and GPU — no separate hand-written CPU path.
+    _bc1d_kernel!(backend, 2)(Φ̇, Π̇, Φ, Π, DΦ, a, β, geom.Hphys,
+                              kindL, kindR, g1L, g2L, g1R, g2R,
+                              σ, Val(N); ndrange = 2)
     return nothing
 end

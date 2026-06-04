@@ -30,9 +30,10 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
   `r = Π + ((β^n+a_n)/a)·n̂·∂_nΦ`, penalty on Π̇, σ=1); excision and
   full-state Dirichlet as in 1D. Confirmed energy-stable by the
   dense-operator spectrum tests (flat / small shift / anisotropic γ).
-  This axis-aligned rectangular boundary pass (`_apply_bc2d!`) is
-  CPU-only for now (periodic 2D runs on GPU); the *curvilinear*
-  boundary pass below does have a GPU kernel.
+  This axis-aligned rectangular boundary pass (`_apply_bc2d!`), like the
+  curvilinear one below, is a single KernelAbstractions kernel run on
+  both CPU and GPU (parallelised over output nodes, race-free at
+  corners).
 * Driver `evolve2d` and app `bin/wave2d.jl` mirror the 1D versions
   (first-order ODEProblem, `pick_integrator_first_order`, energy/L²
   monitoring, `bc ∈ {:periodic, :auto, 4-tuple}`). Backgrounds:
@@ -70,18 +71,26 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
   it exercises the SAT's `_neigh_p` orientation transform — free-stream,
   interior skew-adjointness, Sommerfeld-spectrum stability, and
   analytic plane-wave convergence all hold there with no operator
-  change. **GPU**: the curvilinear operators
-  (`apply_gradient2d!`/`apply_divergence2d!`) and the physical-normal
-  boundary pass (`_apply_bc2d_curv!`) have KernelAbstractions kernels —
-  a full cubed-square evolution (gradient/divergence, flux, per-axis
-  KO, Sommerfeld/Dirichlet BC) runs entirely on-device. The operator
-  kernels parallelise one node per workitem (split-form volume + the
-  centred-flux SAT for the interior faces the node lies on); the BC
-  kernel parallelises over output nodes so a corner node touched by two
-  boundary faces accumulates both contributions race-free in one
-  workitem. Verified CPU↔Metal Float32 (operator agreement on both
-  curvilinear meshes; short curved-Sommerfeld evolution to 1e-3). The
-  3D curvilinear case (which needs the harder conservative-curl metric
+  change. **GPU / kernel structure**: every SBP-SAT operator
+  (`apply_gradient2d!`/`apply_divergence2d!`, the affine `apply_D!`, and
+  the 2D/3D Laplacian) is a *single* set of KernelAbstractions kernels
+  run on both CPU and GPU — there is no separate hand-written CPU loop;
+  the CPU backend exists to test the GPU path. The gradient/divergence
+  use the **two-pass** structure (shared with the Laplacian): a gather
+  kernel writes each element's face-node values into the mesh-workspace
+  face trace, then a workgroup-per-element kernel stages the field into
+  shared memory, does the split-form volume reduction, and applies the
+  centred-flux SAT by reading the *neighbour's* gathered trace
+  (orientation via `_neigh_p`). One write per output node (gather, not
+  scatter) — no races; the two launches give the global barrier. The
+  scalar/vector face gathers (`_gather_face2d_1ch!`/`_2ch!`) are shared
+  with `apply_D!`. The physical-normal boundary pass
+  (`_apply_bc2d_curv!`) is one node-parallel kernel (corner nodes
+  race-free). A full cubed-square evolution (gradient/divergence, flux,
+  per-axis KO, Sommerfeld/Dirichlet BC) runs entirely on-device.
+  Verified CPU↔Metal Float32 (operator agreement on both curvilinear
+  meshes; short curved-Sommerfeld evolution to 1e-3). The 3D
+  curvilinear case (which needs the harder conservative-curl metric
   form) remains out of scope.
 * **Deferred** (same as 1D's open items, plus): subluminal Dirichlet
   data-injection in the 2D driver (Sommerfeld is the radiative

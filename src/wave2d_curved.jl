@@ -17,7 +17,7 @@
 #
 # CAPITAL Greek Φ, Π (lowercase π is the constant).
 
-using HexSBPSAT: MeshGeometry, SBPOps, apply_D!,
+using HexSBPSAT: MeshGeometry, SBPOps, MeshWorkspace, make_workspace, apply_D!,
                  make_metric_terms2d, apply_gradient2d!, apply_divergence2d!
 using KernelAbstractions: @kernel, @index, @Const, get_backend, allocate
 using SpacetimeMetrics: adm_decompose
@@ -127,13 +127,14 @@ Scratch for [`wave2d_curved_rhs!`](@ref): six `(N,N,Ne)` buffers
 (`DΦ1, DΦ2, F1, F2, s1, s2`) plus the first-derivative spectral radius
 `μ` and the Kreiss-Oliger scale `μ⁻⁵`.
 """
-struct Wave2DWorkspace{T, AT <: AbstractArray{T,3}}
+struct Wave2DWorkspace{T, AT <: AbstractArray{T,3}, MW}
     DΦ1 :: AT
     DΦ2 :: AT
     F1  :: AT
     F2  :: AT
     s1  :: AT
     s2  :: AT
+    mw  :: MW          # HexSBPSAT.MeshWorkspace{2,T,N}: operator face trace
     μ      :: T
     inv_μ5 :: T
 end
@@ -149,32 +150,33 @@ function make_wave2d_workspace(geom::MeshGeometry{2, T, N}, ops) where {T, N}
     backend = get_backend(geom.coords)
     Ne = geom.Ne
     bufs = ntuple(_ -> allocate(backend, T, N, N, Ne), 6)
+    mw = make_workspace(geom)        # operator face-trace buffer
     v, w = bufs[5], bufs[6]
     v_host = T[isodd(i + j + m) ? one(T) : -one(T) for i in 1:N, j in 1:N, m in 1:Ne]
     copyto!(v, v_host)
     μ² = zero(T)
     for _ in 1:30
-        apply_D!(w, v, 1; geom, ops)
-        apply_D!(v, w, 1; geom, ops)
+        apply_D!(w, v, 1; geom, ops, work = mw)
+        apply_D!(v, w, 1; geom, ops, work = mw)
         μ² = sqrt(sum(abs2, v))
         μ² > 0 || break
         v ./= μ²
     end
     μ = sqrt(μ²)
     inv_μ5 = μ > 0 ? inv(μ)^5 : zero(T)
-    return Wave2DWorkspace{T, typeof(v)}(bufs..., μ, inv_μ5)
+    return Wave2DWorkspace{T, typeof(v), typeof(mw)}(bufs..., mw, μ, inv_μ5)
 end
 
 # Six-fold per-axis KO application: out += koT · D_d⁶ field, ping-pong
 # through the two scratch buffers. `field` is not modified.
 @inline function _ko_axis!(dst, field, d, koT, ws, geom, ops)
-    s1, s2 = ws.s1, ws.s2
-    apply_D!(s1, field, d; geom, ops)
-    apply_D!(s2, s1, d; geom, ops)
-    apply_D!(s1, s2, d; geom, ops)
-    apply_D!(s2, s1, d; geom, ops)
-    apply_D!(s1, s2, d; geom, ops)
-    apply_D!(s2, s1, d; geom, ops)   # D⁶ field in s2
+    s1, s2 = ws.s1, ws.s2; mw = ws.mw
+    apply_D!(s1, field, d; geom, ops, work = mw)
+    apply_D!(s2, s1, d; geom, ops, work = mw)
+    apply_D!(s1, s2, d; geom, ops, work = mw)
+    apply_D!(s2, s1, d; geom, ops, work = mw)
+    apply_D!(s1, s2, d; geom, ops, work = mw)
+    apply_D!(s2, s1, d; geom, ops, work = mw)   # D⁶ field in s2
     @. dst += koT * s2
     return nothing
 end
@@ -207,11 +209,12 @@ function wave2d_curved_rhs!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
     (; alpha, sqrtγ, b1, b2, gu11, gu12, gu22) = coef
     εT = T(ε_KO); koT = εT * ws.inv_μ5
 
+    mw = ws.mw
     if metric === nothing
-        apply_D!(DΦ1, Φ, 1; geom, ops)        # affine per-axis gradient
-        apply_D!(DΦ2, Φ, 2; geom, ops)
+        apply_D!(DΦ1, Φ, 1; geom, ops, work = mw)   # affine per-axis gradient
+        apply_D!(DΦ2, Φ, 2; geom, ops, work = mw)
     else
-        apply_gradient2d!(DΦ1, DΦ2, Φ; geom, ops, metric)   # curvilinear
+        apply_gradient2d!(DΦ1, DΦ2, Φ; geom, ops, metric, work = mw)   # curvilinear
     end
 
     # Flux Fⁱ = βⁱΠ + α√γ γ^{ij}∂_jΦ.
@@ -219,11 +222,11 @@ function wave2d_curved_rhs!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
     @. F2 = b2 * Π + alpha * sqrtγ * (gu12 * DΦ1 + gu22 * DΦ2)
 
     if metric === nothing
-        apply_D!(s1, F1, 1; geom, ops)
-        apply_D!(s2, F2, 2; geom, ops)
+        apply_D!(s1, F1, 1; geom, ops, work = mw)
+        apply_D!(s2, F2, 2; geom, ops, work = mw)
         @. Π̇ = s1 + s2
     else
-        apply_divergence2d!(Π̇, F1, F2; geom, ops, metric)
+        apply_divergence2d!(Π̇, F1, F2; geom, ops, metric, work = mw)
     end
     @. Φ̇ = b1 * DΦ1 + b2 * DΦ2 + (alpha / sqrtγ) * Π
 
@@ -258,12 +261,13 @@ function wave2d_energy(Φ::AbstractArray{T,3}, Π::AbstractArray{T,3}, coef;
                        ws::Wave2DWorkspace{T}, metric = nothing) where {N, T}
     (; DΦ1, DΦ2) = ws
     (; sqrtγ, gu11, gu12, gu22) = coef
+    mw = ws.mw
     if metric === nothing
-        apply_D!(DΦ1, Φ, 1; geom, ops)
-        apply_D!(DΦ2, Φ, 2; geom, ops)
+        apply_D!(DΦ1, Φ, 1; geom, ops, work = mw)
+        apply_D!(DΦ2, Φ, 2; geom, ops, work = mw)
         H = geom.Hphys
     else
-        apply_gradient2d!(DΦ1, DΦ2, Φ; geom, ops, metric)
+        apply_gradient2d!(DΦ1, DΦ2, Φ; geom, ops, metric, work = mw)
         H = metric.Hd
     end
     return sum(@. (Π^2 / sqrtγ +

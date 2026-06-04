@@ -68,55 +68,25 @@ function make_bc2d(kinds; σ = 1, gΦ = nothing, gΠ = nothing,
     return (; kinds = codes, σ, gΦ, gΠ, gDx, gDy)
 end
 
-# Per-element boundary pass over the four faces (CPU). Reads ∂_dΦ from
-# ws.DΦ1/DΦ2 (populated by the RHS).
+# Axis-aligned affine outer-boundary pass: per-face BC kind, axis-aligned
+# outward normal (diagonal invjac). Reads ∂_dΦ from ws.DΦ1/DΦ2 (populated
+# by the RHS). A single KA kernel (parallelised over output nodes, so a
+# corner node touched by two faces accumulates both race-free) runs on
+# both CPU and GPU.
 function _apply_bc2d!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
                       Φ::AbstractArray{T,3}, Π::AbstractArray{T,3},
                       coef, ws; geom::MeshGeometry{2, T, N},
                       ops::SBPOps{N, T}, bc2d) where {N, T}
-    get_backend(Φ̇) isa KernelAbstractions.CPU ||
-        error("_apply_bc2d!: non-CPU boundary pass not implemented " *
-              "(periodic meshes run on GPU; non-periodic on CPU)")
-    DΦ1, DΦ2 = ws.DΦ1, ws.DΦ2
-    H1 = ops.H
-    σ  = T(bc2d.σ)
-    conn = geom.conn
-    @inbounds for m in 1:geom.Ne, f in 1:4
-        conn.bdry[f, m] == 0 && continue
-        kind = bc2d.kinds[f]
-        kind == BC_EXCISION && continue
-        dn, n̂, fn = _face_geom2d(f, Val(N))
-        for t in 1:N
-            i = dn == 1 ? fn : t
-            j = dn == 1 ? t  : fn
-            α  = coef.alpha[i, j, m]; sγ = coef.sqrtγ[i, j, m]
-            gunn = dn == 1 ? coef.gu11[i, j, m] : coef.gu22[i, j, m]
-            βax  = dn == 1 ? coef.b1[i, j, m]   : coef.b2[i, j, m]
-            ij   = dn == 1 ? geom.invjac[1, 1, i, j, m] :
-                             geom.invjac[2, 2, i, j, m]
-            a   = α / sγ
-            a_n = α * sqrt(gunn)
-            βn  = n̂ * βax
-            wt  = ij / H1[fn, fn]            # per-axis face weight
-            if kind == BC_FULL_DIRICHLET
-                # Both modes enter: pin the state to data.
-                τ = σ * (abs(a_n - βax) + abs(a_n + βax)) * wt
-                gΦv = bc2d.gΦ === nothing ? zero(T) : bc2d.gΦ[i, j, m]
-                gΠv = bc2d.gΠ === nothing ? zero(T) : bc2d.gΠ[i, j, m]
-                Φ̇[i, j, m] += -τ * (Φ[i, j, m] - gΦv)
-                Π̇[i, j, m] += -τ * (Π[i, j, m] - gΠv)
-            else
-                # Field-radiation (Sommerfeld absorbing / Dirichlet).
-                DΦn = dn == 1 ? DΦ1[i, j, m] : DΦ2[i, j, m]
-                q   = n̂ * DΦn
-                r   = Π[i, j, m] + ((βn + a_n) / a) * q
-                g   = kind == BC_SOMMERFELD ? zero(T) :
-                      (bc2d.gΦ === nothing ? zero(T) : bc2d.gΦ[i, j, m])
-                s_in = a_n + βn
-                Π̇[i, j, m] += -σ * s_in * wt * (r - g)
-            end
-        end
-    end
+    backend = get_backend(Φ̇)
+    gΦ = bc2d.gΦ === nothing ? Φ : bc2d.gΦ
+    gΠ = bc2d.gΠ === nothing ? Φ : bc2d.gΠ
+    k = bc2d.kinds
+    _bc2d_affine_kernel!(backend, (N, N))(
+        Φ̇, Π̇, Φ, Π, ws.DΦ1, ws.DΦ2, coef.alpha, coef.sqrtγ,
+        coef.gu11, coef.gu22, coef.b1, coef.b2, geom.invjac,
+        geom.conn.bdry, ops, gΦ, gΠ, bc2d.gΦ === nothing, bc2d.gΠ === nothing,
+        Int32(k[1]), Int32(k[2]), Int32(k[3]), Int32(k[4]),
+        T(bc2d.σ), Val(N); ndrange = (N, N, geom.Ne))
     return nothing
 end
 
@@ -133,84 +103,23 @@ function _apply_bc2d_curv!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
                            coef, ws, metric; geom::MeshGeometry{2, T, N},
                            ops::SBPOps{N, T}, bc2d) where {N, T}
     backend = get_backend(Φ̇)
-    if !(backend isa KernelAbstractions.CPU)
-        kind = bc2d.kinds[1]
-        kind == BC_EXCISION && return nothing
-        # Substitute the field arrays as dummies where no data is given
-        # (the corresponding kind-branch in the kernel never reads them).
-        gΦ  = bc2d.gΦ  === nothing ? Φ : bc2d.gΦ
-        gΠ  = bc2d.gΠ  === nothing ? Φ : bc2d.gΠ
-        gDx = bc2d.gDx === nothing ? Φ : bc2d.gDx
-        gDy = bc2d.gDy === nothing ? Φ : bc2d.gDy
-        _bc2d_curv_kernel!(backend, (N, N))(
-            Φ̇, Π̇, Φ, Π, ws.DΦ1, ws.DΦ2,
-            coef.alpha, coef.sqrtγ, coef.gu11, coef.gu12, coef.gu22,
-            coef.b1, coef.b2, geom.jac, geom.detjac, geom.handedness,
-            geom.conn.bdry, ops, gΦ, gΠ, gDx, gDy,
-            bc2d.gΦ === nothing, bc2d.gΠ === nothing,
-            bc2d.gDx === nothing, bc2d.gDy === nothing,
-            Int32(kind), T(bc2d.σ), Val(N); ndrange = (N, N, geom.Ne))
-        return nothing
-    end
-    DΦ1, DΦ2 = ws.DΦ1, ws.DΦ2
-    H1 = ops.H; σ = T(bc2d.σ); conn = geom.conn
     kind = bc2d.kinds[1]               # single outer BC kind
-    @inbounds for m in 1:geom.Ne, f in 1:4
-        conn.bdry[f, m] == 0 && continue
-        kind == BC_EXCISION && continue
-        a_idx  = (f + 1) ÷ 2                       # normal reference axis
-        axis_p = a_idx == 1 ? 2 : 1                # tangent axis
-        sgn_f  = isodd(f) ? -one(T) : one(T)
-        sgn_c  = a_idx == 1 ? one(T) : -one(T)
-        row = isodd(f) ? 1 : N
-        for p in 1:N
-            i = f ≤ 2 ? row : p
-            j = f ≤ 2 ? p   : row
-            # Outward unit normal + surface element from the analytic
-            # Jacobian columns, exactly as the curvilinear Laplacian's
-            # face SAT (`_face_sat_compute_2d!`): 90° rotation of the
-            # face tangent, oriented by sgn_f·sgn_c·handedness.
-            sgn_out = sgn_f * sgn_c * T(geom.handedness[m])
-            tpx = geom.jac[1, axis_p, i, j, m]
-            tpy = geom.jac[2, axis_p, i, j, m]
-            nfx =  sgn_out * tpy
-            nfy = -sgn_out * tpx
-            JF  = sqrt(nfx*nfx + nfy*nfy)
-            nx  = nfx / JF; ny = nfy / JF
-            αv = coef.alpha[i,j,m]; sγ = coef.sqrtγ[i,j,m]
-            g11 = coef.gu11[i,j,m]; g12 = coef.gu12[i,j,m]; g22 = coef.gu22[i,j,m]
-            a   = αv / sγ
-            a_n = αv * sqrt(g11*nx*nx + 2*g12*nx*ny + g22*ny*ny)
-            βn  = coef.b1[i,j,m]*nx + coef.b2[i,j,m]*ny
-            # SAT lift = surface element / volume mass-per-reference-face
-            #          = JF / (H_1d[row]·detjac).
-            wt  = JF / (H1[row, row] * geom.detjac[i,j,m])
-            if kind == BC_FULL_DIRICHLET
-                τ = σ * (abs(a_n - βn) + abs(a_n + βn)) * wt
-                gΦv = bc2d.gΦ === nothing ? zero(T) : bc2d.gΦ[i,j,m]
-                gΠv = bc2d.gΠ === nothing ? zero(T) : bc2d.gΠ[i,j,m]
-                Φ̇[i,j,m] += -τ * (Φ[i,j,m] - gΦv)
-                Π̇[i,j,m] += -τ * (Π[i,j,m] - gΠv)
-            else
-                q = nx*DΦ1[i,j,m] + ny*DΦ2[i,j,m]      # outward normal deriv
-                r = Π[i,j,m] + ((βn + a_n) / a) * q
-                # Target field-radiation residual: 0 for Sommerfeld
-                # (absorbing); for Dirichlet, the residual of the
-                # supplied exact-solution data (Π and ∇Φ at the
-                # boundary node), formed with the same physical normal.
-                g = if kind == BC_SOMMERFELD
-                    zero(T)
-                else
-                    gΠv = bc2d.gΠ  === nothing ? zero(T) : bc2d.gΠ[i,j,m]
-                    gDx = bc2d.gDx === nothing ? zero(T) : bc2d.gDx[i,j,m]
-                    gDy = bc2d.gDy === nothing ? zero(T) : bc2d.gDy[i,j,m]
-                    gΠv + ((βn + a_n) / a) * (nx*gDx + ny*gDy)
-                end
-                s_in = a_n + βn
-                Π̇[i,j,m] += -σ * s_in * wt * (r - g)
-            end
-        end
-    end
+    kind == BC_EXCISION && return nothing
+    # Substitute the field arrays as dummies where no data is given (the
+    # corresponding kind-branch in the kernel never reads them).
+    gΦ  = bc2d.gΦ  === nothing ? Φ : bc2d.gΦ
+    gΠ  = bc2d.gΠ  === nothing ? Φ : bc2d.gΠ
+    gDx = bc2d.gDx === nothing ? Φ : bc2d.gDx
+    gDy = bc2d.gDy === nothing ? Φ : bc2d.gDy
+    # One KA kernel (per output node) on both CPU and GPU.
+    _bc2d_curv_kernel!(backend, (N, N))(
+        Φ̇, Π̇, Φ, Π, ws.DΦ1, ws.DΦ2,
+        coef.alpha, coef.sqrtγ, coef.gu11, coef.gu12, coef.gu22,
+        coef.b1, coef.b2, geom.jac, geom.detjac, geom.handedness,
+        geom.conn.bdry, ops, gΦ, gΠ, gDx, gDy,
+        bc2d.gΦ === nothing, bc2d.gΠ === nothing,
+        bc2d.gDx === nothing, bc2d.gDy === nothing,
+        Int32(kind), T(bc2d.σ), Val(N); ndrange = (N, N, geom.Ne))
     return nothing
 end
 
@@ -273,6 +182,59 @@ using KernelAbstractions: @kernel, @index, @Const
                 gy  = noDy ? zero(T) : gDy[i,j,m]
                 gΠv + ((βn + a_n) / a) * (nx*gx + ny*gy)
             end
+            s_in = a_n + βn
+            dP += -σ * s_in * wt * (r - g)
+        end
+    end
+    @inbounds Fdot[i,j,m] += dF
+    @inbounds Pdot[i,j,m] += dP
+end
+
+# GPU/CPU form of the axis-aligned affine boundary pass `_apply_bc2d!`.
+# Parallelised over output NODES; each workitem loops over the ≤ 2
+# boundary faces it lies on and accumulates locally, writing once (no
+# corner-node race). Per-face BC code k1..k4 (faces −x,+x,−y,+y); axis-
+# aligned normal sign n̂ and the diagonal invjac give the weight. Mirrors
+# the previous CPU loop line-for-line. `noΦ/noΠ` flag missing data arrays.
+@kernel function _bc2d_affine_kernel!(Fdot, Pdot, @Const(F), @Const(P),
+                                      @Const(DΦ1), @Const(DΦ2), @Const(alpha),
+                                      @Const(sqrtγ), @Const(gu11), @Const(gu22),
+                                      @Const(b1), @Const(b2), @Const(invjac),
+                                      @Const(bdry), ops, @Const(gΦ), @Const(gΠ),
+                                      noΦ, noΠ, k1, k2, k3, k4, σ,
+                                      ::Val{N}) where {N}
+    i, j, m = @index(Global, NTuple)
+    T = eltype(Fdot)
+    dF = zero(T); dP = zero(T)
+    @inbounds for f in 1:4
+        bdry[f, m] == 0 && continue
+        kind = f == 1 ? k1 : f == 2 ? k2 : f == 3 ? k3 : k4
+        kind == Int32(BC_EXCISION) && continue
+        dn = (f + 1) ÷ 2
+        fn = isodd(f) ? 1 : N
+        on = dn == 1 ? (i == fn) : (j == fn)
+        on || continue
+        n̂ = isodd(f) ? -one(T) : one(T)
+        α = alpha[i,j,m]; sγ = sqrtγ[i,j,m]
+        gunn = dn == 1 ? gu11[i,j,m] : gu22[i,j,m]
+        βax  = dn == 1 ? b1[i,j,m]   : b2[i,j,m]
+        ij   = dn == 1 ? invjac[1,1,i,j,m] : invjac[2,2,i,j,m]
+        a   = α / sγ
+        a_n = α * sqrt(gunn)
+        βn  = n̂ * βax
+        wt  = ij / ops.H[fn, fn]
+        if kind == Int32(BC_FULL_DIRICHLET)
+            τ = σ * (abs(a_n - βax) + abs(a_n + βax)) * wt
+            gΦv = noΦ ? zero(T) : gΦ[i,j,m]
+            gΠv = noΠ ? zero(T) : gΠ[i,j,m]
+            dF += -τ * (F[i,j,m] - gΦv)
+            dP += -τ * (P[i,j,m] - gΠv)
+        else
+            DΦn = dn == 1 ? DΦ1[i,j,m] : DΦ2[i,j,m]
+            q   = n̂ * DΦn
+            r   = P[i,j,m] + ((βn + a_n) / a) * q
+            g   = kind == Int32(BC_SOMMERFELD) ? zero(T) :
+                  (noΦ ? zero(T) : gΦ[i,j,m])
             s_in = a_n + βn
             dP += -σ * s_in * wt * (r - g)
         end
