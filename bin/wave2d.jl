@@ -6,14 +6,21 @@
 #     julia --project bin/wave2d.jl --background gaugewave --A 0.1 --bc periodic
 #     julia --project bin/wave2d.jl --background minkowski --bc auto --ic noise
 #
-# Flags: --N --M --mesh (cubical|cubed_square|inflated_square) --R
-#        (cubed-square radius) --L --R1 --R2 (inflated-square radii)
-# --x0 --x1 --background (minkowski|constant_shift|gaugewave) --A --d
+# Flags: --N --M --mesh (cubical|cubed_square|inflated_square|annulus)
+#        --R (cubed-square radius) --L --R1 --R2 (inflated-square /
+#        annulus radii) --x0 --x1 --background
+#        (minkowski|constant_shift|gaugewave|radial_shift) --A --d
 # --shift (e.g. 0.05,0.0) --ic (exact|gaussian|noise) --ic-width --bc
 # (periodic|auto) --eps-ko --t1 --Nt --type --backend --out.
 #
 #     julia --project bin/wave2d.jl --mesh cubed_square --ic gaussian \
 #           --eps-ko 0.1 --t1 1.5
+#
+# 2D BH-excision annulus (inner circle excised, outer Sommerfeld, an
+# outward radial shift superluminal at R1 and subluminal at R2; --A
+# sets the inner shift speed V):
+#     julia --project bin/wave2d.jl --mesh annulus --R1 0.5 --R2 2.0 \
+#           --background radial_shift --A 1.5 --ic noise --eps-ko 0.1 --t1 2
 
 using CairoMakie
 using KernelAbstractions

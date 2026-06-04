@@ -523,22 +523,28 @@ function evolve2d(; T::Type = Float64,
     on_cpu = backend isa CPU
     on_cpu || T <: AbstractFloat ||
         error("evolve2d: non-CPU backend requires a floating-point T; got $T")
-    curv = mesh_kind === :cubed_square || mesh_kind === :inflated_square
+    curv = mesh_kind === :cubed_square || mesh_kind === :inflated_square ||
+           mesh_kind === :annulus
     periodic = (bc === :periodic) && !curv
     (periodic || on_cpu) ||
         error("evolve2d: non-periodic boundary pass is CPU-only for now")
 
     # `:cubical` → axis-aligned affine uniform_quad (per-axis operator);
-    # `:cubed_square` / `:inflated_square` → curvilinear mesh with
+    # `:cubed_square` / `:inflated_square` → curvilinear FILLED disk;
+    # `:annulus` → curvilinear ring R1 ≤ |x| ≤ R2 with the inner circle
+    # an excision surface (tag 8) and the outer circle the computational
+    # boundary — the 2D BH-excision setup. All curvilinear kinds use the
     # discrete metric terms and the free-stream-preserving conservative
-    # operator + physical-normal outer boundary. The inflated-square
-    # patches carry non-zero connectivity orientation, exercising the
-    # SAT's orientation transform.
+    # operator + physical-normal boundary.
     if mesh_kind === :cubed_square
         mesh = make_cubed_square_mesh(T, M, T(R))
         x0, x1 = -one(T), one(T)
     elseif mesh_kind === :inflated_square
         mesh = make_inflated_square_mesh(T, T(L), T(R1), T(R2), M)
+        x0, x1 = -T(R2), T(R2)
+    elseif mesh_kind === :annulus
+        mesh = make_annulus_mesh(T, T(R1), T(R2), M;
+                                 inner_bc = :excision, outer_bc = :sommerfeld)
         x0, x1 = -T(R2), T(R2)
     else
         mesh = make_uniform_quad(T, M, M, T(x0), T(x1); periodic)
@@ -555,7 +561,8 @@ function evolve2d(; T::Type = Float64,
     xg_d = on_cpu ? xg : copyto!(similar(coef.alpha), xg)
     yg_d = on_cpu ? yg : copyto!(similar(coef.alpha), yg)
 
-    bg, Φe, Πe, Dxe, Dye, max_speed = _background2d(background, T; A, d, shift)
+    bg, Φe, Πe, Dxe, Dye, max_speed =
+        _background2d(background, T; A, d, shift, R1 = T(R1), R2 = T(R2))
 
     # Smallest physical node spacing (handles curved elements).
     dx_min = _min_node_spacing_2d(geom_host.coords)
@@ -634,6 +641,10 @@ function evolve2d(; T::Type = Float64,
     gΠ  = needdata ? zeros(T, N, N, mesh.Ne) : nothing
     gDx = curv_dir ? zeros(T, N, N, mesh.Ne) : nothing
     gDy = curv_dir ? zeros(T, N, N, mesh.Ne) : nothing
+    # Annulus inner circle is tagged excision (8): the curvilinear BC
+    # pass gives those faces no SAT (pure outflow) while `kinds[1]`
+    # drives the outer circle.
+    exc_tag = mesh_kind === :annulus ? 8 : 0
 
     p = (; geom, ops, ws, coef, bg, metric, xg = xg_d, yg = yg_d)
     function rhs!(du, u, p, t)
@@ -649,7 +660,7 @@ function evolve2d(; T::Type = Float64,
                     @. gΦ = Φe(t, xg, yg)
                 end
             end
-            bc2d = make_bc2d(kinds; gΦ, gΠ, gDx, gDy)
+            bc2d = make_bc2d(kinds; gΦ, gΠ, gDx, gDy, excision_tag = exc_tag)
         end
         wave2d_curved_rhs!(Φ̇, Π̇, Φ, Π, p.coef; p.geom, p.ops, p.ws,
                            ε_KO = T(ε_KO), bc2d, metric = p.metric)
@@ -713,9 +724,11 @@ function evolve2d(; T::Type = Float64,
               integrator_name = nameof(typeof(alg)))
 end
 
-# Built-in 2D backgrounds with exact scalar-wave solutions.
-# Returns (bg::Background2D, Φe(t,x,y), Πe(t,x,y), max_speed).
-function _background2d(kind::Symbol, ::Type{T}; A, d, shift) where {T}
+# Built-in 2D backgrounds. Returns
+# (bg::Background2D, Φe, Πe, Dxe, Dye, max_speed). Backgrounds with an
+# exact scalar-wave solution fill the closures; `:radial_shift` has none
+# (use ic=:noise) and returns zero closures.
+function _background2d(kind::Symbol, ::Type{T}; A, d, shift, R1 = 0, R2 = 1) where {T}
     if kind === :minkowski || kind === :constant_shift
         bx, by = kind === :minkowski ? (zero(T), zero(T)) :
                  (T(shift[1]), T(shift[2]))
@@ -739,10 +752,43 @@ function _background2d(kind::Symbol, ::Type{T}; A, d, shift) where {T}
         Dxe = (t,x,y) -> k₀*(1 - 2C*kᵥ*sin(kᵥ*(x-t)))*cos(k₀*ψ(t,x))
         Dye = (t,x,y) -> zero(T)
         return bg, Φe, Πe, Dxe, Dye, one(T)
+    elseif kind === :radial_shift
+        # Flat space (α=1, γ=I) with an OUTWARD radial shift whose
+        # magnitude ramps LINEARLY in r from `V` (>1, superluminal) at
+        # the inner radius R1 to `V_out` (<0.1, subluminal) at the outer
+        # radius R2: β_r(r) = V + (V_out − V)·(r − R1)/(R2 − R1),
+        # β = +β_r·(x,y)/r. A linear ramp keeps β' small (a 1/r² profile's
+        # steep gradient drives a variable-β instability).
+        #
+        # Sign: this solver advects with +βⁱ∂_iΦ, and a face's incoming
+        # characteristic speed is a_n + β^n with β^n = n̂·β (see
+        # `classify_face2d`). At the inner circle the outward normal is
+        # −r̂, so β^n = −β_r < −1 there: a SUPERLUMINAL-OUTFLOW face that
+        # is correctly handled by EXCISION (no SAT). At the outer circle
+        # β^n = +β_r is subluminal ⇒ Sommerfeld. No analytic solution →
+        # use ic=:noise. `A` sets V. max_speed = V + 1.
+        V = T(A); R1v = T(R1); R2v = T(R2); Vout = T(1)/20
+        bg = AnalyticBackground2D(_Const3(one(T)),
+                                  _RadialShift2(V, Vout, R1v, R2v),
+                                  _ConstMet2(one(T), zero(T), one(T)))
+        z = (t,x,y) -> zero(T)
+        return bg, z, z, z, z, V + one(T)
     else
-        error("evolve2d: unknown background $kind " *
-              "(:minkowski, :constant_shift, :gaugewave)")
+        error("evolve2d: unknown background $kind (:minkowski, " *
+              ":constant_shift, :gaugewave, :radial_shift)")
     end
+end
+
+# Outward radial shift with magnitude ramping linearly in r from `Vin`
+# at `R1` to `Vout` at `R2`: β = +β_r(r)·(x,y)/r (points outward), making
+# the inner circle (outward normal −r̂) a superluminal-outflow / excision
+# surface in this solver's sign convention.
+struct _RadialShift2{T}; Vin::T; Vout::T; R1::T; R2::T; end
+function (f::_RadialShift2)(t, x, y)
+    r = sqrt(x*x + y*y)
+    βr = f.Vin + (f.Vout - f.Vin) * (r - f.R1) / (f.R2 - f.R1)
+    s = βr / r
+    return (s * x, s * y)
 end
 
 # isbits callable closures so the backgrounds pass into GPU kernels.
