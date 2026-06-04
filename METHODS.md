@@ -62,11 +62,16 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
   the pass's own physical normal; at β=0 it is exact. Verified by a
   **convergence test against an analytic plane wave** on the
   cubed-square (L2 error vs exact converges at rate ~2, capped by the
-  one-sided boundary). `evolve2d(mesh_kind=:cubed_square, bc=
-  :sommerfeld|:dirichlet)`, `bin/wave2d.jl --mesh cubed_square`. GPU
-  for the curvilinear operators, the inflated-square mesh (mixed
-  orientations), and the 3D curvilinear case (which needs the harder
-  conservative-curl metric form) remain out of scope.
+  one-sided boundary). `evolve2d(mesh_kind=:cubed_square|:inflated_square, bc=
+  :sommerfeld|:dirichlet)`, `bin/wave2d.jl --mesh …`. The
+  **inflated-square** mesh (inner square + inflation + shell patches)
+  carries non-zero connectivity orientation {0,1} between patches, so
+  it exercises the SAT's `_neigh_p` orientation transform — free-stream,
+  interior skew-adjointness, Sommerfeld-spectrum stability, and
+  analytic plane-wave convergence all hold there with no operator
+  change. GPU for the curvilinear operators and the 3D curvilinear
+  case (which needs the harder conservative-curl metric form) remain
+  out of scope.
 * **Deferred** (same as 1D's open items, plus): inflated-square (mixed
   orientations); subluminal Dirichlet data-injection in the 2D driver
   (Sommerfeld is the radiative default); GPU non-periodic / curvilinear

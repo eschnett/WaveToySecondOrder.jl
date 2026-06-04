@@ -504,6 +504,7 @@ function evolve2d(; T::Type = Float64,
                     x1::Real = 1,
                     mesh_kind::Symbol = :cubical,
                     R::Real = 0.3,
+                    L::Real = 0.2, R1::Real = 0.5, R2::Real = 1.0,
                     ic_width::Real = 0.15,
                     background::Symbol = :minkowski,
                     A::Real = 0.1,
@@ -522,18 +523,23 @@ function evolve2d(; T::Type = Float64,
     on_cpu = backend isa CPU
     on_cpu || T <: AbstractFloat ||
         error("evolve2d: non-CPU backend requires a floating-point T; got $T")
-    curv = mesh_kind === :cubed_square
+    curv = mesh_kind === :cubed_square || mesh_kind === :inflated_square
     periodic = (bc === :periodic) && !curv
     (periodic || on_cpu) ||
         error("evolve2d: non-periodic boundary pass is CPU-only for now")
 
     # `:cubical` → axis-aligned affine uniform_quad (per-axis operator);
-    # `:cubed_square` → curvilinear mesh with discrete metric terms and
-    # the free-stream-preserving conservative operator + physical-normal
-    # Sommerfeld outer boundary.
-    if curv
+    # `:cubed_square` / `:inflated_square` → curvilinear mesh with
+    # discrete metric terms and the free-stream-preserving conservative
+    # operator + physical-normal outer boundary. The inflated-square
+    # patches carry non-zero connectivity orientation, exercising the
+    # SAT's orientation transform.
+    if mesh_kind === :cubed_square
         mesh = make_cubed_square_mesh(T, M, T(R))
         x0, x1 = -one(T), one(T)
+    elseif mesh_kind === :inflated_square
+        mesh = make_inflated_square_mesh(T, T(L), T(R1), T(R2), M)
+        x0, x1 = -T(R2), T(R2)
     else
         mesh = make_uniform_quad(T, M, M, T(x0), T(x1); periodic)
     end
@@ -569,10 +575,10 @@ function evolve2d(; T::Type = Float64,
         # default and maps to Sommerfeld here.
         ck = bc === :periodic ? :sommerfeld : bc
         ck === :sommerfeld || ck === :dirichlet ||
-            throw(ArgumentError("evolve2d: cubed_square bc must be " *
-                ":sommerfeld or :dirichlet; got $bc"))
+            throw(ArgumentError("evolve2d: curvilinear ($mesh_kind) bc " *
+                "must be :sommerfeld or :dirichlet; got $bc"))
         ck === :dirichlet && ic !== :exact &&
-            throw(ArgumentError("evolve2d: cubed_square bc=:dirichlet " *
+            throw(ArgumentError("evolve2d: curvilinear bc=:dirichlet " *
                 "requires ic=:exact (it injects the exact solution)"))
         kinds = ntuple(_ -> bc1d_kind(ck), 4)
     elseif !periodic

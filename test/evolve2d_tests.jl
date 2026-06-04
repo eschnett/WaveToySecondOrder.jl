@@ -87,6 +87,24 @@ using WaveToySecondOrder: evolve2d
             t1 = 0.1, Nt = 2)
     end
 
+    _progress("evolve2d: inflated-square mesh")
+    @testset "inflated-square: gaussian absorbed + Dirichlet converges" begin
+        r = evolve2d(; N = 4, M = 2, mesh_kind = :inflated_square,
+                     L = 0.2, R1 = 0.5, R2 = 1.0, ic = :gaussian,
+                     ic_width = 0.2, ε_KO = 0.1, t1 = 0.5, Nt = 5)
+        @test all(isfinite, r.Φ_final)
+        @test r.mesh_kind === :inflated_square
+        @test r.energy[end] ≤ r.energy[1]
+        errs = Float64[]
+        for M in (2, 4)
+            rr = evolve2d(; N = 4, M, mesh_kind = :inflated_square,
+                          background = :minkowski, ic = :exact,
+                          bc = :dirichlet, t1 = 0.4, Nt = 5)
+            push!(errs, maximum(rr.l2_err))
+        end
+        @test (errs[1] / errs[end]) > 3      # converges under refinement
+    end
+
     _progress("evolve2d: inadmissible bc throws")
     @testset "inadmissible bc combinations throw" begin
         # Sommerfeld requested at the +x superluminal inflow face.

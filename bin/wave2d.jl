@@ -6,7 +6,8 @@
 #     julia --project bin/wave2d.jl --background gaugewave --A 0.1 --bc periodic
 #     julia --project bin/wave2d.jl --background minkowski --bc auto --ic noise
 #
-# Flags: --N --M --mesh (cubical|cubed_square) --R (cubed-square radius)
+# Flags: --N --M --mesh (cubical|cubed_square|inflated_square) --R
+#        (cubed-square radius) --L --R1 --R2 (inflated-square radii)
 # --x0 --x1 --background (minkowski|constant_shift|gaugewave) --A --d
 # --shift (e.g. 0.05,0.0) --ic (exact|gaussian|noise) --ic-width --bc
 # (periodic|auto) --eps-ko --t1 --Nt --type --backend --out.
@@ -92,6 +93,9 @@ function main2d_cli(args)
         N = parse(Int, get(o, "N", "4")), M = parse(Int, get(o, "M", "16")),
         mesh_kind = Symbol(get(o, "mesh", "cubical")),
         R = parse(Float64, get(o, "R", "0.3")),
+        L = parse(Float64, get(o, "L", "0.2")),
+        R1 = parse(Float64, get(o, "R1", "0.5")),
+        R2 = parse(Float64, get(o, "R2", "1.0")),
         ic_width = parse(Float64, get(o, "ic-width", "0.15")),
         x0 = parse(Float64, get(o, "x0", "0")), x1 = parse(Float64, get(o, "x1", "1")),
         background = Symbol(get(o, "background", "minkowski")),
