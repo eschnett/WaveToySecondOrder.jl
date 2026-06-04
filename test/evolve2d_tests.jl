@@ -68,6 +68,25 @@ using WaveToySecondOrder: evolve2d
         @test r.energy[end] < r.energy[1]
     end
 
+    _progress("evolve2d: cubed-square Dirichlet convergence")
+    @testset "cubed-square + Dirichlet: converges to analytic" begin
+        # Curved Dirichlet boundary injecting the exact plane-wave data;
+        # the driver tracks the analytic solution and converges.
+        errs = Float64[]
+        for M in (2, 4, 8)
+            r = evolve2d(; N = 4, M, mesh_kind = :cubed_square, R = 0.3,
+                         background = :minkowski, ic = :exact,
+                         bc = :dirichlet, t1 = 0.4, Nt = 5)
+            push!(errs, maximum(r.l2_err))
+        end
+        @test all(isfinite, errs)
+        @test (errs[1] / errs[end])^(1/2) > 2.5
+        # Dirichlet requires exact data.
+        @test_throws ArgumentError evolve2d(; N = 4, M = 2,
+            mesh_kind = :cubed_square, bc = :dirichlet, ic = :noise,
+            t1 = 0.1, Nt = 2)
+    end
+
     _progress("evolve2d: inadmissible bc throws")
     @testset "inadmissible bc combinations throw" begin
         # Sommerfeld requested at the +x superluminal inflow face.

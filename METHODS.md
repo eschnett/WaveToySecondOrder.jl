@@ -56,10 +56,17 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
   Sommerfeld outer BC** (`_apply_bc2d_curv!`, normal from the analytic
   Jacobian columns × handedness — the handedness factor is essential
   where detJ<0, as on half the wedges) restores stability (spectrum
-  max Re λ ≤ round-off at M=2,4). `evolve2d(mesh_kind=:cubed_square)`,
-  `bin/wave2d.jl --mesh cubed_square`. GPU and the 3D curvilinear case
-  (which needs the harder conservative-curl metric form) are out of
-  scope.
+  max Re λ ≤ round-off at M=2,4). Outer BCs: Sommerfeld (absorbing,
+  default) and **Dirichlet** — the curved field-radiation Dirichlet
+  forms its target from exact-solution boundary data (Π and ∇Φ) using
+  the pass's own physical normal; at β=0 it is exact. Verified by a
+  **convergence test against an analytic plane wave** on the
+  cubed-square (L2 error vs exact converges at rate ~2, capped by the
+  one-sided boundary). `evolve2d(mesh_kind=:cubed_square, bc=
+  :sommerfeld|:dirichlet)`, `bin/wave2d.jl --mesh cubed_square`. GPU
+  for the curvilinear operators, the inflated-square mesh (mixed
+  orientations), and the 3D curvilinear case (which needs the harder
+  conservative-curl metric form) remain out of scope.
 * **Deferred** (same as 1D's open items, plus): inflated-square (mixed
   orientations); subluminal Dirichlet data-injection in the 2D driver
   (Sommerfeld is the radiative default); GPU non-periodic / curvilinear

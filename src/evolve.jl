@@ -549,7 +549,7 @@ function evolve2d(; T::Type = Float64,
     xg_d = on_cpu ? xg : copyto!(similar(coef.alpha), xg)
     yg_d = on_cpu ? yg : copyto!(similar(coef.alpha), yg)
 
-    bg, Φe, Πe, max_speed = _background2d(background, T; A, d, shift)
+    bg, Φe, Πe, Dxe, Dye, max_speed = _background2d(background, T; A, d, shift)
 
     # Smallest physical node spacing (handles curved elements).
     dx_min = _min_node_spacing_2d(geom_host.coords)
@@ -563,7 +563,18 @@ function evolve2d(; T::Type = Float64,
     # resolve :auto, validate. Side axis/sign: 1→−x,2→+x,3→−y,4→+y.
     local kinds::NTuple{4,Int}
     if curv
-        kinds = ntuple(_ -> BC_SOMMERFELD, 4)
+        # Single BC kind on the whole curved outer circle: Sommerfeld
+        # (absorbing, default) or Dirichlet (injects the exact solution
+        # — requires ic = :exact). `bc === :periodic` is the unset
+        # default and maps to Sommerfeld here.
+        ck = bc === :periodic ? :sommerfeld : bc
+        ck === :sommerfeld || ck === :dirichlet ||
+            throw(ArgumentError("evolve2d: cubed_square bc must be " *
+                ":sommerfeld or :dirichlet; got $bc"))
+        ck === :dirichlet && ic !== :exact &&
+            throw(ArgumentError("evolve2d: cubed_square bc=:dirichlet " *
+                "requires ic=:exact (it injects the exact solution)"))
+        kinds = ntuple(_ -> bc1d_kind(ck), 4)
     elseif !periodic
         sample_background2d!(coef, bg, T(t0), xg, yg)
         side_axis = (1, 1, 2, 2); side_sign = (-1, 1, -1, 1)
@@ -607,9 +618,16 @@ function evolve2d(; T::Type = Float64,
     Πdev = on_cpu ? Π0 : copyto!(similar(coef.alpha), Π0)
 
     withdata = ic === :exact
-    gΦ = (!periodic && any(==(BC_FULL_DIRICHLET), kinds)) ?
-         zeros(T, N, N, mesh.Ne) : nothing
-    gΠ = gΦ === nothing ? nothing : zeros(T, N, N, mesh.Ne)
+    # Boundary data buffers, allocated only when a data-carrying BC is
+    # active. Rectangular full-state Dirichlet uses (gΦ, gΠ); the curved
+    # field-radiation Dirichlet uses (gΠ, gDx, gDy) = exact (Π, ∂_xΦ,
+    # ∂_yΦ). Refilled each stage in `rhs!`.
+    curv_dir = curv && kinds[1] == BC_DIRICHLET
+    needdata = (!periodic && any(==(BC_FULL_DIRICHLET), kinds)) || curv_dir
+    gΦ  = needdata ? zeros(T, N, N, mesh.Ne) : nothing
+    gΠ  = needdata ? zeros(T, N, N, mesh.Ne) : nothing
+    gDx = curv_dir ? zeros(T, N, N, mesh.Ne) : nothing
+    gDy = curv_dir ? zeros(T, N, N, mesh.Ne) : nothing
 
     p = (; geom, ops, ws, coef, bg, metric, xg = xg_d, yg = yg_d)
     function rhs!(du, u, p, t)
@@ -617,10 +635,15 @@ function evolve2d(; T::Type = Float64,
         sample_background2d!(p.coef, p.bg, t, p.xg, p.yg)
         bc2d = nothing
         if !periodic
-            if gΦ !== nothing && withdata
-                @. gΦ = Φe(t, xg, yg); @. gΠ = Πe(t, xg, yg)
+            if needdata && withdata
+                @. gΠ = Πe(t, xg, yg)
+                if curv_dir
+                    @. gDx = Dxe(t, xg, yg); @. gDy = Dye(t, xg, yg)
+                else
+                    @. gΦ = Φe(t, xg, yg)
+                end
             end
-            bc2d = make_bc2d(kinds; gΦ, gΠ)
+            bc2d = make_bc2d(kinds; gΦ, gΠ, gDx, gDy)
         end
         wave2d_curved_rhs!(Φ̇, Π̇, Φ, Π, p.coef; p.geom, p.ops, p.ws,
                            ε_KO = T(ε_KO), bc2d, metric = p.metric)
@@ -698,14 +721,18 @@ function _background2d(kind::Symbol, ::Type{T}; A, d, shift) where {T}
         Φe = (t,x,y) -> sin(k*(x+y) - ω*t)
         # Π = ∂_tΦ − βⁱ∂_iΦ = (−ω − k(bx+by))cos.
         Πe = (t,x,y) -> (-ω - k*(bx+by)) * cos(k*(x+y) - ω*t)
-        return bg, Φe, Πe, abs(bx) + abs(by) + sqrt(T(2))
+        Dxe = (t,x,y) -> k * cos(k*(x+y) - ω*t)      # ∂_xΦ = ∂_yΦ
+        return bg, Φe, Πe, Dxe, Dxe, abs(bx) + abs(by) + sqrt(T(2))
     elseif kind === :gaugewave
         Aᵥ, dᵥ = T(A), T(d); kᵥ = 2*T(π)/dᵥ; k₀ = 2*T(π); C = Aᵥ*dᵥ/(4*T(π))
         bg = MetricBackground2D(SpacetimeMetrics.GaugeWave(Aᵥ, dᵥ))
         ψ = (t,x) -> x - t + 2C*cos(kᵥ*(x-t))
         Φe = (t,x,y) -> sin(k₀*ψ(t,x))
         Πe = (t,x,y) -> -k₀*(1 - Aᵥ*sin(kᵥ*(x-t)))*cos(k₀*ψ(t,x))
-        return bg, Φe, Πe, one(T)
+        # ∂_xΦ = k₀·∂_xψ·cos(k₀ψ), ∂_xψ = 1 − 2C kᵥ sin(kᵥ(x−t)); ∂_yΦ = 0.
+        Dxe = (t,x,y) -> k₀*(1 - 2C*kᵥ*sin(kᵥ*(x-t)))*cos(k₀*ψ(t,x))
+        Dye = (t,x,y) -> zero(T)
+        return bg, Φe, Πe, Dxe, Dye, one(T)
     else
         error("evolve2d: unknown background $kind " *
               "(:minkowski, :constant_shift, :gaugewave)")
