@@ -37,7 +37,14 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
 * Driver `evolve2d` and app `bin/wave2d.jl` mirror the 1D versions
   (first-order ODEProblem, `pick_integrator_first_order`, energy/L²
   monitoring, `bc ∈ {:periodic, :auto, 4-tuple}`). Backgrounds:
-  `:minkowski`, `:constant_shift`, `:gaugewave`.
+  `:minkowski`, `:constant_shift`, `:gaugewave`, `:radial_shift`. The
+  driver runs end-to-end on **GPU** for *all* mesh/BC kinds — periodic
+  and non-periodic, affine and curvilinear (cubed-square /
+  inflated-square / annulus, Sommerfeld / Dirichlet / excision): the
+  OrdinaryDiffEq RK4 steps the device `ArrayPartition`, the metric terms
+  and boundary-data buffers are migrated to the device, and the
+  per-output monitoring (energy / L²) copies back to host. Verified
+  GPU↔CPU Float32 to ≤1e-3 across those configurations.
 * Type/backend matrix as in 1D: Float64/Float32 CPU+CUDA, Float32
   Metal, Float64x2 CPU; the kernel and `apply_D!` have GPU paths
   (verified CPU↔Metal Float32).

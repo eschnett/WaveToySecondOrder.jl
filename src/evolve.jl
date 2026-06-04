@@ -526,8 +526,6 @@ function evolve2d(; T::Type = Float64,
     curv = mesh_kind === :cubed_square || mesh_kind === :inflated_square ||
            mesh_kind === :annulus
     periodic = (bc === :periodic) && !curv
-    (periodic || on_cpu) ||
-        error("evolve2d: non-periodic boundary pass is CPU-only for now")
 
     # `:cubical` → axis-aligned affine uniform_quad (per-axis operator);
     # `:cubed_square` / `:inflated_square` → curvilinear FILLED disk;
@@ -554,7 +552,20 @@ function evolve2d(; T::Type = Float64,
     geom = on_cpu ? geom_host : to_device(geom_host, backend)
     ws   = make_wave2d_workspace(geom, ops)
     coef = make_coef2d(geom)
-    metric = curv ? make_metric_terms2d(geom, ops) : nothing
+    # Discrete metric terms are computed on the HOST geom (host scalar
+    # loop); the device evolution uses a migrated copy, while the host
+    # monitoring loop uses `metric_host`.
+    metric_host = curv ? make_metric_terms2d(geom_host, ops) : nothing
+    metric = if !curv
+        nothing
+    elseif on_cpu
+        metric_host
+    else
+        _md(a) = copyto!(similar(coef.alpha), a)
+        (; ax1 = _md(metric_host.ax1), ax2 = _md(metric_host.ax2),
+           ay1 = _md(metric_host.ay1), ay2 = _md(metric_host.ay2),
+           invdetJ = _md(metric_host.invdetJ), Hd = _md(metric_host.Hd))
+    end
 
     xg = reshape(copy(geom_host.coords[1, :, :, :]), N, N, mesh.Ne)
     yg = reshape(copy(geom_host.coords[2, :, :, :]), N, N, mesh.Ne)
@@ -637,10 +648,13 @@ function evolve2d(; T::Type = Float64,
     # ∂_yΦ). Refilled each stage in `rhs!`.
     curv_dir = curv && kinds[1] == BC_DIRICHLET
     needdata = (!periodic && any(==(BC_FULL_DIRICHLET), kinds)) || curv_dir
-    gΦ  = needdata ? zeros(T, N, N, mesh.Ne) : nothing
-    gΠ  = needdata ? zeros(T, N, N, mesh.Ne) : nothing
-    gDx = curv_dir ? zeros(T, N, N, mesh.Ne) : nothing
-    gDy = curv_dir ? zeros(T, N, N, mesh.Ne) : nothing
+    # Allocate on the same backend as the state (device on GPU, host on
+    # CPU) so the BC kernel reads them in place; filled each stage in rhs!.
+    _gbuf() = fill!(similar(coef.alpha), zero(T))
+    gΦ  = needdata ? _gbuf() : nothing
+    gΠ  = needdata ? _gbuf() : nothing
+    gDx = curv_dir ? _gbuf() : nothing
+    gDy = curv_dir ? _gbuf() : nothing
     # Annulus inner circle is tagged excision (8): the curvilinear BC
     # pass gives those faces no SAT (pure outflow) while `kinds[1]`
     # drives the outer circle.
@@ -653,11 +667,13 @@ function evolve2d(; T::Type = Float64,
         bc2d = nothing
         if !periodic
             if needdata && withdata
-                @. gΠ = Πe(t, xg, yg)
+                # Fill on the device grids (== host grids on CPU) so the
+                # buffers match the backend the BC kernel reads from.
+                @. gΠ = Πe(t, xg_d, yg_d)
                 if curv_dir
-                    @. gDx = Dxe(t, xg, yg); @. gDy = Dye(t, xg, yg)
+                    @. gDx = Dxe(t, xg_d, yg_d); @. gDy = Dye(t, xg_d, yg_d)
                 else
-                    @. gΦ = Φe(t, xg, yg)
+                    @. gΦ = Φe(t, xg_d, yg_d)
                 end
             end
             bc2d = make_bc2d(kinds; gΦ, gΠ, gDx, gDy, excision_tag = exc_tag)
@@ -709,11 +725,11 @@ function evolve2d(; T::Type = Float64,
         else
             fill!(Φref, zero(T))
         end
-        Hw = curv ? metric.Hd : Hphys_h
+        Hw = curv ? metric_host.Hd : Hphys_h
         l2_err[n] = sqrt(sum(@. (Φh - Φref)^2 * Hw))
         sample_background2d!(coef_h, bg, ta, xg, yg)
         energy[n] = wave2d_energy(Φh, Πh, coef_h; geom = geom_host, ops,
-                                  ws = ws_h, metric)
+                                  ws = ws_h, metric = metric_host)
     end
     finish!(prog)
 

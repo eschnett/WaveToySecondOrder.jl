@@ -96,7 +96,10 @@ function main2d_cli(args)
     shift = Tuple(parse.(Float64, split(get(o, "shift", "0.0,0.0"), ",")))
     bcs = get(o, "bc", "periodic")
     bc = bcs in ("periodic", "auto") ? Symbol(bcs) : Symbol(bcs)
-    return main2d(; T, backend,
+    # `_pbackend` may `@eval using Metal/CUDA` at runtime; run `main2d`
+    # via `invokelatest` so the freshly-loaded backend's methods (e.g.
+    # `KernelAbstractions.allocate` for the device) are visible.
+    return Base.invokelatest(main2d; T, backend,
         N = parse(Int, get(o, "N", "4")), M = parse(Int, get(o, "M", "16")),
         mesh_kind = Symbol(get(o, "mesh", "cubical")),
         R = parse(Float64, get(o, "R", "0.3")),
