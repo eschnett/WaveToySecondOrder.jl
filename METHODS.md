@@ -30,8 +30,9 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
   `r = Π + ((β^n+a_n)/a)·n̂·∂_nΦ`, penalty on Π̇, σ=1); excision and
   full-state Dirichlet as in 1D. Confirmed energy-stable by the
   dense-operator spectrum tests (flat / small shift / anisotropic γ).
-  CPU boundary pass (periodic 2D runs on GPU; non-periodic CPU-only
-  for now).
+  This axis-aligned rectangular boundary pass (`_apply_bc2d!`) is
+  CPU-only for now (periodic 2D runs on GPU); the *curvilinear*
+  boundary pass below does have a GPU kernel.
 * Driver `evolve2d` and app `bin/wave2d.jl` mirror the 1D versions
   (first-order ODEProblem, `pick_integrator_first_order`, energy/L²
   monitoring, `bc ∈ {:periodic, :auto, 4-tuple}`). Backgrounds:
@@ -69,13 +70,22 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
   it exercises the SAT's `_neigh_p` orientation transform — free-stream,
   interior skew-adjointness, Sommerfeld-spectrum stability, and
   analytic plane-wave convergence all hold there with no operator
-  change. GPU for the curvilinear operators and the 3D curvilinear
-  case (which needs the harder conservative-curl metric form) remain
-  out of scope.
-* **Deferred** (same as 1D's open items, plus): inflated-square (mixed
-  orientations); subluminal Dirichlet data-injection in the 2D driver
-  (Sommerfeld is the radiative default); GPU non-periodic / curvilinear
-  boundary pass.
+  change. **GPU**: the curvilinear operators
+  (`apply_gradient2d!`/`apply_divergence2d!`) and the physical-normal
+  boundary pass (`_apply_bc2d_curv!`) have KernelAbstractions kernels —
+  a full cubed-square evolution (gradient/divergence, flux, per-axis
+  KO, Sommerfeld/Dirichlet BC) runs entirely on-device. The operator
+  kernels parallelise one node per workitem (split-form volume + the
+  centred-flux SAT for the interior faces the node lies on); the BC
+  kernel parallelises over output nodes so a corner node touched by two
+  boundary faces accumulates both contributions race-free in one
+  workitem. Verified CPU↔Metal Float32 (operator agreement on both
+  curvilinear meshes; short curved-Sommerfeld evolution to 1e-3). The
+  3D curvilinear case (which needs the harder conservative-curl metric
+  form) remains out of scope.
+* **Deferred** (same as 1D's open items, plus): subluminal Dirichlet
+  data-injection in the 2D driver (Sommerfeld is the radiative
+  default).
 
 ## Scope (1D)
 
