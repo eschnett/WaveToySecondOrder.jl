@@ -39,12 +39,31 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
 * Type/backend matrix as in 1D: Float64/Float32 CPU+CUDA, Float32
   Metal, Float64x2 CPU; the kernel and `apply_D!` have GPU paths
   (verified CPU↔Metal Float32).
-* **Deferred** (same as 1D's open items, plus): curvilinear 2D meshes
-  (cubed-square / inflated — node-varying full invjac needs discrete
-  metric identities / free-stream preservation, the known-hard SBP
-  problem); subluminal Dirichlet data-injection in the 2D driver
-  (Sommerfeld is the radiative default); GPU non-periodic boundary
-  pass.
+* **Curvilinear (cubed-square)**: free-stream-preserving conservative
+  first derivative (`HexSBPSAT.make_metric_terms2d` +
+  `apply_gradient2d!`/`apply_divergence2d!`). Metric terms are computed
+  *discretely* from the nodal coordinates (`make_geometry`'s analytic
+  Jacobians fail the discrete metric identities); in 2D the identities
+  `Σ_α D̂_α(aₐ^α)=0` then hold automatically (tensor-product SBP ops
+  commute), giving free-stream by construction (∇const, ∇·const ≈
+  1e-14). The operators use the **split (skew-symmetric) form**
+  ½(conservative + advective) — the pure conservative form's adjoint is
+  the advective form, so only the split form gives a skew-adjoint
+  gradient/divergence pair (verified: interior `H_d·D` skew to ~1e-15;
+  the consistent discrete mass `H_d = H_ref·detJ` is the energy norm).
+  The KO term stays per-axis. The closed curved domain is unstable
+  (uncancelled boundary term, max Re λ ≈ +0.87); the **physical-normal
+  Sommerfeld outer BC** (`_apply_bc2d_curv!`, normal from the analytic
+  Jacobian columns × handedness — the handedness factor is essential
+  where detJ<0, as on half the wedges) restores stability (spectrum
+  max Re λ ≤ round-off at M=2,4). `evolve2d(mesh_kind=:cubed_square)`,
+  `bin/wave2d.jl --mesh cubed_square`. GPU and the 3D curvilinear case
+  (which needs the harder conservative-curl metric form) are out of
+  scope.
+* **Deferred** (same as 1D's open items, plus): inflated-square (mixed
+  orientations); subluminal Dirichlet data-injection in the 2D driver
+  (Sommerfeld is the radiative default); GPU non-periodic / curvilinear
+  boundary pass.
 
 ## Scope (1D)
 

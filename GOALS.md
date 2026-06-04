@@ -33,6 +33,15 @@ HexMeshes. Use SBP-SAT operators provided by HexSBPSAT. These
 packages may be extended or updated if necessary. Elements with N=4 or
 N=8 grid points seem particularly suitable for GPUs.
 
+On curvilinear meshes the conservative first-derivative operator uses
+metric terms computed *discretely* from the nodal coordinates (so the
+discrete metric identities hold and a constant state is preserved —
+free-stream preservation) and the split (skew-symmetric) form (so the
+gradient/divergence pair is energy-stable). In 2D the metric
+identities hold automatically; the 3D case needs the harder
+conservative-curl metric form. Implemented for 2D cubed-square; 3D
+curvilinear is future work.
+
 The inter-element and outer boundary conditions are to be decided. The
 current implementation is making choices that either need to be
 confirmed, corrected, or consolidated. I prefer SBP/SAT operators

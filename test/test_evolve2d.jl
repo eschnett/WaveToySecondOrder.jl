@@ -55,6 +55,19 @@ using WaveToySecondOrder: evolve2d
         @test maximum(abs, r.Φ_final) < 100 * sqrt(eps(Float64))
     end
 
+    _progress("evolve2d: curvilinear cubed-square")
+    @testset "cubed-square gaussian pulse: bounded, absorbed" begin
+        r = evolve2d(; N = 4, M = 4, mesh_kind = :cubed_square, R = 0.3,
+                     ic = :gaussian, ic_width = 0.15, ε_KO = 0.1,
+                     t1 = 1.0, Nt = 10)
+        @test all(isfinite, r.Φ_final)
+        @test r.mesh_kind === :cubed_square
+        # Energy non-increasing (Sommerfeld outer boundary absorbs) and
+        # the pulse has partly radiated out.
+        @test r.energy[end] ≤ r.energy[1] * (1 + 1e-6)
+        @test r.energy[end] < r.energy[1]
+    end
+
     _progress("evolve2d: inadmissible bc throws")
     @testset "inadmissible bc combinations throw" begin
         # Sommerfeld requested at the +x superluminal inflow face.

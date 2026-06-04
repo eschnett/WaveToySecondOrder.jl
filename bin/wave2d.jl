@@ -6,9 +6,13 @@
 #     julia --project bin/wave2d.jl --background gaugewave --A 0.1 --bc periodic
 #     julia --project bin/wave2d.jl --background minkowski --bc auto --ic noise
 #
-# Flags: --N --M --x0 --x1 --background (minkowski|constant_shift|
-# gaugewave) --A --d --shift (e.g. 0.05,0.0) --ic (exact|noise) --bc
+# Flags: --N --M --mesh (cubical|cubed_square) --R (cubed-square radius)
+# --x0 --x1 --background (minkowski|constant_shift|gaugewave) --A --d
+# --shift (e.g. 0.05,0.0) --ic (exact|gaussian|noise) --ic-width --bc
 # (periodic|auto) --eps-ko --t1 --Nt --type --backend --out.
+#
+#     julia --project bin/wave2d.jl --mesh cubed_square --ic gaussian \
+#           --eps-ko 0.1 --t1 1.5
 
 using CairoMakie
 using KernelAbstractions
@@ -86,6 +90,9 @@ function main2d_cli(args)
     bc = bcs in ("periodic", "auto") ? Symbol(bcs) : Symbol(bcs)
     return main2d(; T, backend,
         N = parse(Int, get(o, "N", "4")), M = parse(Int, get(o, "M", "16")),
+        mesh_kind = Symbol(get(o, "mesh", "cubical")),
+        R = parse(Float64, get(o, "R", "0.3")),
+        ic_width = parse(Float64, get(o, "ic-width", "0.15")),
         x0 = parse(Float64, get(o, "x0", "0")), x1 = parse(Float64, get(o, "x1", "1")),
         background = Symbol(get(o, "background", "minkowski")),
         A = parse(Float64, get(o, "A", "0.1")), d = parse(Float64, get(o, "d", "1.0")),

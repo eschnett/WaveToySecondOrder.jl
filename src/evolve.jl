@@ -502,6 +502,9 @@ function evolve2d(; T::Type = Float64,
                     M::Int = 16,
                     x0::Real = 0,
                     x1::Real = 1,
+                    mesh_kind::Symbol = :cubical,
+                    R::Real = 0.3,
+                    ic_width::Real = 0.15,
                     background::Symbol = :minkowski,
                     A::Real = 0.1,
                     d::Real = 1,
@@ -519,16 +522,27 @@ function evolve2d(; T::Type = Float64,
     on_cpu = backend isa CPU
     on_cpu || T <: AbstractFloat ||
         error("evolve2d: non-CPU backend requires a floating-point T; got $T")
-    periodic = bc === :periodic
+    curv = mesh_kind === :cubed_square
+    periodic = (bc === :periodic) && !curv
     (periodic || on_cpu) ||
         error("evolve2d: non-periodic boundary pass is CPU-only for now")
 
-    mesh = make_uniform_quad(T, M, M, T(x0), T(x1); periodic)
+    # `:cubical` → axis-aligned affine uniform_quad (per-axis operator);
+    # `:cubed_square` → curvilinear mesh with discrete metric terms and
+    # the free-stream-preserving conservative operator + physical-normal
+    # Sommerfeld outer boundary.
+    if curv
+        mesh = make_cubed_square_mesh(T, M, T(R))
+        x0, x1 = -one(T), one(T)
+    else
+        mesh = make_uniform_quad(T, M, M, T(x0), T(x1); periodic)
+    end
     elem = make_element(T, N); ops = make_operators(elem)
     geom_host = make_geometry(mesh, elem)
     geom = on_cpu ? geom_host : to_device(geom_host, backend)
     ws   = make_wave2d_workspace(geom, ops)
     coef = make_coef2d(geom)
+    metric = curv ? make_metric_terms2d(geom, ops) : nothing
 
     xg = reshape(copy(geom_host.coords[1, :, :, :]), N, N, mesh.Ne)
     yg = reshape(copy(geom_host.coords[2, :, :, :]), N, N, mesh.Ne)
@@ -537,18 +551,20 @@ function evolve2d(; T::Type = Float64,
 
     bg, Φe, Πe, max_speed = _background2d(background, T; A, d, shift)
 
-    h_elem = T(geom_host.jac[1, 1, 1, 1, 1])
-    ξs = elem.xs
-    dx_min = minimum(ξs[i+1] - ξs[i] for i in 1:N-1) * h_elem
+    # Smallest physical node spacing (handles curved elements).
+    dx_min = _min_node_spacing_2d(geom_host.coords)
     dt = T(cfl) * dx_min / max_speed
     if ε_KO != 0
         dt = min(dt, T(1.4) / (T(ε_KO) * ws.μ))
     end
 
-    # Boundary setup: classify the four sides at t0, resolve :auto,
-    # validate. Side normal axis/sign: 1→(−x), 2→(+x), 3→(−y), 4→(+y).
+    # Boundary setup. Curvilinear: a single Sommerfeld kind on the
+    # whole outer circle. Rectangular: classify the four sides at t0,
+    # resolve :auto, validate. Side axis/sign: 1→−x,2→+x,3→−y,4→+y.
     local kinds::NTuple{4,Int}
-    if !periodic
+    if curv
+        kinds = ntuple(_ -> BC_SOMMERFELD, 4)
+    elseif !periodic
         sample_background2d!(coef, bg, T(t0), xg, yg)
         side_axis = (1, 1, 2, 2); side_sign = (-1, 1, -1, 1)
         classes = ntuple(4) do f
@@ -578,6 +594,9 @@ function evolve2d(; T::Type = Float64,
     Φ0 = Array{T,3}(undef, N, N, mesh.Ne); Π0 = similar(Φ0)
     if ic === :exact
         @. Φ0 = Φe(T(t0), xg, yg); @. Π0 = Πe(T(t0), xg, yg)
+    elseif ic === :gaussian
+        w = T(ic_width)
+        @. Φ0 = exp(-(xg^2 + yg^2) / (2 * w^2)); fill!(Π0, zero(T))
     elseif ic === :noise
         Φ0 .= T(noise_amp) .* randn(T, N, N, mesh.Ne)
         Π0 .= T(noise_amp) .* randn(T, N, N, mesh.Ne)
@@ -592,7 +611,7 @@ function evolve2d(; T::Type = Float64,
          zeros(T, N, N, mesh.Ne) : nothing
     gΠ = gΦ === nothing ? nothing : zeros(T, N, N, mesh.Ne)
 
-    p = (; geom, ops, ws, coef, bg, xg = xg_d, yg = yg_d)
+    p = (; geom, ops, ws, coef, bg, metric, xg = xg_d, yg = yg_d)
     function rhs!(du, u, p, t)
         Φ, Π = u.x[1], u.x[2]; Φ̇, Π̇ = du.x[1], du.x[2]
         sample_background2d!(p.coef, p.bg, t, p.xg, p.yg)
@@ -604,7 +623,7 @@ function evolve2d(; T::Type = Float64,
             bc2d = make_bc2d(kinds; gΦ, gΠ)
         end
         wave2d_curved_rhs!(Φ̇, Π̇, Φ, Π, p.coef; p.geom, p.ops, p.ws,
-                           ε_KO = T(ε_KO), bc2d)
+                           ε_KO = T(ε_KO), bc2d, metric = p.metric)
         return nothing
     end
 
@@ -650,15 +669,17 @@ function evolve2d(; T::Type = Float64,
         else
             fill!(Φref, zero(T))
         end
-        l2_err[n] = sqrt(sum(@. (Φh - Φref)^2 * Hphys_h))
+        Hw = curv ? metric.Hd : Hphys_h
+        l2_err[n] = sqrt(sum(@. (Φh - Φref)^2 * Hw))
         sample_background2d!(coef_h, bg, ta, xg, yg)
-        energy[n] = wave2d_energy(Φh, Πh, coef_h; geom = geom_host, ops, ws = ws_h)
+        energy[n] = wave2d_energy(Φh, Πh, coef_h; geom = geom_host, ops,
+                                  ws = ws_h, metric)
     end
     finish!(prog)
 
     return (; ts, ts_actual, xs_line, perm, Φs, Πs, l2_err, energy,
               Φ_final = copy(Φh), Π_final = copy(Πh),
-              mesh, geom = geom_host, elem, ops, background, ic, bc,
+              mesh, geom = geom_host, elem, ops, background, ic, bc, mesh_kind,
               x0 = T(x0), x1 = T(x1), dt, dx = dx_min, y_target,
               integrator_name = nameof(typeof(alg)))
 end
