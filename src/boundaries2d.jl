@@ -57,12 +57,15 @@ tagged `bdry ≠ 0` are touched. `gΦ`/`gΠ` are optional `(N,N,Ne)` data
 arrays (boundary-node entries only): `gΦ` is the field-radiation
 target for `:dirichlet`, and `(gΦ, gΠ)` the state target for
 `:full_dirichlet`. `:sommerfeld` (absorbing) and `:excision` need no
-data.
+data. On curvilinear meshes, `:dirichlet` instead takes the exact
+solution's boundary data `gΠ` (Π) and `gDx`/`gDy` (∂_xΦ, ∂_yΦ); the
+pass forms the field-radiation target with its own physical normal.
 """
-function make_bc2d(kinds; σ = 1, gΦ = nothing, gΠ = nothing)
+function make_bc2d(kinds; σ = 1, gΦ = nothing, gΠ = nothing,
+                   gDx = nothing, gDy = nothing)
     codes = ntuple(i -> (kinds[i] isa Symbol ? bc1d_kind(kinds[i]) :
                          Int(kinds[i])), 4)
-    return (; kinds = codes, σ, gΦ, gΠ)
+    return (; kinds = codes, σ, gΦ, gΠ, gDx, gDy)
 end
 
 # Per-element boundary pass over the four faces (CPU). Reads ∂_dΦ from
@@ -173,8 +176,18 @@ function _apply_bc2d_curv!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
             else
                 q = nx*DΦ1[i,j,m] + ny*DΦ2[i,j,m]      # outward normal deriv
                 r = Π[i,j,m] + ((βn + a_n) / a) * q
-                g = kind == BC_SOMMERFELD ? zero(T) :
-                    (bc2d.gΦ === nothing ? zero(T) : bc2d.gΦ[i,j,m])
+                # Target field-radiation residual: 0 for Sommerfeld
+                # (absorbing); for Dirichlet, the residual of the
+                # supplied exact-solution data (Π and ∇Φ at the
+                # boundary node), formed with the same physical normal.
+                g = if kind == BC_SOMMERFELD
+                    zero(T)
+                else
+                    gΠv = bc2d.gΠ  === nothing ? zero(T) : bc2d.gΠ[i,j,m]
+                    gDx = bc2d.gDx === nothing ? zero(T) : bc2d.gDx[i,j,m]
+                    gDy = bc2d.gDy === nothing ? zero(T) : bc2d.gDy[i,j,m]
+                    gΠv + ((βn + a_n) / a) * (nx*gDx + ny*gDy)
+                end
                 s_in = a_n + βn
                 Π̇[i,j,m] += -σ * s_in * wt * (r - g)
             end
