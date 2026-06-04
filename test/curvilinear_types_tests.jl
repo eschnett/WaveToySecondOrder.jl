@@ -9,7 +9,7 @@
 
 using HexMeshes: make_cubed_square_mesh
 using HexSBPSAT: make_element, make_operators, make_geometry,
-                 make_metric_terms2d, apply_gradient2d!
+                 make_metric_terms2d, make_workspace, apply_gradient2d!
 using MultiFloats
 using Test
 using WaveToySecondOrder: AnalyticBackground2D, make_coef2d,
@@ -64,9 +64,9 @@ end
             mesh = make_cubed_square_mesh(T, 2, T(0.3))
             elem = make_element(T, 4); ops = make_operators(elem)
             geom = make_geometry(mesh, elem); metric = make_metric_terms2d(geom, ops)
-            Ne = geom.Ne
+            work = make_workspace(geom); Ne = geom.Ne
             g1 = zeros(T,4,4,Ne); g2 = similar(g1)
-            apply_gradient2d!(g1, g2, fill(T(5)/2, 4,4,Ne); geom, ops, metric)
+            apply_gradient2d!(g1, g2, fill(T(5)/2, 4,4,Ne); geom, ops, metric, work)
             @test Float64(maximum(abs, g1)) ≤ tol
             @test Float64(maximum(abs, g2)) ≤ tol
         end
