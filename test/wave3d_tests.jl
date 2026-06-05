@@ -5,8 +5,10 @@
 # axis-aligned affine hex (Milestone 1): RHS / energy / boundary pass.
 # Mirrors wave2d_tests.jl.
 
-using HexMeshes: make_uniform_hex
-using HexSBPSAT: make_element, make_operators, make_geometry
+using HexMeshes: make_uniform_hex, make_cubed_cube_mesh, make_inflated_cube_mesh,
+                 make_radial_shell_mesh
+using HexSBPSAT: make_element, make_operators, make_geometry, make_metric_terms3d,
+                 make_workspace
 using LinearAlgebra, Random, Test
 using WaveToySecondOrder: AnalyticBackground3D, make_coef3d,
                           sample_background3d!, make_wave3d_workspace,
@@ -102,6 +104,41 @@ end
     @testset "classify_face3d" begin
         @test classify_face3d(1.0,0.0,0.0,0.0,1.0,1.0,1.0, 1, 1) == FACE_SUBLUMINAL
         @test classify_face3d(1.0,0.0,0.0,0.0,1.0,1.0,1.0, 3, -1) == FACE_SUBLUMINAL
+    end
+
+    _progress("3D curvilinear: free-stream RHS + curved Sommerfeld spectrum")
+    @testset "curvilinear RHS free-stream + spectrum" begin
+        bg = _flat3d(T)
+        meshes = (("cubed_cube",   make_cubed_cube_mesh(T, 2, T(0.3))),
+                  ("inflated_cube", make_inflated_cube_mesh(T, T(0.2), T(0.5), T(1.0), 1)),
+                  ("radial_shell",  make_radial_shell_mesh(T, T(0.5), T(1.0), 2)))
+        for (_, mesh) in meshes
+            elem = make_element(T, N); ops = make_operators(elem)
+            geom = make_geometry(mesh, elem); metric = make_metric_terms3d(geom, ops)
+            ws = make_wave3d_workspace(geom, ops); coef = make_coef3d(geom); Ne = geom.Ne
+            xg=geom.coords[1,:,:,:,:]; yg=geom.coords[2,:,:,:,:]; zg=geom.coords[3,:,:,:,:]
+            sample_background3d!(coef, bg, 0.0, xg, yg, zg)
+            Φ = fill(T(2.5),N,N,N,Ne); Π = zeros(T,N,N,N,Ne); Φ̇=similar(Φ); Π̇=similar(Π)
+            bc = make_bc3d(ntuple(_->:sommerfeld,6))
+            wave3d_curved_rhs!(Φ̇,Π̇,Φ,Π,coef; geom,ops,ws,ε_KO=0.0,bc3d=bc,metric)
+            @test maximum(abs,Φ̇) ≤ 1e-9 && maximum(abs,Π̇) ≤ 1e-9   # free-stream
+        end
+        # Curved Sommerfeld spectrum stable on the cubed-cube (flat outer).
+        mesh = make_cubed_cube_mesh(T, 1, T(0.3))
+        elem = make_element(T, N); ops = make_operators(elem)
+        geom = make_geometry(mesh, elem); metric = make_metric_terms3d(geom, ops)
+        ws = make_wave3d_workspace(geom, ops); coef = make_coef3d(geom); Ne = geom.Ne
+        sample_background3d!(coef, bg, 0.0, geom.coords[1,:,:,:,:],
+                             geom.coords[2,:,:,:,:], geom.coords[3,:,:,:,:])
+        bc = make_bc3d(ntuple(_->:sommerfeld,6))
+        nn = N^3*Ne; n = 2nn; A = zeros(T,n,n)
+        Φ=zeros(T,N,N,N,Ne); Π=similar(Φ); Φ̇=similar(Φ); Π̇=similar(Φ)
+        for jc in 1:n
+            fill!(Φ,0); fill!(Π,0); jc ≤ nn ? (Φ[jc]=1) : (Π[jc-nn]=1)
+            wave3d_curved_rhs!(Φ̇,Π̇,Φ,Π,coef; geom,ops,ws,ε_KO=0.1,bc3d=bc,metric)
+            A[1:nn,jc]=vec(Φ̇); A[nn+1:end,jc]=vec(Π̇)
+        end
+        @test maximum(real, eigvals(A)) ≤ 1e-5 * maximum(abs, eigvals(A))
     end
 end
 
