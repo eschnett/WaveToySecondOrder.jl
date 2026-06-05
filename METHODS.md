@@ -37,7 +37,14 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
 * Driver `evolve2d` and app `bin/wave2d.jl` mirror the 1D versions
   (first-order ODEProblem, `pick_integrator_first_order`, energy/L²
   monitoring, `bc ∈ {:periodic, :auto, 4-tuple}`). Backgrounds:
-  `:minkowski`, `:constant_shift`, `:gaugewave`.
+  `:minkowski`, `:constant_shift`, `:gaugewave`, `:radial_shift`. The
+  driver runs end-to-end on **GPU** for *all* mesh/BC kinds — periodic
+  and non-periodic, affine and curvilinear (cubed-square /
+  inflated-square / annulus, Sommerfeld / Dirichlet / excision): the
+  OrdinaryDiffEq RK4 steps the device `ArrayPartition`, the metric terms
+  and boundary-data buffers are migrated to the device, and the
+  per-output monitoring (energy / L²) copies back to host. Verified
+  GPU↔CPU Float32 to ≤1e-3 across those configurations.
 * Type/backend matrix as in 1D: Float64/Float32 CPU+CUDA, Float32
   Metal, Float64x2 CPU; the kernel and `apply_D!` have GPU paths
   (verified CPU↔Metal Float32).
@@ -91,10 +98,37 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
   Verified CPU↔Metal Float32 (operator agreement on both curvilinear
   meshes; short curved-Sommerfeld evolution to 1e-3). The 3D
   curvilinear case (which needs the harder conservative-curl metric
-  form) remains out of scope.
+  form) remains out of scope. **Curvilinear test parity** with the
+  affine path: robust stability under √eps noise (Sommerfeld + KO),
+  energy non-increasing under the absorbing boundary, and a variable
+  background (gaugewave, varying lapse) with curved Dirichlet — all on
+  cubed-square.
+* **2D annulus + inner excision (BH-excision model).** `mesh_kind =
+  :annulus` (`HexMeshes.make_annulus_mesh`) is a pure 4-patch shell ring
+  `R1 ≤ |x| ≤ R2` — the 2D analog of the 3D `make_radial_shell_mesh` —
+  with distinct inner/outer boundary tags (inner `:excision`→8, outer
+  `:sommerfeld`→7). The curvilinear BC pass gives **no SAT** (pure
+  outflow) to any face whose mesh tag is the excision tag (`make_bc2d`
+  `excision_tag`); excision is declared by the mesh, not auto-classified
+  by speed. The `:radial_shift` background (flat α, γ; outward radial
+  shift ramping linearly from `V > 1` at `R1` to `< 0.1` at `R2`) makes
+  the inner circle superluminal-outflow and the outer subluminal. The
+  radial characteristic speeds are `dr/dt = −(β_r ± a)` (this solver
+  advects with `+βⁱ∂_iΦ`, `a = α√γ^rr`); at `R1` both are `< 0` for
+  `β_r > 1` (both characteristics fall into the hole) ⇒ the inner circle
+  is **superluminal outflow**, correctly handled by **excision** (no
+  SAT); the outer circle is subluminal ⇒ Sommerfeld. (The opposite sign,
+  `β_r < −1`, would be superluminal *inflow* / full-Dirichlet — out of
+  scope.) The shift is a **linear** radial ramp so it is well resolved on
+  the grid; a steep `1/r²` profile would be under-resolved at these
+  resolutions and is not an appropriate test. The RHS spectrum is stable
+  (max Re λ ≤ round-off at `V = 1.2`) and a noisy annulus evolution stays
+  bounded with non-increasing, decaying energy (`evolve2d`,
+  `bin/wave2d.jl --mesh annulus`).
 * **Deferred** (same as 1D's open items, plus): subluminal Dirichlet
   data-injection in the 2D driver (Sommerfeld is the radiative
-  default).
+  default); per-face characteristic-speed auto-classification on curved
+  faces (excision is declared by the mesh tag instead).
 
 ## Scope (1D)
 

@@ -60,12 +60,20 @@ target for `:dirichlet`, and `(gΦ, gΠ)` the state target for
 data. On curvilinear meshes, `:dirichlet` instead takes the exact
 solution's boundary data `gΠ` (Π) and `gDx`/`gDy` (∂_xΦ, ∂_yΦ); the
 pass forms the field-radiation target with its own physical normal.
+
+`excision_tag` (default 0 = none): in the CURVILINEAR pass, any
+boundary face whose mesh `bdry` tag equals `excision_tag` gets NO SAT
+(pure outflow), regardless of `kinds`. This lets a multi-boundary
+curved mesh (e.g. the annulus, inner tag 8 = excision, outer tag 7 =
+Sommerfeld) apply excision to the inner circle while `kinds[1]` drives
+the outer one. The HexMeshes excision tag is 8.
 """
 function make_bc2d(kinds; σ = 1, gΦ = nothing, gΠ = nothing,
-                   gDx = nothing, gDy = nothing)
+                   gDx = nothing, gDy = nothing, excision_tag = 0)
     codes = ntuple(i -> (kinds[i] isa Symbol ? bc1d_kind(kinds[i]) :
                          Int(kinds[i])), 4)
-    return (; kinds = codes, σ, gΦ, gΠ, gDx, gDy)
+    return (; kinds = codes, σ, gΦ, gΠ, gDx, gDy,
+            excision_tag = Int32(excision_tag))
 end
 
 # Axis-aligned affine outer-boundary pass: per-face BC kind, axis-aligned
@@ -103,15 +111,20 @@ function _apply_bc2d_curv!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
                            coef, ws, metric; geom::MeshGeometry{2, T, N},
                            ops::SBPOps{N, T}, bc2d) where {N, T}
     backend = get_backend(Φ̇)
-    kind = bc2d.kinds[1]               # single outer BC kind
-    kind == BC_EXCISION && return nothing
+    kind = bc2d.kinds[1]               # single outer BC kind (non-excision faces)
+    excision_tag = hasproperty(bc2d, :excision_tag) ?
+                   Int32(bc2d.excision_tag) : Int32(0)
+    # If the only boundary is excision (no excision_tag set, kind==excision),
+    # there is nothing to do.
+    kind == BC_EXCISION && excision_tag == 0 && return nothing
     # Substitute the field arrays as dummies where no data is given (the
     # corresponding kind-branch in the kernel never reads them).
     gΦ  = bc2d.gΦ  === nothing ? Φ : bc2d.gΦ
     gΠ  = bc2d.gΠ  === nothing ? Φ : bc2d.gΠ
     gDx = bc2d.gDx === nothing ? Φ : bc2d.gDx
     gDy = bc2d.gDy === nothing ? Φ : bc2d.gDy
-    # One KA kernel (per output node) on both CPU and GPU.
+    # One KA kernel (per output node) on both CPU and GPU. Faces tagged
+    # `excision_tag` get no SAT (handled inside the kernel).
     _bc2d_curv_kernel!(backend, (N, N))(
         Φ̇, Π̇, Φ, Π, ws.DΦ1, ws.DΦ2,
         coef.alpha, coef.sqrtγ, coef.gu11, coef.gu12, coef.gu22,
@@ -119,7 +132,7 @@ function _apply_bc2d_curv!(Φ̇::AbstractArray{T,3}, Π̇::AbstractArray{T,3},
         geom.conn.bdry, ops, gΦ, gΠ, gDx, gDy,
         bc2d.gΦ === nothing, bc2d.gΠ === nothing,
         bc2d.gDx === nothing, bc2d.gDy === nothing,
-        Int32(kind), T(bc2d.σ), Val(N); ndrange = (N, N, geom.Ne))
+        Int32(kind), excision_tag, T(bc2d.σ), Val(N); ndrange = (N, N, geom.Ne))
     return nothing
 end
 
@@ -141,12 +154,15 @@ using KernelAbstractions: @kernel, @index, @Const
                                     @Const(detjac), @Const(handed),
                                     @Const(bdry), ops, @Const(gΦ), @Const(gΠ),
                                     @Const(gDx), @Const(gDy), noΦ, noΠ, noDx,
-                                    noDy, kind, σ, ::Val{N}) where {N}
+                                    noDy, kind, excision_tag, σ,
+                                    ::Val{N}) where {N}
     i, j, m = @index(Global, NTuple)
     T = eltype(Fdot)
     dF = zero(T); dP = zero(T)
     @inbounds for f in 1:4
         bdry[f, m] == 0 && continue
+        # Excision face (e.g. annulus inner circle): no SAT = pure outflow.
+        bdry[f, m] == excision_tag && continue
         a_idx = (f + 1) ÷ 2
         row = isodd(f) ? 1 : N
         on = a_idx == 1 ? (i == row) : (j == row)
@@ -183,7 +199,7 @@ using KernelAbstractions: @kernel, @index, @Const
                 gΠv + ((βn + a_n) / a) * (nx*gx + ny*gy)
             end
             s_in = a_n + βn
-            dP += -σ * s_in * wt * (r - g)
+            dP += -σ * abs(s_in) * wt * (r - g)   # |s_in| ⇒ dissipative
         end
     end
     @inbounds Fdot[i,j,m] += dF
@@ -236,7 +252,7 @@ end
             g   = kind == Int32(BC_SOMMERFELD) ? zero(T) :
                   (noΦ ? zero(T) : gΦ[i,j,m])
             s_in = a_n + βn
-            dP += -σ * s_in * wt * (r - g)
+            dP += -σ * abs(s_in) * wt * (r - g)   # |s_in| ⇒ dissipative
         end
     end
     @inbounds Fdot[i,j,m] += dF

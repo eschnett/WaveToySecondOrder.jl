@@ -182,7 +182,10 @@ function main1d_cli(args)
     o = _parse_args(args)
     T = _pick_type(get(o, "type", "Float64"))
     backend = _pick_backend(get(o, "backend", "cpu"), T)
-    return main1d(;
+    # `_pick_backend` may `@eval using Metal/CUDA` at runtime; run `main1d`
+    # via `invokelatest` so the freshly-loaded backend's device methods
+    # are visible (else a world-age MethodError on GPU).
+    return Base.invokelatest(main1d;
         bc = _pick_bc(o),
         T, backend,
         N  = parse(Int, get(o, "N", "4")),

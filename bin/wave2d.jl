@@ -6,14 +6,21 @@
 #     julia --project bin/wave2d.jl --background gaugewave --A 0.1 --bc periodic
 #     julia --project bin/wave2d.jl --background minkowski --bc auto --ic noise
 #
-# Flags: --N --M --mesh (cubical|cubed_square|inflated_square) --R
-#        (cubed-square radius) --L --R1 --R2 (inflated-square radii)
-# --x0 --x1 --background (minkowski|constant_shift|gaugewave) --A --d
+# Flags: --N --M --mesh (cubical|cubed_square|inflated_square|annulus)
+#        --R (cubed-square radius) --L --R1 --R2 (inflated-square /
+#        annulus radii) --x0 --x1 --background
+#        (minkowski|constant_shift|gaugewave|radial_shift) --A --d
 # --shift (e.g. 0.05,0.0) --ic (exact|gaussian|noise) --ic-width --bc
 # (periodic|auto) --eps-ko --t1 --Nt --type --backend --out.
 #
 #     julia --project bin/wave2d.jl --mesh cubed_square --ic gaussian \
 #           --eps-ko 0.1 --t1 1.5
+#
+# 2D BH-excision annulus (inner circle excised, outer Sommerfeld, an
+# outward radial shift superluminal at R1 and subluminal at R2; --A
+# sets the inner shift speed V):
+#     julia --project bin/wave2d.jl --mesh annulus --R1 0.5 --R2 2.0 \
+#           --background radial_shift --A 1.5 --ic noise --eps-ko 0.1 --t1 2
 
 using CairoMakie
 using KernelAbstractions
@@ -89,7 +96,10 @@ function main2d_cli(args)
     shift = Tuple(parse.(Float64, split(get(o, "shift", "0.0,0.0"), ",")))
     bcs = get(o, "bc", "periodic")
     bc = bcs in ("periodic", "auto") ? Symbol(bcs) : Symbol(bcs)
-    return main2d(; T, backend,
+    # `_pbackend` may `@eval using Metal/CUDA` at runtime; run `main2d`
+    # via `invokelatest` so the freshly-loaded backend's methods (e.g.
+    # `KernelAbstractions.allocate` for the device) are visible.
+    return Base.invokelatest(main2d; T, backend,
         N = parse(Int, get(o, "N", "4")), M = parse(Int, get(o, "M", "16")),
         mesh_kind = Symbol(get(o, "mesh", "cubical")),
         R = parse(Float64, get(o, "R", "0.3")),

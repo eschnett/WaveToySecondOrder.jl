@@ -49,25 +49,50 @@ end
 
 # Smallest GLL-node spacing across the mesh, Euclidean. Handles
 # curvilinear elements whose local axis 1 is not aligned with physical x.
+@inline _node_dist3(c, a, b) =
+    sqrt((c[1,a...] - c[1,b...])^2 + (c[2,a...] - c[2,b...])^2 +
+         (c[3,a...] - c[3,b...])^2)
+
+# Smallest physical spacing between reference-axis-adjacent nodes, taken
+# over ALL reference directions (ξ, η, ζ) — not just axis 1. On curved
+# meshes the angular spacing can be smaller than the radial one, so an
+# axis-1-only minimum overestimates h and yields a too-large CFL dt.
 function _min_node_spacing_3d(coords::AbstractArray{T}) where {T}
+    N1, N2, N3, Ne = size(coords, 2), size(coords, 3), size(coords, 4), size(coords, 5)
     h = typemax(T)
-    @inbounds for e in 1:size(coords, 5), k in 1:size(coords, 4),
-                  j in 1:size(coords, 3), i in 2:size(coords, 2)
-        dxv = coords[1, i, j, k, e] - coords[1, i-1, j, k, e]
-        dyv = coords[2, i, j, k, e] - coords[2, i-1, j, k, e]
-        dzv = coords[3, i, j, k, e] - coords[3, i-1, j, k, e]
-        h = min(h, sqrt(dxv*dxv + dyv*dyv + dzv*dzv))
+    @inbounds for e in 1:Ne, k in 1:N3, j in 1:N2, i in 1:N1
+        i > 1 && (h = min(h, _node_dist3(coords, (i,j,k,e), (i-1,j,k,e))))
+        j > 1 && (h = min(h, _node_dist3(coords, (i,j,k,e), (i,j-1,k,e))))
+        k > 1 && (h = min(h, _node_dist3(coords, (i,j,k,e), (i,j,k-1,e))))
     end
     return h
 end
 
+# (i, j, e) of a representative node on boundary side `f` (1=−x, 2=+x,
+# 3=−y, 4=+y) of an axis-aligned mesh — the first boundary element on
+# that side, at the side's row and the mid tangential node. Used to
+# classify each side from a node that actually lies on it.
+function _side_node_2d(geom, f, N)
+    bdry = geom.conn.bdry
+    a_idx = (f + 1) ÷ 2
+    row = isodd(f) ? 1 : N
+    mid = (N + 1) ÷ 2
+    @inbounds for e in 1:geom.Ne
+        bdry[f, e] == 0 && continue
+        return a_idx == 1 ? (row, mid, e) : (mid, row, e)
+    end
+    return (1, 1, 1)
+end
+
+@inline _node_dist2(c, a, b) =
+    sqrt((c[1,a...] - c[1,b...])^2 + (c[2,a...] - c[2,b...])^2)
+
 function _min_node_spacing_2d(coords::AbstractArray{T}) where {T}
+    N1, N2, Ne = size(coords, 2), size(coords, 3), size(coords, 4)
     h = typemax(T)
-    @inbounds for e in 1:size(coords, 4), j in 1:size(coords, 3),
-                  i in 2:size(coords, 2)
-        dxv = coords[1, i, j, e] - coords[1, i-1, j, e]
-        dyv = coords[2, i, j, e] - coords[2, i-1, j, e]
-        h = min(h, sqrt(dxv*dxv + dyv*dyv))
+    @inbounds for e in 1:Ne, j in 1:N2, i in 1:N1
+        i > 1 && (h = min(h, _node_dist2(coords, (i,j,e), (i-1,j,e))))
+        j > 1 && (h = min(h, _node_dist2(coords, (i,j,e), (i,j-1,e))))
     end
     return h
 end
@@ -523,22 +548,26 @@ function evolve2d(; T::Type = Float64,
     on_cpu = backend isa CPU
     on_cpu || T <: AbstractFloat ||
         error("evolve2d: non-CPU backend requires a floating-point T; got $T")
-    curv = mesh_kind === :cubed_square || mesh_kind === :inflated_square
+    curv = mesh_kind === :cubed_square || mesh_kind === :inflated_square ||
+           mesh_kind === :annulus
     periodic = (bc === :periodic) && !curv
-    (periodic || on_cpu) ||
-        error("evolve2d: non-periodic boundary pass is CPU-only for now")
 
     # `:cubical` → axis-aligned affine uniform_quad (per-axis operator);
-    # `:cubed_square` / `:inflated_square` → curvilinear mesh with
+    # `:cubed_square` / `:inflated_square` → curvilinear FILLED disk;
+    # `:annulus` → curvilinear ring R1 ≤ |x| ≤ R2 with the inner circle
+    # an excision surface (tag 8) and the outer circle the computational
+    # boundary — the 2D BH-excision setup. All curvilinear kinds use the
     # discrete metric terms and the free-stream-preserving conservative
-    # operator + physical-normal outer boundary. The inflated-square
-    # patches carry non-zero connectivity orientation, exercising the
-    # SAT's orientation transform.
+    # operator + physical-normal boundary.
     if mesh_kind === :cubed_square
         mesh = make_cubed_square_mesh(T, M, T(R))
         x0, x1 = -one(T), one(T)
     elseif mesh_kind === :inflated_square
         mesh = make_inflated_square_mesh(T, T(L), T(R1), T(R2), M)
+        x0, x1 = -T(R2), T(R2)
+    elseif mesh_kind === :annulus
+        mesh = make_annulus_mesh(T, T(R1), T(R2), M;
+                                 inner_bc = :excision, outer_bc = :sommerfeld)
         x0, x1 = -T(R2), T(R2)
     else
         mesh = make_uniform_quad(T, M, M, T(x0), T(x1); periodic)
@@ -548,14 +577,25 @@ function evolve2d(; T::Type = Float64,
     geom = on_cpu ? geom_host : to_device(geom_host, backend)
     ws   = make_wave2d_workspace(geom, ops)
     coef = make_coef2d(geom)
-    metric = curv ? make_metric_terms2d(geom, ops) : nothing
+    # Discrete metric terms are computed on the HOST geom (host scalar
+    # loop); the device evolution uses a migrated copy, while the host
+    # monitoring loop uses `metric_host`.
+    metric_host = curv ? make_metric_terms2d(geom_host, ops) : nothing
+    metric = !curv ? nothing :
+             on_cpu ? metric_host : metric_to_device(metric_host, backend)
 
     xg = reshape(copy(geom_host.coords[1, :, :, :]), N, N, mesh.Ne)
     yg = reshape(copy(geom_host.coords[2, :, :, :]), N, N, mesh.Ne)
     xg_d = on_cpu ? xg : copyto!(similar(coef.alpha), xg)
     yg_d = on_cpu ? yg : copyto!(similar(coef.alpha), yg)
 
-    bg, Φe, Πe, Dxe, Dye, max_speed = _background2d(background, T; A, d, shift)
+    bg, Φe, Πe, Dxe, Dye, max_speed =
+        _background2d(background, T; A, d, shift, R1 = T(R1), R2 = T(R2))
+
+    # Host-resident background coefficients, for boundary-face
+    # classification (below) and the per-output diagnostics (energy / L²).
+    # Sampled on the host grids so all reads are host-side even on GPU.
+    coef_h = on_cpu ? coef : make_coef2d(geom_host)
 
     # Smallest physical node spacing (handles curved elements).
     dx_min = _min_node_spacing_2d(geom_host.coords)
@@ -582,13 +622,15 @@ function evolve2d(; T::Type = Float64,
                 "requires ic=:exact (it injects the exact solution)"))
         kinds = ntuple(_ -> bc1d_kind(ck), 4)
     elseif !periodic
-        sample_background2d!(coef, bg, T(t0), xg, yg)
+        # Classify each side from a node that actually lies on it, using
+        # the HOST coefficients (host scalar reads — safe on GPU).
+        sample_background2d!(coef_h, bg, T(t0), xg, yg)
         side_axis = (1, 1, 2, 2); side_sign = (-1, 1, -1, 1)
         classes = ntuple(4) do f
-            # representative boundary node on side f
-            classify_face2d(coef.alpha[1], coef.b1[1], coef.b2[1],
-                            coef.gu11[1], coef.gu22[1],
-                            side_axis[f], side_sign[f])
+            i, j, e = _side_node_2d(geom_host, f, N)
+            classify_face2d(coef_h.alpha[i,j,e], coef_h.b1[i,j,e],
+                            coef_h.b2[i,j,e], coef_h.gu11[i,j,e],
+                            coef_h.gu22[i,j,e], side_axis[f], side_sign[f])
         end
         autopick(c) = c == FACE_SUBLUMINAL ? BC_SOMMERFELD :
                       c == FACE_OUTFLOW    ? BC_EXCISION : BC_FULL_DIRICHLET
@@ -630,10 +672,17 @@ function evolve2d(; T::Type = Float64,
     # ∂_yΦ). Refilled each stage in `rhs!`.
     curv_dir = curv && kinds[1] == BC_DIRICHLET
     needdata = (!periodic && any(==(BC_FULL_DIRICHLET), kinds)) || curv_dir
-    gΦ  = needdata ? zeros(T, N, N, mesh.Ne) : nothing
-    gΠ  = needdata ? zeros(T, N, N, mesh.Ne) : nothing
-    gDx = curv_dir ? zeros(T, N, N, mesh.Ne) : nothing
-    gDy = curv_dir ? zeros(T, N, N, mesh.Ne) : nothing
+    # Allocate on the same backend as the state (device on GPU, host on
+    # CPU) so the BC kernel reads them in place; filled each stage in rhs!.
+    _gbuf() = fill!(similar(coef.alpha), zero(T))
+    gΦ  = needdata ? _gbuf() : nothing
+    gΠ  = needdata ? _gbuf() : nothing
+    gDx = curv_dir ? _gbuf() : nothing
+    gDy = curv_dir ? _gbuf() : nothing
+    # Annulus inner circle is tagged excision (8): the curvilinear BC
+    # pass gives those faces no SAT (pure outflow) while `kinds[1]`
+    # drives the outer circle.
+    exc_tag = mesh_kind === :annulus ? 8 : 0
 
     p = (; geom, ops, ws, coef, bg, metric, xg = xg_d, yg = yg_d)
     function rhs!(du, u, p, t)
@@ -642,14 +691,16 @@ function evolve2d(; T::Type = Float64,
         bc2d = nothing
         if !periodic
             if needdata && withdata
-                @. gΠ = Πe(t, xg, yg)
+                # Fill on the device grids (== host grids on CPU) so the
+                # buffers match the backend the BC kernel reads from.
+                @. gΠ = Πe(t, xg_d, yg_d)
                 if curv_dir
-                    @. gDx = Dxe(t, xg, yg); @. gDy = Dye(t, xg, yg)
+                    @. gDx = Dxe(t, xg_d, yg_d); @. gDy = Dye(t, xg_d, yg_d)
                 else
-                    @. gΦ = Φe(t, xg, yg)
+                    @. gΦ = Φe(t, xg_d, yg_d)
                 end
             end
-            bc2d = make_bc2d(kinds; gΦ, gΠ, gDx, gDy)
+            bc2d = make_bc2d(kinds; gΦ, gΠ, gDx, gDy, excision_tag = exc_tag)
         end
         wave2d_curved_rhs!(Φ̇, Π̇, Φ, Π, p.coef; p.geom, p.ops, p.ws,
                            ε_KO = T(ε_KO), bc2d, metric = p.metric)
@@ -679,7 +730,7 @@ function evolve2d(; T::Type = Float64,
     Φref = similar(Φh)
     Hphys_h = geom_host.Hphys
     ws_h = on_cpu ? ws : make_wave2d_workspace(geom_host, ops)
-    coef_h = on_cpu ? coef : make_coef2d(geom_host)
+    # coef_h was allocated above (used for boundary classification too).
 
     prog = Progress(Nt; desc = "evolve2d (M=$M, bg=$background, " *
                     "backend=$(typeof(backend).name.name)): ",
@@ -698,11 +749,11 @@ function evolve2d(; T::Type = Float64,
         else
             fill!(Φref, zero(T))
         end
-        Hw = curv ? metric.Hd : Hphys_h
+        Hw = curv ? metric_host.Hd : Hphys_h
         l2_err[n] = sqrt(sum(@. (Φh - Φref)^2 * Hw))
         sample_background2d!(coef_h, bg, ta, xg, yg)
         energy[n] = wave2d_energy(Φh, Πh, coef_h; geom = geom_host, ops,
-                                  ws = ws_h, metric)
+                                  ws = ws_h, metric = metric_host)
     end
     finish!(prog)
 
@@ -713,19 +764,23 @@ function evolve2d(; T::Type = Float64,
               integrator_name = nameof(typeof(alg)))
 end
 
-# Built-in 2D backgrounds with exact scalar-wave solutions.
-# Returns (bg::Background2D, Φe(t,x,y), Πe(t,x,y), max_speed).
-function _background2d(kind::Symbol, ::Type{T}; A, d, shift) where {T}
+# Built-in 2D backgrounds. Returns
+# (bg::Background2D, Φe, Πe, Dxe, Dye, max_speed). Backgrounds with an
+# exact scalar-wave solution fill the closures; `:radial_shift` has none
+# (use ic=:noise) and returns zero closures.
+function _background2d(kind::Symbol, ::Type{T}; A, d, shift, R1 = 0, R2 = 1) where {T}
     if kind === :minkowski || kind === :constant_shift
         bx, by = kind === :minkowski ? (zero(T), zero(T)) :
                  (T(shift[1]), T(shift[2]))
         bg = AnalyticBackground2D(_Const3(one(T)), _ConstVec2(bx, by),
                                   _ConstMet2(one(T), zero(T), one(T)))
-        # Diagonal plane wave Φ = sin(2π(x+y) − ωt); dispersion (α=γ=1)
-        # ω = β·k + |k| with k = 2π(1,1): ω = 2π(bx+by) + 2π√2.
-        k = 2 * T(π); ω = k * (bx + by) + k * sqrt(T(2))
+        # Diagonal plane wave Φ = sin(2π(x+y) − ωt). For ∂_tΦ=β·∇Φ+Π,
+        # ∂_tΠ=∇·(βΠ+∇Φ) the dispersion is (ω+β·k)²=|k|², so the physical
+        # branch is ω = −β·k + |k| (NOT +β·k): with k=2π(1,1),
+        # ω = −2π(bx+by) + 2π√2.
+        k = 2 * T(π); ω = -k * (bx + by) + k * sqrt(T(2))
         Φe = (t,x,y) -> sin(k*(x+y) - ω*t)
-        # Π = ∂_tΦ − βⁱ∂_iΦ = (−ω − k(bx+by))cos.
+        # Π = ∂_tΦ − βⁱ∂_iΦ = (−ω − k(bx+by))cos = −k√2·cos (β-independent).
         Πe = (t,x,y) -> (-ω - k*(bx+by)) * cos(k*(x+y) - ω*t)
         Dxe = (t,x,y) -> k * cos(k*(x+y) - ω*t)      # ∂_xΦ = ∂_yΦ
         return bg, Φe, Πe, Dxe, Dxe, abs(bx) + abs(by) + sqrt(T(2))
@@ -739,10 +794,46 @@ function _background2d(kind::Symbol, ::Type{T}; A, d, shift) where {T}
         Dxe = (t,x,y) -> k₀*(1 - 2C*kᵥ*sin(kᵥ*(x-t)))*cos(k₀*ψ(t,x))
         Dye = (t,x,y) -> zero(T)
         return bg, Φe, Πe, Dxe, Dye, one(T)
+    elseif kind === :radial_shift
+        # Flat space (α=1, γ=I) with a radial shift whose magnitude ramps
+        # LINEARLY in r from `V` (>1) at the inner radius R1 to `V_out`
+        # (<0.1) at the outer radius R2:
+        #   β_r(r) = V + (V_out − V)·(r − R1)/(R2 − R1),  β = β_r·(x,y)/r.
+        # The radial characteristic speeds are dr/dt = −(β_r ± a) (this
+        # solver advects with +βⁱ∂_iΦ; a = α√γ^rr = 1). At R1 both are
+        # < 0 (V > 1 ⇒ both characteristics fall into the hole) → the
+        # inner circle is SUPERLUMINAL OUTFLOW, correctly handled by
+        # EXCISION (no SAT). At R2 the face is subluminal ⇒ Sommerfeld.
+        # Because dr/dt = −(β_r ± a), infall (outflow at the inner
+        # circle) corresponds to β_r > 0 — the shift VECTOR points
+        # radially outward even though matter falls inward; the opposite
+        # sign (β_r < −1) would be superluminal INFLOW (full-Dirichlet),
+        # which is out of scope. A linear ramp is used so the shift is
+        # well resolved on the grid (a steep 1/r² profile would be
+        # under-resolved and drive a spurious variable-β instability). No
+        # analytic solution → use ic=:noise. `A` sets V. max_speed = V+1.
+        V = T(A); R1v = T(R1); R2v = T(R2); Vout = T(1)/20
+        bg = AnalyticBackground2D(_Const3(one(T)),
+                                  _RadialShift2(V, Vout, R1v, R2v),
+                                  _ConstMet2(one(T), zero(T), one(T)))
+        z = (t,x,y) -> zero(T)
+        return bg, z, z, z, z, V + one(T)
     else
-        error("evolve2d: unknown background $kind " *
-              "(:minkowski, :constant_shift, :gaugewave)")
+        error("evolve2d: unknown background $kind (:minkowski, " *
+              ":constant_shift, :gaugewave, :radial_shift)")
     end
+end
+
+# Radial shift with magnitude ramping linearly in r from `Vin` at `R1`
+# to `Vout` at `R2`: β = β_r(r)·(x,y)/r. With β_r > 0 the radial
+# characteristic speeds −(β_r ± a) are negative (matter falls inward),
+# making the inner circle a superluminal-outflow / excision surface.
+struct _RadialShift2{T}; Vin::T; Vout::T; R1::T; R2::T; end
+function (f::_RadialShift2)(t, x, y)
+    r = sqrt(x*x + y*y)
+    βr = f.Vin + (f.Vout - f.Vin) * (r - f.R1) / (f.R2 - f.R1)
+    s = βr / r
+    return (s * x, s * y)
 end
 
 # isbits callable closures so the backgrounds pass into GPU kernels.
