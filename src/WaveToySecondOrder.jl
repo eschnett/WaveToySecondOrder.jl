@@ -105,6 +105,12 @@ include("wave1d.jl")
 include("boundaries2d.jl")
 include("wave2d_curved.jl")
 
+# `boundaries3d.jl` / `wave3d_curved.jl`: conservative-form 3D scalar
+# wave on a 3+1 ADM background (uniform_hex / axis-aligned affine for
+# Milestone 1), the 3D analog of the 2D conservative path.
+include("boundaries3d.jl")
+include("wave3d_curved.jl")
+
 # `evolve.jl`: high-level drivers `evolve1d`, `evolve2d`, `evolve3d`.
 # Each builds the geometry, runs the time integration, samples a
 # spacetime slice + L² error, and returns a NamedTuple consumed by
@@ -155,6 +161,10 @@ export
     sample_background2d!, make_coef2d,
     Wave2DWorkspace, make_wave2d_workspace,
     wave2d_curved_rhs!, wave2d_energy,
+    Background3D, AnalyticBackground3D, MetricBackground3D,
+    sample_background3d!, make_coef3d,
+    Wave3DWorkspace, make_wave3d_workspace,
+    wave3d_curved_rhs!, wave3d_energy,
     classify_face2d, make_bc2d,
     # Wave-equation layer — 2D
     Params2d, initialize2d!,
