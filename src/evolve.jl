@@ -866,7 +866,7 @@ Sommerfeld outer BC option on `:inflated_cube`.
 Returned NamedTuple keys mirror `evolve2d`'s plus `z_target` and
 `sommerfeld_R`.
 """
-function evolve3d(; T::Type = Float64,
+function _evolve3d_strong(; T::Type = Float64,
                     backend = CPU(),
                     mesh_kind::Symbol = :cubical,
                     ic_kind::Symbol = :cartesian,
@@ -1061,5 +1061,228 @@ function evolve3d(; T::Type = Float64,
               mesh, geom = geom_host, elem, ops, params,
               x0, x1, dt, dx, y_target, z_target,
               sommerfeld_R, ic_kind, mesh_kind, outer_bc,
+              integrator_name = nameof(typeof(alg)))
+end
+
+"""
+    evolve3d(; formulation = :strong, kwargs...)
+
+3D wave driver. `formulation = :strong` (default) is the second-order
+Laplacian wave (`_evolve3d_strong`, symplectic). `formulation =
+:conservative` is the first-order ADM (Φ,Π) wave (`_evolve3d_conservative`,
+explicit RK), the 3D analog of `evolve2d`. The two take different kwargs.
+"""
+function evolve3d(; formulation::Symbol = :strong, kwargs...)
+    formulation === :conservative && return _evolve3d_conservative(; kwargs...)
+    formulation === :strong ||
+        throw(ArgumentError("evolve3d: formulation must be :strong or " *
+                            ":conservative; got $formulation"))
+    return _evolve3d_strong(; kwargs...)
+end
+
+# (i,j,k,e) of a representative node on boundary side `f` (1=−x..6=+z) of
+# an axis-aligned 3D mesh — the first boundary element on that side, at
+# the side's row and mid tangential node.
+function _side_node_3d(geom, f, N)
+    bdry = geom.conn.bdry
+    a_idx = (f + 1) ÷ 2
+    row = isodd(f) ? 1 : N
+    mid = (N + 1) ÷ 2
+    @inbounds for e in 1:geom.Ne
+        bdry[f, e] == 0 && continue
+        return a_idx == 1 ? (row, mid, mid, e) :
+               a_idx == 2 ? (mid, row, mid, e) : (mid, mid, row, e)
+    end
+    return (1, 1, 1, 1)
+end
+
+# Built-in 3D ADM backgrounds. Returns
+# (bg::Background3D, Φe, Πe, Dxe, Dye, Dze, max_speed).
+function _background3d(kind::Symbol, ::Type{T}; shift) where {T}
+    if kind === :minkowski || kind === :constant_shift
+        bx, by, bz = kind === :minkowski ? (zero(T), zero(T), zero(T)) :
+                     (T(shift[1]), T(shift[2]), T(shift[3]))
+        bg = AnalyticBackground3D(_Const4(one(T)), _ConstVec3(bx, by, bz),
+                                  _ConstMet3(one(T), zero(T), zero(T),
+                                             one(T), zero(T), one(T)))
+        # Φ = sin(k(x+y+z) − ωt); dispersion (ω+β·k)²=|k|² ⇒ ω = −β·k + |k|,
+        # k = 2π(1,1,1): ω = −2π(bx+by+bz) + 2π√3.
+        k = 2 * T(π); s = bx + by + bz; ω = -k * s + k * sqrt(T(3))
+        Φe = (t,x,y,z) -> sin(k*(x+y+z) - ω*t)
+        Πe = (t,x,y,z) -> (-ω - k*s) * cos(k*(x+y+z) - ω*t)   # = −k√3·cos
+        De = (t,x,y,z) -> k * cos(k*(x+y+z) - ω*t)            # ∂_xΦ=∂_yΦ=∂_zΦ
+        return bg, Φe, Πe, De, De, De, abs(bx)+abs(by)+abs(bz)+sqrt(T(3))
+    else
+        error("evolve3d (conservative): unknown background $kind " *
+              "(:minkowski, :constant_shift)")
+    end
+end
+
+# Conservative first-order (Φ,Π) ADM 3D wave driver — the 3D analog of
+# evolve2d. Milestone 1: axis-aligned affine `uniform_hex` only.
+function _evolve3d_conservative(; T::Type = Float64,
+                    backend = CPU(),
+                    N::Int = 4,
+                    M::Int = 8,
+                    x0::Real = 0, x1::Real = 1,
+                    mesh_kind::Symbol = :cubical,
+                    background::Symbol = :minkowski,
+                    shift = (0.0, 0.0, 0.0),
+                    ic::Symbol = :exact,
+                    bc = :periodic,
+                    ic_width::Real = 0.15,
+                    noise_amp::Real = sqrt(eps(Float64)),
+                    ε_KO::Real = 0,
+                    t0::Real = 0, t1::Real = 1, Nt::Int = 200,
+                    cfl::Real = 1//10,
+                    slice_y::Union{Nothing, Real} = nothing,
+                    slice_z::Union{Nothing, Real} = nothing)
+    on_cpu = backend isa CPU
+    on_cpu || T <: AbstractFloat ||
+        error("evolve3d: non-CPU backend requires a floating-point T; got $T")
+    mesh_kind === :cubical ||
+        error("evolve3d conservative: only :cubical (uniform_hex) in " *
+              "Milestone 1; curvilinear is Milestone 2")
+    periodic = bc === :periodic
+
+    mesh = make_uniform_hex(T, M, T(x0), T(x1); periodic = periodic)
+    elem = make_element(T, N); ops = make_operators(elem)
+    geom_host = make_geometry(mesh, elem)
+    geom = on_cpu ? geom_host : to_device(geom_host, backend)
+    ws   = make_wave3d_workspace(geom, ops)
+    coef = make_coef3d(geom)
+
+    xg = reshape(copy(geom_host.coords[1,:,:,:,:]), N, N, N, mesh.Ne)
+    yg = reshape(copy(geom_host.coords[2,:,:,:,:]), N, N, N, mesh.Ne)
+    zg = reshape(copy(geom_host.coords[3,:,:,:,:]), N, N, N, mesh.Ne)
+    xg_d = on_cpu ? xg : copyto!(similar(coef.alpha), xg)
+    yg_d = on_cpu ? yg : copyto!(similar(coef.alpha), yg)
+    zg_d = on_cpu ? zg : copyto!(similar(coef.alpha), zg)
+
+    bg, Φe, Πe, Dxe, Dye, Dze, max_speed = _background3d(background, T; shift)
+    coef_h = on_cpu ? coef : make_coef3d(geom_host)
+
+    dx_min = _min_node_spacing_3d(geom_host.coords)
+    dt = T(cfl) * dx_min / max_speed
+    if ε_KO != 0
+        dt = min(dt, T(1.4) / (T(ε_KO) * ws.μ))
+    end
+
+    # Boundary setup (rectangular: classify the 6 sides on the host).
+    local kinds::NTuple{6,Int}
+    if !periodic
+        sample_background3d!(coef_h, bg, T(t0), xg, yg, zg)
+        side_axis = (1,1,2,2,3,3); side_sign = (-1,1,-1,1,-1,1)
+        classes = ntuple(6) do f
+            i,j,k,e = _side_node_3d(geom_host, f, N)
+            classify_face3d(coef_h.alpha[i,j,k,e], coef_h.b1[i,j,k,e],
+                            coef_h.b2[i,j,k,e], coef_h.b3[i,j,k,e],
+                            coef_h.gu11[i,j,k,e], coef_h.gu22[i,j,k,e],
+                            coef_h.gu33[i,j,k,e], side_axis[f], side_sign[f])
+        end
+        autopick(c) = c == FACE_SUBLUMINAL ? BC_SOMMERFELD :
+                      c == FACE_OUTFLOW    ? BC_EXCISION : BC_FULL_DIRICHLET
+        if bc === :auto
+            kinds = ntuple(f -> autopick(classes[f]), 6)
+        elseif bc isa Tuple
+            kinds = ntuple(f -> bc1d_kind(bc[f]), 6)
+        else
+            throw(ArgumentError("evolve3d: bc must be :periodic, :auto, or " *
+                                "a 6-tuple; got $bc"))
+        end
+        for f in 1:6
+            validate_bc1d(classes[f], kinds[f],
+                          ("−x","+x","−y","+y","−z","+z")[f] * " side")
+        end
+    else
+        kinds = ntuple(_ -> BC_SOMMERFELD, 6)
+    end
+
+    # IC.
+    Φ0 = Array{T,4}(undef, N, N, N, mesh.Ne); Π0 = similar(Φ0)
+    if ic === :exact
+        @. Φ0 = Φe(T(t0), xg, yg, zg); @. Π0 = Πe(T(t0), xg, yg, zg)
+    elseif ic === :gaussian
+        w = T(ic_width); c0 = T((x0 + x1) / 2)
+        @. Φ0 = exp(-((xg-c0)^2 + (yg-c0)^2 + (zg-c0)^2) / (2 * w^2))
+        fill!(Π0, zero(T))
+    elseif ic === :noise
+        Φ0 .= T(noise_amp) .* randn(T, N, N, N, mesh.Ne)
+        Π0 .= T(noise_amp) .* randn(T, N, N, N, mesh.Ne)
+    else
+        error("evolve3d: unknown ic $ic")
+    end
+    Φdev = on_cpu ? Φ0 : copyto!(similar(coef.alpha), Φ0)
+    Πdev = on_cpu ? Π0 : copyto!(similar(coef.alpha), Π0)
+
+    withdata = ic === :exact
+    needdata = !periodic && any(==(BC_FULL_DIRICHLET), kinds)
+    _gbuf() = fill!(similar(coef.alpha), zero(T))
+    gΦ = needdata ? _gbuf() : nothing
+    gΠ = needdata ? _gbuf() : nothing
+
+    p = (; geom, ops, ws, coef, bg, xg = xg_d, yg = yg_d, zg = zg_d)
+    function rhs!(du, u, p, t)
+        Φ, Π = u.x[1], u.x[2]; Φ̇, Π̇ = du.x[1], du.x[2]
+        sample_background3d!(p.coef, p.bg, t, p.xg, p.yg, p.zg)
+        bc3d = nothing
+        if !periodic
+            if needdata && withdata
+                @. gΦ = Φe(t, xg_d, yg_d, zg_d); @. gΠ = Πe(t, xg_d, yg_d, zg_d)
+            end
+            bc3d = make_bc3d(kinds; gΦ, gΠ)
+        end
+        wave3d_curved_rhs!(Φ̇, Π̇, Φ, Π, p.coef; p.geom, p.ops, p.ws,
+                           ε_KO = T(ε_KO), bc3d)
+        return nothing
+    end
+
+    alg  = pick_integrator_first_order(N)
+    prob = ODEProblem(rhs!, ArrayPartition(Φdev, Πdev), (T(t0), T(t1)), p)
+    integrator = init(prob, alg; dt, adaptive = false,
+                      save_everystep = false, save_start = false,
+                      save_end = false, dense = false)
+
+    y_target = T(slice_y === nothing ? (x0 + x1) / 2 : slice_y)
+    z_target = T(slice_z === nothing ? (x0 + x1) / 2 : slice_z)
+    slice_idx, xs_line = _build_slice_3d(geom_host.coords, y_target, z_target;
+                                         atol = sqrt(eps(T)))
+    isempty(xs_line) && error("evolve3d: slice y=$y_target z=$z_target hit no nodes")
+    perm = sortperm(xs_line); xs_line = xs_line[perm]; sidx = slice_idx[perm]
+
+    ts = range(T(t0), T(t1), Nt); Ns = length(xs_line)
+    Φs = Array{T}(undef, Ns, Nt); Πs = similar(Φs)
+    ts_actual = Vector{T}(undef, Nt)
+    l2_err = Vector{T}(undef, Nt); energy = Vector{T}(undef, Nt)
+    Φh = Array{T,4}(undef, N, N, N, mesh.Ne); Πh = similar(Φh); Φref = similar(Φh)
+    ws_h = on_cpu ? ws : make_wave3d_workspace(geom_host, ops)
+
+    prog = Progress(Nt; desc = "evolve3d-cons (M=$M, bg=$background, " *
+                    "backend=$(typeof(backend).name.name)): ",
+                    barlen = 30, showspeed = true)
+    for (n, t) in enumerate(ts)
+        while integrator.t < t; step!(integrator); end
+        next!(prog)
+        ta = T(integrator.t); ts_actual[n] = ta
+        copyto!(Φh, integrator.u.x[1]); copyto!(Πh, integrator.u.x[2])
+        @assert all(isfinite, Φh) && all(isfinite, Πh)
+        for (q, (e, ii, jj, kk)) in enumerate(sidx)
+            Φs[q, n] = Φh[ii, jj, kk, e]; Πs[q, n] = Πh[ii, jj, kk, e]
+        end
+        if ic === :exact
+            @. Φref = Φe(ta, xg, yg, zg)
+        else
+            fill!(Φref, zero(T))
+        end
+        l2_err[n] = sqrt(sum(@. (Φh - Φref)^2 * geom_host.Hphys))
+        sample_background3d!(coef_h, bg, ta, xg, yg, zg)
+        energy[n] = wave3d_energy(Φh, Πh, coef_h; geom = geom_host, ops, ws = ws_h)
+    end
+    finish!(prog)
+
+    return (; ts, ts_actual, xs_line, perm, Φs, Πs, l2_err, energy,
+              Φ_final = copy(Φh), Π_final = copy(Πh),
+              mesh, geom = geom_host, elem, ops, background, ic, bc, mesh_kind,
+              x0 = T(x0), x1 = T(x1), dt, dx = dx_min, y_target, z_target,
               integrator_name = nameof(typeof(alg)))
 end
