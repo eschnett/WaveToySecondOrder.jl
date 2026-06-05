@@ -1,16 +1,22 @@
 # 3D conservative scalar-wave app: evolve the first-order (Φ,Π) system on
-# a 3+1 ADM background (`W.evolve3d(; formulation = :conservative)`) on the
-# axis-aligned uniform_hex mesh (Milestone 1), and render an x-slice
-# spacetime heatmap, total energy vs time, and L² error vs time. PNG +
-# Sixel.
+# a 3+1 ADM background (`W.evolve3d(; formulation = :conservative)`), on
+# the axis-aligned uniform_hex mesh OR a curvilinear mesh (cubed-cube /
+# inflated-cube / radial-shell), and render an x-slice spacetime heatmap,
+# total energy vs time, and L² error vs time. PNG + Sixel.
 #
 #     julia --project bin/wave3d.jl --N 4 --M 8 --background minkowski
 #     julia --project bin/wave3d.jl --background constant_shift --shift 0.1,0.0,0.0 \
 #           --bc auto --ic gaussian --eps-ko 0.1
+#     julia --project bin/wave3d.jl --mesh cubed_cube --bc sommerfeld \
+#           --ic gaussian --eps-ko 0.1
+#     julia --project bin/wave3d.jl --mesh radial_shell --background radial_shift \
+#           --shift 2.0,0,0 --ic noise --bc sommerfeld --eps-ko 0.1
 #
-# Flags: --N --M --x0 --x1 --background (minkowski|constant_shift)
-# --shift (e.g. 0.1,0.0,0.0) --ic (exact|gaussian|noise) --ic-width --bc
-# (periodic|auto) --eps-ko --t1 --Nt --type --backend --out.
+# Flags: --N --M --x0 --x1 --mesh (cubical|cubed_cube|inflated_cube|
+# radial_shell) --R --L --R1 --R2 --background (minkowski|constant_shift|
+# radial_shift) --shift (e.g. 0.1,0.0,0.0) --ic (exact|gaussian|noise)
+# --ic-width --bc (periodic|auto|sommerfeld|dirichlet) --eps-ko --t1 --Nt
+# --type --backend --out.
 
 using WaveToySecondOrder
 const W = WaveToySecondOrder
@@ -20,9 +26,15 @@ import KernelAbstractions
 
 function _plot3d(res, out)
     fig = Figure(size = (800, 280))
-    ax1 = Axis(fig[1, 1]; title = "Φ on x-slice (y=z=$(round(res.y_target, digits=2)))",
-               xlabel = "x", ylabel = "t")
-    heatmap!(ax1, res.xs_line, res.ts, res.Φs; colormap = :balance)
+    # Curvilinear meshes often have no node exactly on the x-axis, so the
+    # diagnostic 1-D slice can be empty — fall back to an energy panel.
+    if isempty(res.xs_line)
+        ax1 = Axis(fig[1, 1]; title = "(no x-slice on this mesh)")
+    else
+        ax1 = Axis(fig[1, 1]; title = "Φ on x-slice (y=z=$(round(res.y_target, digits=2)))",
+                   xlabel = "x", ylabel = "t")
+        heatmap!(ax1, res.xs_line, res.ts, res.Φs; colormap = :balance)
+    end
     ax2 = Axis(fig[1, 2]; title = "energy", xlabel = "t")
     lines!(ax2, res.ts_actual, res.energy)
     ax3 = Axis(fig[1, 3]; title = "L² error", xlabel = "t", yscale = log10)
@@ -71,6 +83,9 @@ function main3d_cli(args)
     return Base.invokelatest(main3d; T, backend,
         N = parse(Int, get(o, "N", "4")), M = parse(Int, get(o, "M", "8")),
         x0 = parse(Float64, get(o, "x0", "0")), x1 = parse(Float64, get(o, "x1", "1")),
+        mesh_kind = Symbol(get(o, "mesh", "cubical")),
+        R = parse(Float64, get(o, "R", "0.3")), L = parse(Float64, get(o, "L", "0.2")),
+        R1 = parse(Float64, get(o, "R1", "0.5")), R2 = parse(Float64, get(o, "R2", "1.0")),
         background = Symbol(get(o, "background", "minkowski")),
         shift, ic = Symbol(get(o, "ic", "exact")), bc,
         ic_width = parse(Float64, get(o, "ic-width", "0.15")),

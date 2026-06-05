@@ -836,6 +836,14 @@ function (f::_RadialShift2)(t, x, y)
     return (s * x, s * y)
 end
 
+struct _RadialShift3{T}; Vin::T; Vout::T; R1::T; R2::T; end
+function (f::_RadialShift3)(t, x, y, z)
+    r = sqrt(x*x + y*y + z*z)
+    βr = f.Vin + (f.Vout - f.Vin) * (r - f.R1) / (f.R2 - f.R1)
+    s = βr / r
+    return (s * x, s * y, s * z)
+end
+
 # isbits callable closures so the backgrounds pass into GPU kernels.
 struct _Const3{T}; v::T; end
 (f::_Const3)(t, x, y) = f.v
@@ -1098,7 +1106,7 @@ end
 
 # Built-in 3D ADM backgrounds. Returns
 # (bg::Background3D, Φe, Πe, Dxe, Dye, Dze, max_speed).
-function _background3d(kind::Symbol, ::Type{T}; shift) where {T}
+function _background3d(kind::Symbol, ::Type{T}; shift, R1 = 0, R2 = 1) where {T}
     if kind === :minkowski || kind === :constant_shift
         bx, by, bz = kind === :minkowski ? (zero(T), zero(T), zero(T)) :
                      (T(shift[1]), T(shift[2]), T(shift[3]))
@@ -1112,9 +1120,27 @@ function _background3d(kind::Symbol, ::Type{T}; shift) where {T}
         Πe = (t,x,y,z) -> (-ω - k*s) * cos(k*(x+y+z) - ω*t)   # = −k√3·cos
         De = (t,x,y,z) -> k * cos(k*(x+y+z) - ω*t)            # ∂_xΦ=∂_yΦ=∂_zΦ
         return bg, Φe, Πe, De, De, De, abs(bx)+abs(by)+abs(bz)+sqrt(T(3))
+    elseif kind === :radial_shift
+        # 3D analog of the 2D annulus excision: flat space (α=1, γ=I)
+        # with a radial shift ramping LINEARLY in r from `V` (>1) at the
+        # inner radius R1 to `V_out` (<0.1) at the outer radius R2,
+        #   β_r(r) = V + (V_out − V)·(r − R1)/(R2 − R1),  β = β_r·x⃗/r.
+        # Radial characteristic speeds dr/dt = −(β_r ± a), a = α√γ^rr = 1.
+        # At R1 (V > 1) both are < 0 ⇒ inner sphere is SUPERLUMINAL
+        # OUTFLOW → EXCISION (no SAT); at R2 the face is subluminal ⇒
+        # Sommerfeld. A linear ramp keeps the shift well resolved (a
+        # steep 1/r² profile would be under-resolved). No analytic
+        # solution → use ic=:noise. `shift[1]` sets V. max_speed = V+1.
+        V = T(shift[1]); Vout = T(1)/20
+        bg = AnalyticBackground3D(_Const4(one(T)),
+                                  _RadialShift3(V, Vout, T(R1), T(R2)),
+                                  _ConstMet3(one(T), zero(T), zero(T),
+                                             one(T), zero(T), one(T)))
+        z = (t,x,y,z) -> zero(T)
+        return bg, z, z, z, z, z, V + one(T)
     else
         error("evolve3d (conservative): unknown background $kind " *
-              "(:minkowski, :constant_shift)")
+              "(:minkowski, :constant_shift, :radial_shift)")
     end
 end
 
@@ -1126,6 +1152,7 @@ function _evolve3d_conservative(; T::Type = Float64,
                     M::Int = 8,
                     x0::Real = 0, x1::Real = 1,
                     mesh_kind::Symbol = :cubical,
+                    R::Real = 0.3, L::Real = 0.2, R1::Real = 0.5, R2::Real = 1.0,
                     background::Symbol = :minkowski,
                     shift = (0.0, 0.0, 0.0),
                     ic::Symbol = :exact,
@@ -1140,17 +1167,33 @@ function _evolve3d_conservative(; T::Type = Float64,
     on_cpu = backend isa CPU
     on_cpu || T <: AbstractFloat ||
         error("evolve3d: non-CPU backend requires a floating-point T; got $T")
-    mesh_kind === :cubical ||
-        error("evolve3d conservative: only :cubical (uniform_hex) in " *
-              "Milestone 1; curvilinear is Milestone 2")
-    periodic = bc === :periodic
+    curv = mesh_kind !== :cubical
+    periodic = (bc === :periodic) && !curv
+    outer = (bc === :periodic || bc === :dirichlet) ? :dirichlet : :sommerfeld
 
-    mesh = make_uniform_hex(T, M, T(x0), T(x1); periodic = periodic)
+    if mesh_kind === :cubical
+        mesh = make_uniform_hex(T, M, T(x0), T(x1); periodic = periodic)
+    elseif mesh_kind === :cubed_cube
+        mesh = make_cubed_cube_mesh(T, M, T(R)); x0, x1 = -one(T), one(T)
+    elseif mesh_kind === :inflated_cube
+        mesh = make_inflated_cube_mesh(T, T(L), T(R1), T(R2), M; outer_bc = outer)
+        x0, x1 = -T(R2), T(R2)
+    elseif mesh_kind === :radial_shell
+        mesh = make_radial_shell_mesh(T, T(R1), T(R2), M;
+                                      inner_bc = :excision, outer_bc = outer)
+        x0, x1 = -T(R2), T(R2)
+    else
+        error("evolve3d conservative: unknown mesh_kind $mesh_kind " *
+              "(:cubical, :cubed_cube, :inflated_cube, :radial_shell)")
+    end
     elem = make_element(T, N); ops = make_operators(elem)
     geom_host = make_geometry(mesh, elem)
     geom = on_cpu ? geom_host : to_device(geom_host, backend)
     ws   = make_wave3d_workspace(geom, ops)
     coef = make_coef3d(geom)
+    metric_host = curv ? make_metric_terms3d(geom_host, ops) : nothing
+    metric = !curv ? nothing :
+             on_cpu ? metric_host : metric_to_device(metric_host, backend)
 
     xg = reshape(copy(geom_host.coords[1,:,:,:,:]), N, N, N, mesh.Ne)
     yg = reshape(copy(geom_host.coords[2,:,:,:,:]), N, N, N, mesh.Ne)
@@ -1159,7 +1202,8 @@ function _evolve3d_conservative(; T::Type = Float64,
     yg_d = on_cpu ? yg : copyto!(similar(coef.alpha), yg)
     zg_d = on_cpu ? zg : copyto!(similar(coef.alpha), zg)
 
-    bg, Φe, Πe, Dxe, Dye, Dze, max_speed = _background3d(background, T; shift)
+    bg, Φe, Πe, Dxe, Dye, Dze, max_speed =
+        _background3d(background, T; shift, R1 = T(R1), R2 = T(R2))
     coef_h = on_cpu ? coef : make_coef3d(geom_host)
 
     dx_min = _min_node_spacing_3d(geom_host.coords)
@@ -1168,9 +1212,20 @@ function _evolve3d_conservative(; T::Type = Float64,
         dt = min(dt, T(1.4) / (T(ε_KO) * ws.μ))
     end
 
-    # Boundary setup (rectangular: classify the 6 sides on the host).
+    # Boundary setup. Curvilinear: a single outer kind (Sommerfeld /
+    # Dirichlet); radial-shell additionally excises the inner sphere
+    # (tag 8). Rectangular: classify the 6 sides on the host.
     local kinds::NTuple{6,Int}
-    if !periodic
+    if curv
+        ck = bc === :periodic ? :sommerfeld : bc
+        ck === :sommerfeld || ck === :dirichlet ||
+            throw(ArgumentError("evolve3d: curvilinear ($mesh_kind) bc must " *
+                "be :sommerfeld or :dirichlet; got $bc"))
+        ck === :dirichlet && ic !== :exact &&
+            throw(ArgumentError("evolve3d: curvilinear bc=:dirichlet requires " *
+                "ic=:exact (it injects the exact solution)"))
+        kinds = ntuple(_ -> bc1d_kind(ck), 6)
+    elseif !periodic
         sample_background3d!(coef_h, bg, T(t0), xg, yg, zg)
         side_axis = (1,1,2,2,3,3); side_sign = (-1,1,-1,1,-1,1)
         classes = ntuple(6) do f
@@ -1216,24 +1271,38 @@ function _evolve3d_conservative(; T::Type = Float64,
     Πdev = on_cpu ? Π0 : copyto!(similar(coef.alpha), Π0)
 
     withdata = ic === :exact
-    needdata = !periodic && any(==(BC_FULL_DIRICHLET), kinds)
+    curv_dir = curv && kinds[1] == BC_DIRICHLET
+    needdata = (!periodic && !curv && any(==(BC_FULL_DIRICHLET), kinds)) || curv_dir
     _gbuf() = fill!(similar(coef.alpha), zero(T))
-    gΦ = needdata ? _gbuf() : nothing
-    gΠ = needdata ? _gbuf() : nothing
+    gΦ  = needdata ? _gbuf() : nothing
+    gΠ  = needdata ? _gbuf() : nothing
+    gDx = curv_dir ? _gbuf() : nothing
+    gDy = curv_dir ? _gbuf() : nothing
+    gDz = curv_dir ? _gbuf() : nothing
+    # radial-shell inner sphere is tagged excision (8): the curvilinear
+    # BC gives those faces no SAT while kinds[1] drives the outer sphere.
+    exc_tag = mesh_kind === :radial_shell ? 8 : 0
 
-    p = (; geom, ops, ws, coef, bg, xg = xg_d, yg = yg_d, zg = zg_d)
+    p = (; geom, ops, ws, coef, bg, metric, xg = xg_d, yg = yg_d, zg = zg_d)
     function rhs!(du, u, p, t)
         Φ, Π = u.x[1], u.x[2]; Φ̇, Π̇ = du.x[1], du.x[2]
         sample_background3d!(p.coef, p.bg, t, p.xg, p.yg, p.zg)
         bc3d = nothing
         if !periodic
             if needdata && withdata
-                @. gΦ = Φe(t, xg_d, yg_d, zg_d); @. gΠ = Πe(t, xg_d, yg_d, zg_d)
+                @. gΠ = Πe(t, xg_d, yg_d, zg_d)
+                if curv_dir
+                    @. gDx = Dxe(t, xg_d, yg_d, zg_d)
+                    @. gDy = Dye(t, xg_d, yg_d, zg_d)
+                    @. gDz = Dze(t, xg_d, yg_d, zg_d)
+                else
+                    @. gΦ = Φe(t, xg_d, yg_d, zg_d)
+                end
             end
-            bc3d = make_bc3d(kinds; gΦ, gΠ)
+            bc3d = make_bc3d(kinds; gΦ, gΠ, gDx, gDy, gDz, excision_tag = exc_tag)
         end
         wave3d_curved_rhs!(Φ̇, Π̇, Φ, Π, p.coef; p.geom, p.ops, p.ws,
-                           ε_KO = T(ε_KO), bc3d)
+                           ε_KO = T(ε_KO), bc3d, metric = p.metric)
         return nothing
     end
 
@@ -1247,8 +1316,15 @@ function _evolve3d_conservative(; T::Type = Float64,
     z_target = T(slice_z === nothing ? (x0 + x1) / 2 : slice_z)
     slice_idx, xs_line = _build_slice_3d(geom_host.coords, y_target, z_target;
                                          atol = sqrt(eps(T)))
-    isempty(xs_line) && error("evolve3d: slice y=$y_target z=$z_target hit no nodes")
-    perm = sortperm(xs_line); xs_line = xs_line[perm]; sidx = slice_idx[perm]
+    # Diagnostic 1-D slice; curvilinear meshes often have no node exactly
+    # on the x-axis, in which case the slice is simply empty (not fatal).
+    local perm, sidx
+    if isempty(xs_line)
+        curv || error("evolve3d: slice y=$y_target z=$z_target hit no nodes")
+        perm = Int[]; sidx = slice_idx
+    else
+        perm = sortperm(xs_line); xs_line = xs_line[perm]; sidx = slice_idx[perm]
+    end
 
     ts = range(T(t0), T(t1), Nt); Ns = length(xs_line)
     Φs = Array{T}(undef, Ns, Nt); Πs = similar(Φs)
@@ -1274,9 +1350,11 @@ function _evolve3d_conservative(; T::Type = Float64,
         else
             fill!(Φref, zero(T))
         end
-        l2_err[n] = sqrt(sum(@. (Φh - Φref)^2 * geom_host.Hphys))
+        Hw = curv ? metric_host.Hd : geom_host.Hphys
+        l2_err[n] = sqrt(sum(@. (Φh - Φref)^2 * Hw))
         sample_background3d!(coef_h, bg, ta, xg, yg, zg)
-        energy[n] = wave3d_energy(Φh, Πh, coef_h; geom = geom_host, ops, ws = ws_h)
+        energy[n] = wave3d_energy(Φh, Πh, coef_h; geom = geom_host, ops,
+                                  ws = ws_h, metric = curv ? metric_host : nothing)
     end
     finish!(prog)
 

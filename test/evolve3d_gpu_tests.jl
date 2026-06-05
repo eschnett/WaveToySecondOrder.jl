@@ -39,6 +39,18 @@ if HAS_METAL
         _agree("non-periodic :auto Sommerfeld (gaussian)";
                mesh_kind = :cubical, M = 4, N = 4, background = :minkowski,
                ic = :gaussian, bc = :auto, ε_KO = 0.1, t1 = 0.2, Nt = 4, cfl = 0.1)
+        _agree("curvilinear cubed_cube Sommerfeld (gaussian)";
+               mesh_kind = :cubed_cube, M = 1, N = 4, R = 0.3,
+               background = :minkowski, ic = :gaussian, bc = :sommerfeld,
+               ε_KO = 0.1, t1 = 0.2, Nt = 4, cfl = 0.1)
+        # Deterministic IC (Gaussian, not noise) so the two runs share
+        # the same initial data; exercises the excision-tag skip + radial
+        # shift on Metal.
+        _agree("curvilinear radial_shell excision (gaussian)";
+               mesh_kind = :radial_shell, M = 2, N = 4, R1 = 0.5, R2 = 1.0,
+               background = :radial_shift, shift = (2.0f0, 0.0f0, 0.0f0),
+               ic = :gaussian, ic_width = 0.5, bc = :sommerfeld, ε_KO = 0.1,
+               t1 = 0.3, Nt = 4, cfl = 0.1)
     end
 end
 

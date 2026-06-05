@@ -136,6 +136,20 @@ function _apply_bc3d_curv!(Φ̇::AbstractArray{T,4}, Π̇::AbstractArray{T,4},
     kind = bc3d.kinds[1]
     exc = hasproperty(bc3d, :excision_tag) ? Int32(bc3d.excision_tag) : Int32(0)
     kind == BC_EXCISION && exc == 0 && return nothing
+    # Sommerfeld (incl. the radial-shell outer sphere with inner
+    # excision) needs neither the state targets nor Fdot: dispatch to a
+    # lean kernel that drops 7 array arguments. This keeps the curvilinear
+    # BC pass under Metal's 31-buffer indirect-argument limit, which the
+    # full kernel (≈27 array args) exceeds for the 3D inverse metric.
+    if kind == BC_SOMMERFELD
+        _bc3d_curv_sommerfeld_kernel!(backend, (N, N, N))(
+            Π̇, Π, ws.DΦ1, ws.DΦ2, ws.DΦ3, coef.alpha, coef.sqrtγ,
+            coef.gu11, coef.gu12, coef.gu13, coef.gu22, coef.gu23, coef.gu33,
+            coef.b1, coef.b2, coef.b3, geom.jac, geom.detjac, geom.handedness,
+            geom.conn.bdry, ops, exc, T(bc3d.σ), Val(N);
+            ndrange = (N, N, N, geom.Ne))
+        return nothing
+    end
     gΦ  = bc3d.gΦ  === nothing ? Φ : bc3d.gΦ
     gΠ  = bc3d.gΠ  === nothing ? Φ : bc3d.gΠ
     gDx = bc3d.gDx === nothing ? Φ : bc3d.gDx
@@ -214,5 +228,53 @@ end
         end
     end
     @inbounds Fdot[i,j,k,m] += dF
+    @inbounds Pdot[i,j,k,m] += dP
+end
+
+# Lean Sommerfeld-only curvilinear BC kernel (no state-target buffers, no
+# Fdot). Faces tagged `excision_tag` get no SAT. Mathematically identical
+# to the `BC_SOMMERFELD` branch of `_bc3d_curv_kernel!`; exists purely to
+# stay under Metal's indirect-argument-buffer limit for the 3D metric.
+@kernel function _bc3d_curv_sommerfeld_kernel!(Pdot, @Const(P),
+        @Const(DΦ1), @Const(DΦ2), @Const(DΦ3), @Const(alpha), @Const(sqrtγ),
+        @Const(gu11), @Const(gu12), @Const(gu13), @Const(gu22), @Const(gu23),
+        @Const(gu33), @Const(b1), @Const(b2), @Const(b3), @Const(jac),
+        @Const(detjac), @Const(handed), @Const(bdry), ops, excision_tag, σ,
+        ::Val{N}) where {N}
+    i, j, k, m = @index(Global, NTuple)
+    T = eltype(Pdot)
+    dP = zero(T)
+    @inbounds for f in 1:6
+        bdry[f, m] == 0 && continue
+        bdry[f, m] == excision_tag && continue
+        a_idx = (f + 1) ÷ 2
+        row = isodd(f) ? 1 : N
+        on = a_idx == 1 ? (i == row) : a_idx == 2 ? (j == row) : (k == row)
+        on || continue
+        axis_p = a_idx == 1 ? 2 : 1
+        axis_q = a_idx == 3 ? 2 : 3
+        sgn_f = isodd(f) ? -one(T) : one(T)
+        sgn_c = a_idx == 2 ? -one(T) : one(T)
+        sgn_out = sgn_f * sgn_c * T(handed[m])
+        tpx = jac[1,axis_p,i,j,k,m]; tpy = jac[2,axis_p,i,j,k,m]; tpz = jac[3,axis_p,i,j,k,m]
+        tqx = jac[1,axis_q,i,j,k,m]; tqy = jac[2,axis_q,i,j,k,m]; tqz = jac[3,axis_q,i,j,k,m]
+        nfx = sgn_out * (tpy*tqz - tpz*tqy)
+        nfy = sgn_out * (tpz*tqx - tpx*tqz)
+        nfz = sgn_out * (tpx*tqy - tpy*tqx)
+        JF = sqrt(nfx*nfx + nfy*nfy + nfz*nfz)
+        nx = nfx/JF; ny = nfy/JF; nz = nfz/JF
+        αv = alpha[i,j,k,m]; sγ = sqrtγ[i,j,k,m]
+        g11=gu11[i,j,k,m]; g12=gu12[i,j,k,m]; g13=gu13[i,j,k,m]
+        g22=gu22[i,j,k,m]; g23=gu23[i,j,k,m]; g33=gu33[i,j,k,m]
+        a   = αv / sγ
+        a_n = αv * sqrt(g11*nx*nx + g22*ny*ny + g33*nz*nz +
+                        2*g12*nx*ny + 2*g13*nx*nz + 2*g23*ny*nz)
+        βn  = b1[i,j,k,m]*nx + b2[i,j,k,m]*ny + b3[i,j,k,m]*nz
+        wt  = JF / (ops.H[row, row] * detjac[i,j,k,m])
+        q = nx*DΦ1[i,j,k,m] + ny*DΦ2[i,j,k,m] + nz*DΦ3[i,j,k,m]
+        r = P[i,j,k,m] + ((βn + a_n) / a) * q
+        s_in = a_n + βn
+        dP += -σ * abs(s_in) * wt * r
+    end
     @inbounds Pdot[i,j,k,m] += dP
 end

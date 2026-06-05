@@ -1,10 +1,13 @@
 # Numerical methods
 
 This file records the numerical choices made in WaveToySecondOrder.
-It documents the 1D implementation in full; the 2D implementation
-mirrors it on axis-aligned affine meshes (`make_uniform_quad`) — see
-the "2D" note at the end. 3D is not yet migrated; the old
-second-order-in-time 3D path remains.
+It documents the 1D implementation in full; the 2D and 3D
+implementations mirror it — see the "2D" and "3D" notes below. The
+conservative first-order (Φ,Π) wave now exists in 1D, 2D and 3D, on
+affine and curvilinear meshes. The older second-order-in-time
+strong-form 3D path (`apply_laplacian!`, `evolve3d(formulation =
+:strong)`, symplectic `SecondOrderODEProblem`) still coexists as the
+default `evolve3d` formulation.
 
 ## 2D (summary)
 
@@ -129,6 +132,75 @@ axis-aligned affine meshes `H·D` is exactly skew, `D_1d ⊗ I`).
   data-injection in the 2D driver (Sommerfeld is the radiative
   default); per-face characteristic-speed auto-classification on curved
   faces (excision is declared by the mesh tag instead).
+
+## 3D (summary)
+
+The conservative first-order (Φ,Π) ADM scalar wave generalizes to 3D
+exactly as 1D→2D, on both affine and curvilinear hex meshes; it
+coexists with the older strong-form Laplacian 3D path.
+
+* **State and RHS.** `(Φ,Π)` with `Π = (√γ/α)(∂_tΦ − βⁱ∂_iΦ)`;
+  `∂_tΦ = βⁱ∂_iΦ + (α/√γ)Π`, `∂_tΠ = ∂_i(βⁱΠ + α√γ γ^{ij}∂_jΦ)`. ADM
+  backgrounds: `AnalyticBackground3D`(α, β→(β1,β2,β3), γ→6 components)
+  and `MetricBackground3D` (`adm_decompose`); `sample_background3d!`
+  fills `coef = (alpha, sqrtγ, b1,b2,b3, gu11,gu12,gu13,gu22,gu23,gu33)`
+  (6 inverse-metric components via the symmetric 3×3 inverse).
+  `wave3d_curved_rhs!` / `wave3d_energy` mirror the 2D versions; KO
+  dissipation is applied per axis (×3). `make_coef3d`,
+  `make_wave3d_workspace`.
+* **Affine path** (`mesh_kind = :cubical`, `make_uniform_hex`): per-axis
+  `HexSBPSAT.apply_D!(Du::Array{T,4}, u, d; …)` for `d ∈ {1,2,3}` — the
+  diagonal Jacobian needs no metric identities. H·D skew to ~1e-16,
+  CPU↔Metal exact (Float32). Spectrum stability, plane-wave convergence
+  (~3rd order), and energy conservation verified.
+* **Curvilinear path** (`:cubed_cube`, `:inflated_cube`,
+  `:radial_shell`): the crux deferred from 2D is the **conservative-curl
+  metric form** (Thomas–Lombard / Kopriva). In 2D the discrete metric
+  identities `Σ_α D̂_α(aₐ^α)=0` hold automatically; in 3D they do **not**,
+  so `HexSBPSAT.make_metric_terms3d` builds each metric vector as a
+  discrete curl of coordinate cross-products `J aⁿ = ∇_ξ × Cⁿ`,
+  `Cⁿ = ½(X_l ∇_ξ X_m − X_m ∇_ξ X_l)` (n,l,m cyclic). The discrete
+  metric divergence `Σ_α D̂_α(aⁿ^α) = D̂·(D̂×Cⁿ)` then vanishes to
+  round-off because the tensor-product SBP derivatives commute. **GCL
+  gate**: this identity ≤ 1e-10 and ∇const/∇·const ≈ 4e-15 on cubed-cube
+  / inflated-cube / radial-shell — the make-or-break check passed, which
+  de-risked the rest. `apply_gradient3d!`/`apply_divergence3d!` use the
+  same split (skew-symmetric) form + centred-flux SAT as 2D (skew-adjoint
+  to 1e-16; the energy mass is `Hd`). Free-stream ~1e-13; convergence and
+  CPU↔Metal agreement verified.
+* **Boundaries** (`boundaries3d.jl`). Affine: `classify_face3d` +
+  `_apply_bc3d!` — one node-parallel kernel over the 6 faces, race-free
+  for edge/corner nodes (each output node written by one workitem).
+  Curvilinear: `_apply_bc3d_curv!` uses the **physical outward normal**
+  from the analytic Jacobian columns (cross product × handedness,
+  `sgn_out = sgn_f·sgn_c·handedness`) with surface weight
+  `wt = JF/(H[normal_row]·detjac)` — the two tangential H's cancel.
+  Sommerfeld (absorbing), field-radiation Dirichlet (exact Π and ∇Φ
+  target via the pass's own normal), excision (no SAT on faces carrying
+  the mesh excision tag), full-Dirichlet (superluminal inflow). Curved
+  Sommerfeld spectrum max Re λ ≤ round-off on the cubed-cube.
+* **3D BH-excision** (`mesh_kind = :radial_shell`, the 3D analog of the
+  2D annulus): inner sphere excised (tag 8), outer sphere Sommerfeld.
+  The `:radial_shift` background (flat α, γ; outward radial shift ramping
+  *linearly* from `V > 1` at `R1` to `< 0.1` at `R2`) makes the inner
+  sphere superluminal-outflow (`dr/dt = −(β_r ± a) < 0`, both
+  characteristics fall in) and the outer sphere subluminal. A noisy
+  evolution drains out through both boundaries with non-increasing
+  energy.
+* **Driver / app / GPU.** `evolve3d(formulation = :conservative,
+  mesh_kind = :cubical|:cubed_cube|:inflated_cube|:radial_shell,
+  bc = :periodic|:auto|:sommerfeld|:dirichlet|6-tuple, …)` — first-order
+  `ODEProblem` + `pick_integrator_first_order` (RK4), host/device split,
+  host-side rectangular classification, device metric + data buffers,
+  on-host energy/L² monitoring. `bin/wave3d.jl` conservative mode.
+  Verified CPU↔Metal Float32 (≤1e-3) for affine periodic/`:auto` and
+  curvilinear cubed-cube-Sommerfeld and radial-shell-excision. **Metal
+  caveat**: the 3D inverse metric pushes the *general* curvilinear BC
+  kernel past Metal's 31-buffer indirect-argument limit; a lean
+  Sommerfeld-only curvilinear BC kernel (drops the 7 unused state-target
+  / Fdot buffers) keeps the Sommerfeld + excision path on Metal. Curved
+  **Dirichlet** on Metal would exceed the limit and is CPU-only (CUDA has
+  no such limit); the affine path is unaffected.
 
 ## Scope (1D)
 
