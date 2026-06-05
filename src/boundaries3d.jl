@@ -122,3 +122,159 @@ end
     @inbounds Fdot[i,j,k,m] += dF
     @inbounds Pdot[i,j,k,m] += dP
 end
+
+# Curvilinear outer-boundary pass: a single BC `kind` on every bdry≠0
+# face (with the excision tag getting no SAT), using the PHYSICAL outward
+# normal from the analytic Jacobian columns (cross product × handedness),
+# exactly as the curvilinear Laplacian's face normal. The 3D analog of
+# `_apply_bc2d_curv!`. Reads the physical gradient from ws.DΦ1/DΦ2/DΦ3.
+function _apply_bc3d_curv!(Φ̇::AbstractArray{T,4}, Π̇::AbstractArray{T,4},
+                           Φ::AbstractArray{T,4}, Π::AbstractArray{T,4},
+                           coef, ws, metric; geom::MeshGeometry{3, T, N},
+                           ops::SBPOps{N, T}, bc3d) where {N, T}
+    backend = get_backend(Φ̇)
+    kind = bc3d.kinds[1]
+    exc = hasproperty(bc3d, :excision_tag) ? Int32(bc3d.excision_tag) : Int32(0)
+    kind == BC_EXCISION && exc == 0 && return nothing
+    # Sommerfeld (incl. the radial-shell outer sphere with inner
+    # excision) needs neither the state targets nor Fdot: dispatch to a
+    # lean kernel that drops 7 array arguments. This keeps the curvilinear
+    # BC pass under Metal's 31-buffer indirect-argument limit, which the
+    # full kernel (≈27 array args) exceeds for the 3D inverse metric.
+    if kind == BC_SOMMERFELD
+        _bc3d_curv_sommerfeld_kernel!(backend, (N, N, N))(
+            Π̇, Π, ws.DΦ1, ws.DΦ2, ws.DΦ3, coef.alpha, coef.sqrtγ,
+            coef.gu11, coef.gu12, coef.gu13, coef.gu22, coef.gu23, coef.gu33,
+            coef.b1, coef.b2, coef.b3, geom.jac, geom.detjac, geom.handedness,
+            geom.conn.bdry, ops, exc, T(bc3d.σ), Val(N);
+            ndrange = (N, N, N, geom.Ne))
+        return nothing
+    end
+    gΦ  = bc3d.gΦ  === nothing ? Φ : bc3d.gΦ
+    gΠ  = bc3d.gΠ  === nothing ? Φ : bc3d.gΠ
+    gDx = bc3d.gDx === nothing ? Φ : bc3d.gDx
+    gDy = bc3d.gDy === nothing ? Φ : bc3d.gDy
+    gDz = bc3d.gDz === nothing ? Φ : bc3d.gDz
+    _bc3d_curv_kernel!(backend, (N, N, N))(
+        Φ̇, Π̇, Φ, Π, ws.DΦ1, ws.DΦ2, ws.DΦ3, coef.alpha, coef.sqrtγ,
+        coef.gu11, coef.gu12, coef.gu13, coef.gu22, coef.gu23, coef.gu33,
+        coef.b1, coef.b2, coef.b3, geom.jac, geom.detjac, geom.handedness,
+        geom.conn.bdry, ops, gΦ, gΠ, gDx, gDy, gDz,
+        bc3d.gΦ === nothing, bc3d.gΠ === nothing, bc3d.gDx === nothing,
+        bc3d.gDy === nothing, bc3d.gDz === nothing,
+        Int32(kind), exc, T(bc3d.σ), Val(N); ndrange = (N, N, N, geom.Ne))
+    return nothing
+end
+
+@kernel function _bc3d_curv_kernel!(Fdot, Pdot, @Const(F), @Const(P),
+        @Const(DΦ1), @Const(DΦ2), @Const(DΦ3), @Const(alpha), @Const(sqrtγ),
+        @Const(gu11), @Const(gu12), @Const(gu13), @Const(gu22), @Const(gu23),
+        @Const(gu33), @Const(b1), @Const(b2), @Const(b3), @Const(jac),
+        @Const(detjac), @Const(handed), @Const(bdry), ops, @Const(gΦ),
+        @Const(gΠ), @Const(gDx), @Const(gDy), @Const(gDz),
+        noΦ, noΠ, noDx, noDy, noDz, kind, excision_tag, σ, ::Val{N}) where {N}
+    i, j, k, m = @index(Global, NTuple)
+    T = eltype(Fdot)
+    dF = zero(T); dP = zero(T)
+    @inbounds for f in 1:6
+        bdry[f, m] == 0 && continue
+        bdry[f, m] == excision_tag && continue
+        a_idx = (f + 1) ÷ 2
+        row = isodd(f) ? 1 : N
+        on = a_idx == 1 ? (i == row) : a_idx == 2 ? (j == row) : (k == row)
+        on || continue
+        axis_p = a_idx == 1 ? 2 : 1
+        axis_q = a_idx == 3 ? 2 : 3
+        sgn_f = isodd(f) ? -one(T) : one(T)
+        sgn_c = a_idx == 2 ? -one(T) : one(T)
+        sgn_out = sgn_f * sgn_c * T(handed[m])
+        tpx = jac[1,axis_p,i,j,k,m]; tpy = jac[2,axis_p,i,j,k,m]; tpz = jac[3,axis_p,i,j,k,m]
+        tqx = jac[1,axis_q,i,j,k,m]; tqy = jac[2,axis_q,i,j,k,m]; tqz = jac[3,axis_q,i,j,k,m]
+        nfx = sgn_out * (tpy*tqz - tpz*tqy)
+        nfy = sgn_out * (tpz*tqx - tpx*tqz)
+        nfz = sgn_out * (tpx*tqy - tpy*tqx)
+        JF = sqrt(nfx*nfx + nfy*nfy + nfz*nfz)
+        nx = nfx/JF; ny = nfy/JF; nz = nfz/JF
+        αv = alpha[i,j,k,m]; sγ = sqrtγ[i,j,k,m]
+        g11=gu11[i,j,k,m]; g12=gu12[i,j,k,m]; g13=gu13[i,j,k,m]
+        g22=gu22[i,j,k,m]; g23=gu23[i,j,k,m]; g33=gu33[i,j,k,m]
+        a   = αv / sγ
+        a_n = αv * sqrt(g11*nx*nx + g22*ny*ny + g33*nz*nz +
+                        2*g12*nx*ny + 2*g13*nx*nz + 2*g23*ny*nz)
+        βn  = b1[i,j,k,m]*nx + b2[i,j,k,m]*ny + b3[i,j,k,m]*nz
+        # SAT lift = surface element / (normal-row mass × volume factor);
+        # the two tangential H's cancel (face weight / volume mass).
+        wt  = JF / (ops.H[row, row] * detjac[i,j,k,m])
+        if kind == Int32(BC_FULL_DIRICHLET)
+            τ = σ * (abs(a_n - βn) + abs(a_n + βn)) * wt
+            gΦv = noΦ ? zero(T) : gΦ[i,j,k,m]
+            gΠv = noΠ ? zero(T) : gΠ[i,j,k,m]
+            dF += -τ * (F[i,j,k,m] - gΦv)
+            dP += -τ * (P[i,j,k,m] - gΠv)
+        else
+            q = nx*DΦ1[i,j,k,m] + ny*DΦ2[i,j,k,m] + nz*DΦ3[i,j,k,m]
+            r = P[i,j,k,m] + ((βn + a_n) / a) * q
+            g = if kind == Int32(BC_SOMMERFELD)
+                zero(T)
+            else
+                gΠv = noΠ  ? zero(T) : gΠ[i,j,k,m]
+                gx  = noDx ? zero(T) : gDx[i,j,k,m]
+                gy  = noDy ? zero(T) : gDy[i,j,k,m]
+                gz  = noDz ? zero(T) : gDz[i,j,k,m]
+                gΠv + ((βn + a_n) / a) * (nx*gx + ny*gy + nz*gz)
+            end
+            s_in = a_n + βn
+            dP += -σ * abs(s_in) * wt * (r - g)
+        end
+    end
+    @inbounds Fdot[i,j,k,m] += dF
+    @inbounds Pdot[i,j,k,m] += dP
+end
+
+# Lean Sommerfeld-only curvilinear BC kernel (no state-target buffers, no
+# Fdot). Faces tagged `excision_tag` get no SAT. Mathematically identical
+# to the `BC_SOMMERFELD` branch of `_bc3d_curv_kernel!`; exists purely to
+# stay under Metal's indirect-argument-buffer limit for the 3D metric.
+@kernel function _bc3d_curv_sommerfeld_kernel!(Pdot, @Const(P),
+        @Const(DΦ1), @Const(DΦ2), @Const(DΦ3), @Const(alpha), @Const(sqrtγ),
+        @Const(gu11), @Const(gu12), @Const(gu13), @Const(gu22), @Const(gu23),
+        @Const(gu33), @Const(b1), @Const(b2), @Const(b3), @Const(jac),
+        @Const(detjac), @Const(handed), @Const(bdry), ops, excision_tag, σ,
+        ::Val{N}) where {N}
+    i, j, k, m = @index(Global, NTuple)
+    T = eltype(Pdot)
+    dP = zero(T)
+    @inbounds for f in 1:6
+        bdry[f, m] == 0 && continue
+        bdry[f, m] == excision_tag && continue
+        a_idx = (f + 1) ÷ 2
+        row = isodd(f) ? 1 : N
+        on = a_idx == 1 ? (i == row) : a_idx == 2 ? (j == row) : (k == row)
+        on || continue
+        axis_p = a_idx == 1 ? 2 : 1
+        axis_q = a_idx == 3 ? 2 : 3
+        sgn_f = isodd(f) ? -one(T) : one(T)
+        sgn_c = a_idx == 2 ? -one(T) : one(T)
+        sgn_out = sgn_f * sgn_c * T(handed[m])
+        tpx = jac[1,axis_p,i,j,k,m]; tpy = jac[2,axis_p,i,j,k,m]; tpz = jac[3,axis_p,i,j,k,m]
+        tqx = jac[1,axis_q,i,j,k,m]; tqy = jac[2,axis_q,i,j,k,m]; tqz = jac[3,axis_q,i,j,k,m]
+        nfx = sgn_out * (tpy*tqz - tpz*tqy)
+        nfy = sgn_out * (tpz*tqx - tpx*tqz)
+        nfz = sgn_out * (tpx*tqy - tpy*tqx)
+        JF = sqrt(nfx*nfx + nfy*nfy + nfz*nfz)
+        nx = nfx/JF; ny = nfy/JF; nz = nfz/JF
+        αv = alpha[i,j,k,m]; sγ = sqrtγ[i,j,k,m]
+        g11=gu11[i,j,k,m]; g12=gu12[i,j,k,m]; g13=gu13[i,j,k,m]
+        g22=gu22[i,j,k,m]; g23=gu23[i,j,k,m]; g33=gu33[i,j,k,m]
+        a   = αv / sγ
+        a_n = αv * sqrt(g11*nx*nx + g22*ny*ny + g33*nz*nz +
+                        2*g12*nx*ny + 2*g13*nx*nz + 2*g23*ny*nz)
+        βn  = b1[i,j,k,m]*nx + b2[i,j,k,m]*ny + b3[i,j,k,m]*nz
+        wt  = JF / (ops.H[row, row] * detjac[i,j,k,m])
+        q = nx*DΦ1[i,j,k,m] + ny*DΦ2[i,j,k,m] + nz*DΦ3[i,j,k,m]
+        r = P[i,j,k,m] + ((βn + a_n) / a) * q
+        s_in = a_n + βn
+        dP += -σ * abs(s_in) * wt * r
+    end
+    @inbounds Pdot[i,j,k,m] += dP
+end

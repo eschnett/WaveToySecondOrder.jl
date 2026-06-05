@@ -15,7 +15,8 @@
 #
 # CAPITAL Greek Φ, Π.
 
-using HexSBPSAT: MeshGeometry, SBPOps, MeshWorkspace, make_workspace, apply_D!
+using HexSBPSAT: MeshGeometry, SBPOps, MeshWorkspace, make_workspace, apply_D!,
+                 apply_gradient3d!, apply_divergence3d!
 using KernelAbstractions: @kernel, @index, @Const, get_backend, allocate
 using SpacetimeMetrics: adm_decompose
 using StaticArrays: SVector, SMatrix
@@ -214,22 +215,27 @@ function wave3d_curved_rhs!(Φ̇::AbstractArray{T,4}, Π̇::AbstractArray{T,4},
     (; alpha, sqrtγ, b1, b2, b3, gu11, gu12, gu13, gu22, gu23, gu33) = coef
     εT = T(ε_KO); koT = εT * ws.inv_μ5; mw = ws.mw
 
-    metric === nothing ||
-        error("wave3d_curved_rhs!: curvilinear path is Milestone 2")
-
-    apply_D!(DΦ1, Φ, 1; geom, ops, work = mw)   # affine per-axis gradient
-    apply_D!(DΦ2, Φ, 2; geom, ops, work = mw)
-    apply_D!(DΦ3, Φ, 3; geom, ops, work = mw)
+    if metric === nothing
+        apply_D!(DΦ1, Φ, 1; geom, ops, work = mw)   # affine per-axis gradient
+        apply_D!(DΦ2, Φ, 2; geom, ops, work = mw)
+        apply_D!(DΦ3, Φ, 3; geom, ops, work = mw)
+    else
+        apply_gradient3d!(DΦ1, DΦ2, DΦ3, Φ; geom, ops, metric, work = mw)
+    end
 
     # Flux Fⁱ = βⁱΠ + α√γ γ^{ij}∂_jΦ.
     @. F1 = b1 * Π + alpha * sqrtγ * (gu11 * DΦ1 + gu12 * DΦ2 + gu13 * DΦ3)
     @. F2 = b2 * Π + alpha * sqrtγ * (gu12 * DΦ1 + gu22 * DΦ2 + gu23 * DΦ3)
     @. F3 = b3 * Π + alpha * sqrtγ * (gu13 * DΦ1 + gu23 * DΦ2 + gu33 * DΦ3)
 
-    apply_D!(s1, F1, 1; geom, ops, work = mw)
-    apply_D!(s2, F2, 2; geom, ops, work = mw)
-    apply_D!(s3, F3, 3; geom, ops, work = mw)
-    @. Π̇ = s1 + s2 + s3
+    if metric === nothing
+        apply_D!(s1, F1, 1; geom, ops, work = mw)
+        apply_D!(s2, F2, 2; geom, ops, work = mw)
+        apply_D!(s3, F3, 3; geom, ops, work = mw)
+        @. Π̇ = s1 + s2 + s3
+    else
+        apply_divergence3d!(Π̇, F1, F2, F3; geom, ops, metric, work = mw)
+    end
     @. Φ̇ = b1 * DΦ1 + b2 * DΦ2 + b3 * DΦ3 + (alpha / sqrtγ) * Π
 
     if εT != 0
@@ -242,7 +248,11 @@ function wave3d_curved_rhs!(Φ̇::AbstractArray{T,4}, Π̇::AbstractArray{T,4},
     end
 
     if bc3d !== nothing
-        _apply_bc3d!(Φ̇, Π̇, Φ, Π, coef, ws; geom, ops, bc3d)
+        if metric === nothing
+            _apply_bc3d!(Φ̇, Π̇, Φ, Π, coef, ws; geom, ops, bc3d)
+        else
+            _apply_bc3d_curv!(Φ̇, Π̇, Φ, Π, coef, ws, metric; geom, ops, bc3d)
+        end
     end
     return Φ̇, Π̇
 end
@@ -257,14 +267,19 @@ static backgrounds with α≡1; otherwise a drift monitor). Overwrites
 """
 function wave3d_energy(Φ::AbstractArray{T,4}, Π::AbstractArray{T,4}, coef;
                        geom::MeshGeometry{3, T, N}, ops::SBPOps{N, T},
-                       ws::Wave3DWorkspace{T}) where {N, T}
+                       ws::Wave3DWorkspace{T}, metric = nothing) where {N, T}
     (; DΦ1, DΦ2, DΦ3) = ws
     (; sqrtγ, gu11, gu12, gu13, gu22, gu23, gu33) = coef
     mw = ws.mw
-    apply_D!(DΦ1, Φ, 1; geom, ops, work = mw)
-    apply_D!(DΦ2, Φ, 2; geom, ops, work = mw)
-    apply_D!(DΦ3, Φ, 3; geom, ops, work = mw)
-    H = geom.Hphys
+    if metric === nothing
+        apply_D!(DΦ1, Φ, 1; geom, ops, work = mw)
+        apply_D!(DΦ2, Φ, 2; geom, ops, work = mw)
+        apply_D!(DΦ3, Φ, 3; geom, ops, work = mw)
+        H = geom.Hphys
+    else
+        apply_gradient3d!(DΦ1, DΦ2, DΦ3, Φ; geom, ops, metric, work = mw)
+        H = metric.Hd
+    end
     return sum(@. (Π^2 / sqrtγ +
                    sqrtγ * (gu11*DΦ1^2 + gu22*DΦ2^2 + gu33*DΦ3^2 +
                             2*gu12*DΦ1*DΦ2 + 2*gu13*DΦ1*DΦ3 +
