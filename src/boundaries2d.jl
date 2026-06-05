@@ -199,7 +199,7 @@ using KernelAbstractions: @kernel, @index, @Const
                 gΠv + ((βn + a_n) / a) * (nx*gx + ny*gy)
             end
             s_in = a_n + βn
-            dP += -σ * s_in * wt * (r - g)
+            dP += -σ * abs(s_in) * wt * (r - g)   # |s_in| ⇒ dissipative
         end
     end
     @inbounds Fdot[i,j,m] += dF
@@ -252,7 +252,7 @@ end
             g   = kind == Int32(BC_SOMMERFELD) ? zero(T) :
                   (noΦ ? zero(T) : gΦ[i,j,m])
             s_in = a_n + βn
-            dP += -σ * s_in * wt * (r - g)
+            dP += -σ * abs(s_in) * wt * (r - g)   # |s_in| ⇒ dissipative
         end
     end
     @inbounds Fdot[i,j,m] += dF

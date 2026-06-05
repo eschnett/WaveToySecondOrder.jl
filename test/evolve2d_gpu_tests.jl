@@ -39,6 +39,11 @@ if HAS_METAL
         _agree("periodic cubical (minkowski)";
                mesh_kind = :cubical, M = 8, N = 4, background = :minkowski,
                ic = :exact, bc = :periodic, t1 = 0.2, Nt = 4, cfl = 0.1)
+        # Rectangular non-periodic with :auto classification — exercises
+        # the host-side face classification on GPU (no device scalar index).
+        _agree("cubical bc=:auto (minkowski, host classification)";
+               mesh_kind = :cubical, M = 6, N = 4, background = :minkowski,
+               ic = :exact, bc = :auto, t1 = 0.2, Nt = 4, cfl = 0.1)
         # Curvilinear non-periodic, absorbing outer (the core capability).
         _agree("cubed-square Sommerfeld (gaussian)";
                mesh_kind = :cubed_square, M = 4, N = 4, R = 0.3,

@@ -276,8 +276,12 @@ Discrete ADM energy
     E = ∫ ½ [ (Π/√γ)² + (∂_x Φ)²/γ ] · √γ dx
       ≈ Σ ½ [ (Π/√γ)² + (DΦ)²/γ ] · √γ · Hphys.
 
-Exactly conserved by the continuum system only for static backgrounds
-(∂_t α = ∂_t β = ∂_t γ = 0); use as a drift monitor otherwise.
+This is the PHYSICAL ADM energy (energy density of the normal
+observers, gradient weight `1/√γ`). The continuum system conserves it
+for static backgrounds with `α ≡ 1`; the *discrete* skew operator's
+exactly-conserved norm uses gradient weight `∝ α/√γ`, so the two
+coincide only when `α ≡ 1`. For static `α ≠ 1` (and for dynamic
+backgrounds) treat this as a drift monitor, not an exact invariant.
 Overwrites `ws.DΦ`.
 """
 function wave1d_energy(Φ::AbstractMatrix{T}, Π::AbstractMatrix{T},

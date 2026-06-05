@@ -8,7 +8,21 @@
 
 using Test
 using WaveToySecondOrder: evolve2d
+using HexMeshes: make_annulus_mesh
+using HexSBPSAT: make_element, make_geometry
 
+# Brute-force min adjacent-node spacing over the given reference axes,
+# for the _min_node_spacing_2d regression test.
+function _brute_spacing(c, N, Ne; axes)
+    h = Inf
+    for e in 1:Ne, j in 1:N, i in 1:N
+        (1 in axes) && i > 1 &&
+            (h = min(h, hypot(c[1,i,j,e]-c[1,i-1,j,e], c[2,i,j,e]-c[2,i-1,j,e])))
+        (2 in axes) && j > 1 &&
+            (h = min(h, hypot(c[1,i,j,e]-c[1,i,j-1,e], c[2,i,j,e]-c[2,i,j-1,e])))
+    end
+    return h
+end
 
 @testset "evolve2d driver" begin
     _progress("evolve2d: periodic minkowski convergence")
@@ -24,6 +38,34 @@ using WaveToySecondOrder: evolve2d
                      bc = :periodic, t1 = 1.0, Nt = 5)
         @test abs(r.energy[end] / r.energy[1] - 1) < 1e-3
         @test r.integrator_name == :RK4
+    end
+
+    _progress("evolve2d: constant-shift exact-solution convergence")
+    @testset "periodic constant-shift: exact convergence (dispersion sign)" begin
+        # Regression for the ω sign: with a nonzero shift the exact
+        # solution must actually solve the PDE, so the L² error converges.
+        # The previous +β·k dispersion made Φe a non-solution (O(1) error).
+        errs = Float64[]
+        for M in (8, 16)
+            r = evolve2d(; N = 4, M, background = :constant_shift,
+                         shift = (0.3, 0.2), ic = :exact, bc = :periodic,
+                         t1 = 0.3, Nt = 4)
+            push!(errs, maximum(r.l2_err))
+        end
+        @test errs[end] < errs[1]
+        @test errs[1] / errs[end] > 4          # ~3rd-order over a 2× refine
+        @test errs[end] < 1e-2
+    end
+
+    _progress("evolve2d: node spacing over all reference axes")
+    @testset "_min_node_spacing_2d uses every axis (curved dt)" begin
+        geom = make_geometry(make_annulus_mesh(Float64, 0.5, 2.0, 4),
+                             make_element(Float64, 4))
+        c = geom.coords; N = 4; Ne = geom.Ne
+        all_axes = _brute_spacing(c, N, Ne; axes = (1, 2))
+        axis1    = _brute_spacing(c, N, Ne; axes = (1,))
+        @test all_axes < axis1     # angular (η) spacing is the smaller one
+        @test WaveToySecondOrder._min_node_spacing_2d(c) ≈ all_axes
     end
 
     _progress("evolve2d: gauge wave (periodic)")

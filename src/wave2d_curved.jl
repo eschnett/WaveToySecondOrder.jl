@@ -254,7 +254,10 @@ Discrete ADM energy `E = Σ ½[ Π²/√γ + √γ γ^{ij}∂_iΦ∂_jΦ ]·H`. 
 affine path the mass `H` is `geom.Hphys`; on the curvilinear path
 (`metric` provided) it is the consistent discrete mass `metric.Hd` and
 the gradient is the free-stream-preserving `apply_gradient2d!`.
-Overwrites `ws.DΦ1, ws.DΦ2`.
+This is the PHYSICAL ADM energy (gradient weight `1/√γ`); it is exactly
+conserved only for static backgrounds with `α ≡ 1` (the skew operator's
+own conserved norm weights the gradient by `∝ α/√γ`). Otherwise use it
+as a drift/decay monitor. Overwrites `ws.DΦ1, ws.DΦ2`.
 """
 function wave2d_energy(Φ::AbstractArray{T,3}, Π::AbstractArray{T,3}, coef;
                        geom::MeshGeometry{2, T, N}, ops::SBPOps{N, T},

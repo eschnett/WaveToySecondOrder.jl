@@ -49,25 +49,50 @@ end
 
 # Smallest GLL-node spacing across the mesh, Euclidean. Handles
 # curvilinear elements whose local axis 1 is not aligned with physical x.
+@inline _node_dist3(c, a, b) =
+    sqrt((c[1,a...] - c[1,b...])^2 + (c[2,a...] - c[2,b...])^2 +
+         (c[3,a...] - c[3,b...])^2)
+
+# Smallest physical spacing between reference-axis-adjacent nodes, taken
+# over ALL reference directions (ξ, η, ζ) — not just axis 1. On curved
+# meshes the angular spacing can be smaller than the radial one, so an
+# axis-1-only minimum overestimates h and yields a too-large CFL dt.
 function _min_node_spacing_3d(coords::AbstractArray{T}) where {T}
+    N1, N2, N3, Ne = size(coords, 2), size(coords, 3), size(coords, 4), size(coords, 5)
     h = typemax(T)
-    @inbounds for e in 1:size(coords, 5), k in 1:size(coords, 4),
-                  j in 1:size(coords, 3), i in 2:size(coords, 2)
-        dxv = coords[1, i, j, k, e] - coords[1, i-1, j, k, e]
-        dyv = coords[2, i, j, k, e] - coords[2, i-1, j, k, e]
-        dzv = coords[3, i, j, k, e] - coords[3, i-1, j, k, e]
-        h = min(h, sqrt(dxv*dxv + dyv*dyv + dzv*dzv))
+    @inbounds for e in 1:Ne, k in 1:N3, j in 1:N2, i in 1:N1
+        i > 1 && (h = min(h, _node_dist3(coords, (i,j,k,e), (i-1,j,k,e))))
+        j > 1 && (h = min(h, _node_dist3(coords, (i,j,k,e), (i,j-1,k,e))))
+        k > 1 && (h = min(h, _node_dist3(coords, (i,j,k,e), (i,j,k-1,e))))
     end
     return h
 end
 
+# (i, j, e) of a representative node on boundary side `f` (1=−x, 2=+x,
+# 3=−y, 4=+y) of an axis-aligned mesh — the first boundary element on
+# that side, at the side's row and the mid tangential node. Used to
+# classify each side from a node that actually lies on it.
+function _side_node_2d(geom, f, N)
+    bdry = geom.conn.bdry
+    a_idx = (f + 1) ÷ 2
+    row = isodd(f) ? 1 : N
+    mid = (N + 1) ÷ 2
+    @inbounds for e in 1:geom.Ne
+        bdry[f, e] == 0 && continue
+        return a_idx == 1 ? (row, mid, e) : (mid, row, e)
+    end
+    return (1, 1, 1)
+end
+
+@inline _node_dist2(c, a, b) =
+    sqrt((c[1,a...] - c[1,b...])^2 + (c[2,a...] - c[2,b...])^2)
+
 function _min_node_spacing_2d(coords::AbstractArray{T}) where {T}
+    N1, N2, Ne = size(coords, 2), size(coords, 3), size(coords, 4)
     h = typemax(T)
-    @inbounds for e in 1:size(coords, 4), j in 1:size(coords, 3),
-                  i in 2:size(coords, 2)
-        dxv = coords[1, i, j, e] - coords[1, i-1, j, e]
-        dyv = coords[2, i, j, e] - coords[2, i-1, j, e]
-        h = min(h, sqrt(dxv*dxv + dyv*dyv))
+    @inbounds for e in 1:Ne, j in 1:N2, i in 1:N1
+        i > 1 && (h = min(h, _node_dist2(coords, (i,j,e), (i-1,j,e))))
+        j > 1 && (h = min(h, _node_dist2(coords, (i,j,e), (i,j-1,e))))
     end
     return h
 end
@@ -556,16 +581,8 @@ function evolve2d(; T::Type = Float64,
     # loop); the device evolution uses a migrated copy, while the host
     # monitoring loop uses `metric_host`.
     metric_host = curv ? make_metric_terms2d(geom_host, ops) : nothing
-    metric = if !curv
-        nothing
-    elseif on_cpu
-        metric_host
-    else
-        _md(a) = copyto!(similar(coef.alpha), a)
-        (; ax1 = _md(metric_host.ax1), ax2 = _md(metric_host.ax2),
-           ay1 = _md(metric_host.ay1), ay2 = _md(metric_host.ay2),
-           invdetJ = _md(metric_host.invdetJ), Hd = _md(metric_host.Hd))
-    end
+    metric = !curv ? nothing :
+             on_cpu ? metric_host : metric_to_device(metric_host, backend)
 
     xg = reshape(copy(geom_host.coords[1, :, :, :]), N, N, mesh.Ne)
     yg = reshape(copy(geom_host.coords[2, :, :, :]), N, N, mesh.Ne)
@@ -574,6 +591,11 @@ function evolve2d(; T::Type = Float64,
 
     bg, Φe, Πe, Dxe, Dye, max_speed =
         _background2d(background, T; A, d, shift, R1 = T(R1), R2 = T(R2))
+
+    # Host-resident background coefficients, for boundary-face
+    # classification (below) and the per-output diagnostics (energy / L²).
+    # Sampled on the host grids so all reads are host-side even on GPU.
+    coef_h = on_cpu ? coef : make_coef2d(geom_host)
 
     # Smallest physical node spacing (handles curved elements).
     dx_min = _min_node_spacing_2d(geom_host.coords)
@@ -600,13 +622,15 @@ function evolve2d(; T::Type = Float64,
                 "requires ic=:exact (it injects the exact solution)"))
         kinds = ntuple(_ -> bc1d_kind(ck), 4)
     elseif !periodic
-        sample_background2d!(coef, bg, T(t0), xg, yg)
+        # Classify each side from a node that actually lies on it, using
+        # the HOST coefficients (host scalar reads — safe on GPU).
+        sample_background2d!(coef_h, bg, T(t0), xg, yg)
         side_axis = (1, 1, 2, 2); side_sign = (-1, 1, -1, 1)
         classes = ntuple(4) do f
-            # representative boundary node on side f
-            classify_face2d(coef.alpha[1], coef.b1[1], coef.b2[1],
-                            coef.gu11[1], coef.gu22[1],
-                            side_axis[f], side_sign[f])
+            i, j, e = _side_node_2d(geom_host, f, N)
+            classify_face2d(coef_h.alpha[i,j,e], coef_h.b1[i,j,e],
+                            coef_h.b2[i,j,e], coef_h.gu11[i,j,e],
+                            coef_h.gu22[i,j,e], side_axis[f], side_sign[f])
         end
         autopick(c) = c == FACE_SUBLUMINAL ? BC_SOMMERFELD :
                       c == FACE_OUTFLOW    ? BC_EXCISION : BC_FULL_DIRICHLET
@@ -706,7 +730,7 @@ function evolve2d(; T::Type = Float64,
     Φref = similar(Φh)
     Hphys_h = geom_host.Hphys
     ws_h = on_cpu ? ws : make_wave2d_workspace(geom_host, ops)
-    coef_h = on_cpu ? coef : make_coef2d(geom_host)
+    # coef_h was allocated above (used for boundary classification too).
 
     prog = Progress(Nt; desc = "evolve2d (M=$M, bg=$background, " *
                     "backend=$(typeof(backend).name.name)): ",
@@ -750,11 +774,13 @@ function _background2d(kind::Symbol, ::Type{T}; A, d, shift, R1 = 0, R2 = 1) whe
                  (T(shift[1]), T(shift[2]))
         bg = AnalyticBackground2D(_Const3(one(T)), _ConstVec2(bx, by),
                                   _ConstMet2(one(T), zero(T), one(T)))
-        # Diagonal plane wave Φ = sin(2π(x+y) − ωt); dispersion (α=γ=1)
-        # ω = β·k + |k| with k = 2π(1,1): ω = 2π(bx+by) + 2π√2.
-        k = 2 * T(π); ω = k * (bx + by) + k * sqrt(T(2))
+        # Diagonal plane wave Φ = sin(2π(x+y) − ωt). For ∂_tΦ=β·∇Φ+Π,
+        # ∂_tΠ=∇·(βΠ+∇Φ) the dispersion is (ω+β·k)²=|k|², so the physical
+        # branch is ω = −β·k + |k| (NOT +β·k): with k=2π(1,1),
+        # ω = −2π(bx+by) + 2π√2.
+        k = 2 * T(π); ω = -k * (bx + by) + k * sqrt(T(2))
         Φe = (t,x,y) -> sin(k*(x+y) - ω*t)
-        # Π = ∂_tΦ − βⁱ∂_iΦ = (−ω − k(bx+by))cos.
+        # Π = ∂_tΦ − βⁱ∂_iΦ = (−ω − k(bx+by))cos = −k√2·cos (β-independent).
         Πe = (t,x,y) -> (-ω - k*(bx+by)) * cos(k*(x+y) - ω*t)
         Dxe = (t,x,y) -> k * cos(k*(x+y) - ω*t)      # ∂_xΦ = ∂_yΦ
         return bg, Φe, Πe, Dxe, Dxe, abs(bx) + abs(by) + sqrt(T(2))
