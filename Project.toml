@@ -1,6 +1,6 @@
 name = "WaveToySecondOrder"
 uuid = "f1991996-c646-45c7-ab9a-2d4391aa9bc8"
-version = "1.0.0"
+version = "2.0.0"
 authors = ["Erik Schnetter <schnetter@gmail.com>"]
 
 [deps]
